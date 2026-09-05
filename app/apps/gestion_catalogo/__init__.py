@@ -1,0 +1,1 @@
+# App 2: Gestión de Catálogo, Productos e Inventario
