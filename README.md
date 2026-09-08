@@ -4,7 +4,7 @@ Backend de la plataforma de comercio electrónico FashionStore desarrollado con 
 
 ## Requisitos Previos
 
-- Python 3.10+
+- Python 3.11+
 - PostgreSQL 14+
 - pip (gestor de paquetes)
 
