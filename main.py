@@ -100,9 +100,14 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
+    import os
+    
+    # Usar puerto de variable de entorno (Render) o 8000 por defecto
+    port = int(os.environ.get("PORT", 8000))
+    
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=port,
         reload=settings.DEBUG
     )

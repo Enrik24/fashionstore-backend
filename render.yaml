@@ -1,0 +1,66 @@
+services:
+  # Web Service - FastAPI Backend
+  - type: web
+    name: fashionstore-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: chmod +x start.sh && ./start.sh
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: DEBUG
+        value: "False"
+      - key: PORT
+        value: "8000"
+      - key: DB_HOST
+        fromDatabase:
+          name: fashionstore-db
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: fashionstore-db
+          property: port
+      - key: DB_NAME
+        fromDatabase:
+          name: fashionstore-db
+          property: database
+      - key: DB_USER
+        fromDatabase:
+          name: fashionstore-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: fashionstore-db
+          property: password
+      - key: DATABASE_URL
+        fromDatabase:
+          name: fashionstore-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateString: true
+      - key: CORS_ORIGINS
+        # Cambia esto por tu dominio de frontend en producción
+        value: "https://tu-frontend.onrender.com,http://localhost:4200"
+      - key: GROQ_API_KEY
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: STRIPE_API_KEY
+        sync: false
+      - key: STRIPE_PUBLISHABLE_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+
+databases:
+  - name: fashionstore-db
+    plan: free
+    databaseName: tiendaropa
+    user: fashionstore
+    postgresMajorVersion: "16"
