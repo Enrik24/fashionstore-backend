@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     DB_PORT: int = 5432
     DATABASE_URL: str = ""
     
+    # SSL para proveedores cloud como Supabase (True por defecto para producción)
+    DB_SSL: bool = True
+    
     # JWT
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
@@ -48,7 +51,7 @@ class Settings(BaseSettings):
     # App
     APP_NAME: str = "FashionStore API"
     APP_VERSION: str = "1.0.0"
-    DEBUG: bool = True
+    DEBUG: bool = False
     CORS_ORIGINS: str = "http://localhost:4200,http://localhost:3000"
     
     class Config:
@@ -56,13 +59,27 @@ class Settings(BaseSettings):
         case_sensitive = True
     
     def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # Construir DATABASE_URL si no está definida
-        if not self.DATABASE_URL:
+        super().__init__(kwargs)
+        
+        # Render proporciona DATABASE_URL con formato postgres://
+        # Necesitamos convertirlo a postgresql+asyncpg:// para SQLAlchemy async
+        database_url = os.environ.get("DATABASE_URL", "")
+        if database_url.startswith("postgres://"):
+            # Convertir postgres:// a postgresql+asyncpg://
+            self.DATABASE_URL = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif database_url.startswith("postgresql://"):
+            # Convertir postgresql:// a postgresql+asyncpg://
+            self.DATABASE_URL = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        elif not self.DATABASE_URL:
+            # Construir DATABASE_URL desde variables individuales (desarrollo local)
             self.DATABASE_URL = (
                 f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}"
                 f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
             )
+        
+        # Activar SSL automáticamente si el host es de Supabase u otros proveedores cloud
+        if self.DATABASE_URL and ("supabase" in self.DATABASE_URL or "rds.amazonaws" in self.DATABASE_URL or "azure" in self.DATABASE_URL):
+            self.DB_SSL = True
     
     @property
     def cors_origins_list(self) -> List[str]:

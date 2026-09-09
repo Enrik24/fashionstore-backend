@@ -6,6 +6,17 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import declarative_base
 from app.config import settings
 
+# Configurar connect_args según si se necesita SSL
+connect_args = {"statement_cache_size": 0}
+
+# Activar SSL para proveedores cloud como Supabase
+if settings.DB_SSL:
+    import ssl
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    connect_args["ssl"] = ssl_context
+
 # Crear el motor de base de datos asíncrono
 engine = create_async_engine(
     settings.DATABASE_URL,
@@ -14,7 +25,7 @@ engine = create_async_engine(
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,
-    connect_args={"statement_cache_size": 0},
+    connect_args=connect_args,
 )
 
 # Crear el factory de sesiones
