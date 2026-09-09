@@ -4,7 +4,7 @@ Alembic environment configuration for async SQLAlchemy.
 from logging.config import fileConfig
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from sqlalchemy.ext.asyncio import create_async_engine
 from alembic import context
 
 # Import the Base from your app
@@ -55,13 +55,12 @@ def do_run_migrations(connection: Connection) -> None:
 
 async def run_async_migrations() -> None:
     """Run migrations in 'online' mode with async engine."""
-    configuration = config.get_section(config.config_ini_section, {})
-    configuration["sqlalchemy.url"] = settings.DATABASE_URL
-    
-    connectable = async_engine_from_config(
-        configuration,
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
+    # Usamos create_async_engine en lugar de async_engine_from_config
+    # para poder pasar connect_args con statement_cache_size=0
+    connectable = create_async_engine(
+        settings.DATABASE_URL,
+        poolclass=pool.NullPool,          # mantenemos NullPool para migraciones
+        connect_args={"statement_cache_size": 0},  # <--- AGREGADO
     )
 
     async with connectable.connect() as connection:
