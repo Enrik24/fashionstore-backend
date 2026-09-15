@@ -2,7 +2,7 @@
 Schemas Pydantic para validación y serialización - Gestión de Catálogo, Productos e Inventario.
 """
 from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional, List
+from typing import Optional, List, Any
 from datetime import datetime, date
 from decimal import Decimal
 from enum import Enum
@@ -283,14 +283,16 @@ class ProductoUpdate(BaseModel):
     proveedor_id: Optional[int] = None
 
 
-class ProductoResponse(ProductoBase):
+class ProductoResumenResponse(ProductoBase):
     id: int
     fecha_creacion: datetime
     
     model_config = ConfigDict(from_attributes=True)
 
 
-class ProductoDetalleResponse(ProductoResponse):
+class ProductoResponse(ProductoBase):
+    id: int
+    fecha_creacion: datetime
     categoria: Optional[CategoriaResponse] = None
     temporada: Optional[TemporadaResponse] = None
     proveedor: Optional[ProveedorResponse] = None
@@ -303,7 +305,7 @@ class ProductoDetalleResponse(ProductoResponse):
 # ============================================
 class VarianteProductoBase(BaseModel):
     producto_id: int
-    talla_id: int
+    talla_id: Optional[int] = None
     color_id: int
     sku_variante: str = Field(..., min_length=1, max_length=50)
     precio_variante: Optional[Decimal] = Field(None, ge=0)
@@ -327,11 +329,43 @@ class VarianteProductoResponse(VarianteProductoBase):
 
 
 class VarianteProductoDetalleResponse(VarianteProductoResponse):
-    producto: ProductoResponse
-    talla: TallaResponse
-    color: ColorResponse
+    talla: Optional[TallaResponse] = None
+    color: Optional[ColorResponse] = None
+    producto: Optional[ProductoResponse] = None
     
     model_config = ConfigDict(from_attributes=True)
+
+
+class ProductoDetalleResponse(ProductoResponse):
+    categoria: Optional[CategoriaResponse] = None
+    temporada: Optional[TemporadaResponse] = None
+    proveedor: Optional[ProveedorResponse] = None
+    variantes: List[VarianteProductoDetalleResponse] = []
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ============================================
+# Schemas de Búsqueda y Filtros Públicos
+# ============================================
+class ProductoFilter(BaseModel):
+    q: Optional[str] = None
+    categoria_id: Optional[int] = None
+    temporada_id: Optional[int] = None
+    talla_id: Optional[int] = None
+    color_id: Optional[int] = None
+    precio_min: Optional[Decimal] = None
+    precio_max: Optional[Decimal] = None
+    ordenar_por: Optional[str] = Field(None, description="precio_asc, precio_desc, nombre, fecha")
+    pagina: int = Field(1, ge=1)
+    limite: int = Field(20, ge=1, le=100)
+
+
+class ProductoBusquedaResponse(BaseModel):
+    items: List[ProductoDetalleResponse]
+    total: int
+    pagina: int
+    total_paginas: int
 
 
 # ============================================
@@ -411,6 +445,10 @@ class DisponibilidadResponse(BaseModel):
     cantidad_disponible: int
     cantidad_reservada: int
     estado: EstadoStockEnum
+    latitud: Optional[float] = None
+    longitud: Optional[float] = None
+    direccion: Optional[str] = None
+    horario_atencion: Optional[str] = None
 
 
 class DisponibilidadProductoResponse(BaseModel):
@@ -418,11 +456,17 @@ class DisponibilidadProductoResponse(BaseModel):
     producto_id: int
     producto_nombre: str
     sku: str
-    talla: str
-    color: str
+    talla: Optional[str] = None
+    color: Optional[str] = None
     disponibilidad: List[DisponibilidadResponse]
     
     model_config = ConfigDict(from_attributes=True)
+
+
+class StockVarianteSucursalResponse(BaseModel):
+    variante_id: int
+    sku_variante: str
+    sucursales: List[DisponibilidadResponse]
 
 
 # ============================================
@@ -432,11 +476,13 @@ class StockPorSucursalRequest(BaseModel):
     """Request para crear stock inicial por sucursal."""
     sucursal_id: int
     cantidad: int = Field(0, ge=0)
+    talla_id: Optional[int] = None
+    color_id: Optional[int] = None
 
 
 class AgregarVarianteRequest(BaseModel):
     """Request para agregar una variante a un producto."""
-    talla_id: int
+    talla_id: Optional[int] = None
     color_id: int
     sku_variante: str
     precio_variante: Optional[Decimal] = None

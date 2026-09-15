@@ -2,14 +2,19 @@
 Router - Gestión de Catálogo, Productos e Inventario
 Contiene todos los endpoints de la App 2.
 """
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, UploadFile, File, HTTPException, status, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from typing import List, Optional
 from datetime import datetime
+from decimal import Decimal
 
-from app.database import get_db
+from app.database import get_db, AsyncSessionLocal
 from app.security import get_current_user, require_role
 from app.apps.gestion_usuarios.models import Usuario
+from app.services.cloudinary_service import CloudinaryService
+from app.services.websocket_manager import manager
 from app.apps.gestion_catalogo import services as catalogo_services
 from app.apps.gestion_catalogo.schemas import (
     # Ciudad
@@ -36,7 +41,9 @@ from app.apps.gestion_catalogo.schemas import (
     # Movimiento
     MovimientoInventarioCreate, MovimientoInventarioResponse,
     # Disponibilidad
-    DisponibilidadProductoResponse, DisponibilidadResponse,
+    DisponibilidadProductoResponse, DisponibilidadResponse, StockVarianteSucursalResponse,
+    # Búsqueda y Filtros
+    ProductoFilter, ProductoBusquedaResponse,
     # Requests
     StockPorSucursalRequest, AsociarColeccionRequest,
 )
@@ -51,7 +58,6 @@ router = APIRouter(prefix="/api/v1", tags=["Gestión de Catálogo, Productos e I
 
 @router.get("/ciudades/", response_model=List[CiudadResponse], name="list_ciudades")
 async def listar_ciudades(
-    current_user: Usuario = Depends(require_role("Administrador")),
     db: AsyncSession = Depends(get_db)
 ):
     """Lista todas las ciudades."""
@@ -71,7 +77,6 @@ async def crear_ciudad(
 @router.get("/ciudades/{ciudad_id}", response_model=CiudadResponse, name="get_ciudad")
 async def obtener_ciudad(
     ciudad_id: int,
-    current_user: Usuario = Depends(require_role("Administrador")),
     db: AsyncSession = Depends(get_db)
 ):
     """Obtiene una ciudad por su ID."""
@@ -110,7 +115,6 @@ async def listar_sucursales(
     limit: int = Query(100, ge=1, le=100),
     ciudad_id: Optional[int] = None,
     estado: Optional[str] = None,
-    current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
     db: AsyncSession = Depends(get_db)
 ):
     """Lista todas las sucursales."""
@@ -131,7 +135,6 @@ async def crear_sucursal(
 @router.get("/sucursales/{sucursal_id}", response_model=SucursalConCiudadResponse, name="get_sucursal")
 async def obtener_sucursal(
     sucursal_id: int,
-    current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
     db: AsyncSession = Depends(get_db)
 ):
     """Obtiene una sucursal por su ID."""
@@ -165,7 +168,6 @@ async def productos_por_sucursal(
     sucursal_id: int,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
-    current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
     db: AsyncSession = Depends(get_db)
 ):
     """Obtiene los productos disponibles en una sucursal."""
@@ -227,6 +229,20 @@ async def eliminar_categoria(
     """Elimina una categoría."""
     await catalogo_services.CategoriaService.delete(db, categoria_id)
     return {"message": "Categoría eliminada exitosamente"}
+
+
+@router.get("/categorias/{categoria_id}/productos", response_model=List[ProductoResponse], name="get_productos_categoria")
+async def productos_por_categoria(
+    categoria_id: int,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    db: AsyncSession = Depends(get_db)
+):
+    """Obtiene los productos pertenecientes a una categoría."""
+    productos, total = await catalogo_services.ProductoService.get_all(
+        db, skip=skip, limit=limit, categoria_id=categoria_id
+    )
+    return productos
 
 
 # ============================================
@@ -328,6 +344,20 @@ async def eliminar_temporada(
     return {"message": "Temporada eliminada exitosamente"}
 
 
+@router.get("/temporadas/{temporada_id}/productos", response_model=List[ProductoResponse], name="get_productos_temporada")
+async def productos_por_temporada(
+    temporada_id: int,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    db: AsyncSession = Depends(get_db)
+):
+    """Obtiene los productos pertenecientes a una temporada."""
+    productos, total = await catalogo_services.ProductoService.get_all(
+        db, skip=skip, limit=limit, temporada_id=temporada_id
+    )
+    return productos
+
+
 # ============================================
 # Endpoints de Colección
 # ============================================
@@ -381,6 +411,27 @@ async def eliminar_coleccion(
     """Elimina una colección."""
     await catalogo_services.ColeccionService.delete(db, coleccion_id)
     return {"message": "Colección eliminada exitosamente"}
+
+
+@router.get("/colecciones/{coleccion_id}/productos", response_model=List[ProductoResponse], name="get_productos_coleccion")
+async def productos_por_coleccion(
+    coleccion_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Obtiene los productos asociados a una colección."""
+    from app.apps.gestion_catalogo.models import Coleccion, Producto
+    res = await db.execute(
+        select(Coleccion).options(
+            selectinload(Coleccion.productos).selectinload(Producto.categoria),
+            selectinload(Coleccion.productos).selectinload(Producto.temporada),
+            selectinload(Coleccion.productos).selectinload(Producto.proveedor),
+            selectinload(Coleccion.productos).selectinload(Producto.variantes)
+        ).where(Coleccion.id == coleccion_id)
+    )
+    col = res.scalar_one_or_none()
+    if not col:
+        raise HTTPException(status_code=404, detail="Colección no encontrada")
+    return col.productos
 
 
 # ============================================
@@ -619,10 +670,112 @@ async def listar_movimientos(
 
 
 # ============================================
-# Endpoints de Disponibilidad (Públicos)
+# Endpoints de Catálogo y Disponibilidad (Públicos)
 # ============================================
 
-@router.get("/public/disponibilidad/{producto_id}", name="disponibilidad_producto")
+@router.get("/public/catalogo", response_model=ProductoBusquedaResponse, name="public_catalogo")
+async def catalogo_publico(
+    q: Optional[str] = None,
+    categoria_id: Optional[int] = None,
+    temporada_id: Optional[int] = None,
+    talla_id: Optional[int] = None,
+    color_id: Optional[int] = None,
+    precio_min: Optional[Decimal] = None,
+    precio_max: Optional[Decimal] = None,
+    ordenar_por: Optional[str] = Query(None, description="precio_asc, precio_desc, nombre, fecha"),
+    pagina: int = Query(1, ge=1),
+    limite: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db)
+):
+    """Obtiene el catálogo público de productos con filtros y paginación."""
+    filtros = ProductoFilter(
+        q=q,
+        categoria_id=categoria_id,
+        temporada_id=temporada_id,
+        talla_id=talla_id,
+        color_id=color_id,
+        precio_min=precio_min,
+        precio_max=precio_max,
+        ordenar_por=ordenar_por,
+        pagina=pagina,
+        limite=limite
+    )
+    productos, total = await catalogo_services.ProductoService.search_productos_publicos(db, filtros)
+    total_paginas = (total + limite - 1) // limite if total > 0 else 1
+    return {
+        "items": productos,
+        "total": total,
+        "pagina": pagina,
+        "total_paginas": total_paginas
+    }
+
+
+@router.get("/public/productos/buscar", response_model=ProductoBusquedaResponse, name="public_buscar_productos")
+async def buscar_productos_publico(
+    q: Optional[str] = None,
+    categoria_id: Optional[int] = None,
+    temporada_id: Optional[int] = None,
+    talla_id: Optional[int] = None,
+    color_id: Optional[int] = None,
+    precio_min: Optional[Decimal] = None,
+    precio_max: Optional[Decimal] = None,
+    ordenar_por: Optional[str] = None,
+    pagina: int = Query(1, ge=1),
+    limite: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db)
+):
+    """Búsqueda avanzada de productos en el catálogo público."""
+    filtros = ProductoFilter(
+        q=q,
+        categoria_id=categoria_id,
+        temporada_id=temporada_id,
+        talla_id=talla_id,
+        color_id=color_id,
+        precio_min=precio_min,
+        precio_max=precio_max,
+        ordenar_por=ordenar_por,
+        pagina=pagina,
+        limite=limite
+    )
+    productos, total = await catalogo_services.ProductoService.search_productos_publicos(db, filtros)
+    total_paginas = (total + limite - 1) // limite if total > 0 else 1
+    return {
+        "items": productos,
+        "total": total,
+        "pagina": pagina,
+        "total_paginas": total_paginas
+    }
+
+
+@router.get("/public/productos/populares", response_model=List[ProductoDetalleResponse], name="public_productos_populares")
+async def productos_populares_publico(
+    limit: int = Query(10, ge=1, le=50),
+    db: AsyncSession = Depends(get_db)
+):
+    """Obtiene los productos destacados / populares del catálogo."""
+    return await catalogo_services.ProductoService.get_productos_populares(db, limit)
+
+
+@router.get("/public/productos/{producto_id}", response_model=ProductoDetalleResponse, name="public_detalle_producto")
+async def detalle_producto_publico(
+    producto_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Obtiene los detalles públicos de un producto específico."""
+    return await catalogo_services.ProductoService.get(db, producto_id)
+
+
+@router.get("/public/productos/{producto_id}/relacionados", response_model=List[ProductoDetalleResponse], name="public_productos_relacionados")
+async def productos_relacionados_publico(
+    producto_id: int,
+    limit: int = Query(6, ge=1, le=20),
+    db: AsyncSession = Depends(get_db)
+):
+    """Obtiene productos relacionados de la misma categoría/temporada."""
+    return await catalogo_services.ProductoService.get_productos_relacionados(db, producto_id, limit)
+
+
+@router.get("/public/disponibilidad/{producto_id}", response_model=DisponibilidadProductoResponse, name="disponibilidad_producto")
 async def disponibilidad_producto(
     producto_id: int,
     talla_id: Optional[int] = None,
@@ -633,6 +786,65 @@ async def disponibilidad_producto(
     return await catalogo_services.DisponibilidadService.get_disponibilidad_producto(
         db, producto_id, talla_id, color_id
     )
+
+
+@router.get("/public/disponibilidad/{producto_id}/sucursal/{sucursal_id}", name="disponibilidad_producto_sucursal")
+async def disponibilidad_producto_por_sucursal(
+    producto_id: int,
+    sucursal_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Obtiene la disponibilidad de todas las variantes de un producto en una sucursal específica."""
+    return await catalogo_services.DisponibilidadService.get_stock_por_sucursal(
+        db, producto_id, sucursal_id
+    )
+
+
+@router.get("/public/stock/{variante_id}", name="disponibilidad_variante_todas_sucursales")
+async def stock_variante_todas_sucursales(
+    variante_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Obtiene el stock de una variante específica en todas las sucursales."""
+    return await catalogo_services.DisponibilidadService.get_disponibilidad_variante(
+        db, variante_id
+    )
+
+
+@router.websocket("/ws/disponibilidad/{producto_id}")
+async def websocket_disponibilidad(websocket: WebSocket, producto_id: int):
+    """
+    WebSocket endpoint para consultar y recibir actualizaciones de disponibilidad
+    en tiempo real para un producto según la talla y color seleccionados.
+    """
+    await manager.connect(websocket, producto_id)
+    try:
+        # Enviar disponibilidad inicial general
+        async with AsyncSessionLocal() as db:
+            try:
+                data = await catalogo_services.DisponibilidadService.get_disponibilidad_producto(
+                    db, producto_id, None, None
+                )
+                await websocket.send_json(data)
+            except Exception as e:
+                await websocket.send_json({"error": str(e)})
+
+        while True:
+            msg = await websocket.receive_json()
+            talla_id = msg.get("talla_id") if isinstance(msg, dict) else None
+            color_id = msg.get("color_id") if isinstance(msg, dict) else None
+            async with AsyncSessionLocal() as db:
+                try:
+                    data = await catalogo_services.DisponibilidadService.get_disponibilidad_producto(
+                        db, producto_id, talla_id, color_id
+                    )
+                    await websocket.send_json(data)
+                except Exception as e:
+                    await websocket.send_json({"error": str(e)})
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, producto_id)
+    except Exception:
+        manager.disconnect(websocket, producto_id)
 
 
 # ============================================
@@ -646,6 +858,47 @@ async def alertas_stock(
 ):
     """Obtiene productos con stock bajo el mínimo."""
     return await catalogo_services.InventarioService.get_alertas_stock(db)
+
+
+# ============================================
+# Endpoints de Carga y Gestión de Archivos (Cloudinary)
+# ============================================
+
+@router.post("/upload/imagen", name="subir_imagen")
+async def subir_imagen(
+    file: UploadFile = File(...),
+    folder: str = Query("fashionstore/productos"),
+    current_user: Usuario = Depends(require_role("Administrador", "Encargado"))
+):
+    """Sube una imagen a Cloudinary y retorna sus URLs y public_id."""
+    try:
+        resultado = CloudinaryService.upload_image(file.file, folder=folder)
+        return resultado
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al subir imagen a Cloudinary: {str(e)}"
+        )
+
+
+@router.delete("/upload/imagen", name="eliminar_imagen")
+async def eliminar_imagen(
+    public_id: str = Query(..., description="ID público de Cloudinary de la imagen"),
+    current_user: Usuario = Depends(require_role("Administrador", "Encargado"))
+):
+    """Elimina una imagen de Cloudinary por su public_id (limpieza de imágenes huérfanas)."""
+    try:
+        exito = CloudinaryService.delete_image(public_id)
+        return {
+            "success": exito,
+            "message": "Imagen eliminada de Cloudinary" if exito else "No se pudo eliminar la imagen",
+            "public_id": public_id
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al eliminar imagen de Cloudinary: {str(e)}"
+        )
 
 
 # ============================================

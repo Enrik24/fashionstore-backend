@@ -16,10 +16,18 @@ class AuthorizationException(HTTPException):
         super().__init__(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
 
 
+# Alias común
+ForbiddenException = AuthorizationException
+
+
 class ValidationException(HTTPException):
     """Excepción para errores de validación."""
     def __init__(self, detail: str = "Error de validación"):
         super().__init__(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+
+# Alias común
+BadRequestException = ValidationException
 
 
 class NotFoundException(HTTPException):
@@ -31,7 +39,7 @@ class NotFoundException(HTTPException):
 class ConflictException(HTTPException):
     """Excepción para conflictos de datos."""
     def __init__(self, detail: str = "Conflicto de datos"):
-        super().__init__(status_code=status.HTTP_409_CONCESSION, detail=detail)
+        super().__init__(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
 
 class ExternalServiceException(HTTPException):

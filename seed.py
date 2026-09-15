@@ -1,10 +1,14 @@
 """
 Script de Seeder para FashionStore Backend.
-Puebla la base de datos con datos iniciales y todos los tipos de usuarios:
-- Administrador
-- Encargado de Sucursal
-- Cajero
-- Clientes
+Puebla la base de datos con datos iniciales completos e idempotentes:
+- Permisos y Roles (incluyendo Administrador, Encargado, Cajero, Cliente)
+- Datos básicos de catálogo (Categorías, Tallas, Colores)
+- Ciudades y Sucursales con coordenadas geográficas
+- Proveedores, Temporadas y Colecciones
+- Catálogo de Productos reales con URLs de Cloudinary
+- Variantes de Producto (combinación Talla x Color)
+- Inventario distribuido por Sucursal
+- Usuarios por tipo (Admin, Encargado, Cajero, Clientes de prueba)
 
 Este script es IDEMPOTENTE: puede ejecutarse múltiples veces de forma segura
 sin duplicar registros ni generar errores de unicidad.
@@ -13,24 +17,32 @@ Uso:
     python seed.py
 """
 import asyncio
-import sys
-from typing import Optional
+from datetime import date
+from decimal import Decimal
+from typing import Optional, Dict, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.database import engine, Base, AsyncSessionLocal
 from app.security import get_password_hash
 import app.apps.gestion_ventas.models
-import app.apps.servicios_intelientes.models
+import app.apps.servicios_inteligentes.models
 from app.apps.gestion_usuarios.models import (
     Usuario, Rol, Permiso, UsuarioRol, RolPermiso,
     Cliente, Administrador, EncargadoSucursal, Cajero, EstadoUsuario
 )
 from app.apps.gestion_catalogo.models import (
-    Ciudad, Sucursal, Categoria, Talla, Color, EstadoSucursal
+    Ciudad, Sucursal, Categoria, Talla, Color, EstadoSucursal,
+    Proveedor, Temporada, Coleccion, Producto, ProductoColeccion,
+    VarianteProducto, Inventario, MovimientoInventario,
+    EstadoProducto, EstadoStock, TipoMovimiento
 )
 from app.apps.gestion_catalogo.services import DatosInicialesCatalogoService
 
+
+# =====================================================================
+# 1. PERMISOS Y ROLES
+# =====================================================================
 
 async def seed_permisos(db: AsyncSession) -> dict:
     """Crea los permisos del sistema si no existen."""
@@ -119,41 +131,406 @@ async def seed_roles(db: AsyncSession, permisos: dict) -> dict:
     return roles
 
 
-async def seed_sucursal_por_defecto(db: AsyncSession) -> Sucursal:
-    """Asegura que exista al menos una ciudad y una sucursal para asignar a Encargados y Cajeros."""
-    # Ciudad
-    res_ciudad = await db.execute(select(Ciudad).where(Ciudad.nombre == "Santa Cruz de la Sierra"))
-    ciudad = res_ciudad.scalar_one_or_none()
-    if not ciudad:
-        ciudad = Ciudad(
-            nombre="Santa Cruz de la Sierra",
-            codigo_postal="0000",
-            pais="Bolivia"
-        )
-        db.add(ciudad)
-        await db.flush()
-        print(f"  [+] Ciudad creada: {ciudad.nombre}")
-    
-    # Sucursal
-    res_sucursal = await db.execute(select(Sucursal).where(Sucursal.nombre == "Sucursal Central"))
-    sucursal = res_sucursal.scalar_one_or_none()
-    if not sucursal:
-        sucursal = Sucursal(
-            nombre="Sucursal Central",
-            direccion="Av. Monseñor Rivero #300, Santa Cruz",
-            telefono="33123456",
-            horario_atencion="09:00 - 21:00",
-            estado=EstadoSucursal.ACTIVO,
-            latitud=-17.7833,
-            longitud=-63.1821,
-            ciudad_id=ciudad.id
-        )
-        db.add(sucursal)
-        await db.flush()
-        print(f"  [+] Sucursal creada: {sucursal.nombre}")
-    
-    return sucursal
+# =====================================================================
+# 2. CIUDADES Y SUCURSALES (CON COORDENADAS)
+# =====================================================================
 
+async def seed_ciudades_y_sucursales(db: AsyncSession) -> Dict[str, Sucursal]:
+    """Crea ciudades y sucursales con coordenadas geográficas."""
+    ciudades_data = [
+        ("Santa Cruz de la Sierra", "0000", "Bolivia"),
+        ("La Paz", "0000", "Bolivia"),
+        ("Cochabamba", "0000", "Bolivia"),
+    ]
+    ciudades_map = {}
+    for nombre_c, cp, pais in ciudades_data:
+        res_c = await db.execute(select(Ciudad).where(Ciudad.nombre == nombre_c))
+        c_obj = res_c.scalar_one_or_none()
+        if not c_obj:
+            c_obj = Ciudad(nombre=nombre_c, codigo_postal=cp, pais=pais)
+            db.add(c_obj)
+            await db.flush()
+        ciudades_map[nombre_c] = c_obj
+
+    sucursales_data = [
+        ("Sucursal Central", "Av. Monseñor Rivero #300, Santa Cruz", "33123456", "09:00 - 21:00", -17.7833, -63.1821, "Santa Cruz de la Sierra"),
+        ("Sucursal Equipetrol", "Av. San Martín y Calle 5 Este, Santa Cruz", "33987654", "10:00 - 22:00", -17.7654, -63.1950, "Santa Cruz de la Sierra"),
+        ("Sucursal Ventura Mall", "4to Anillo y Av. San Martín, Santa Cruz", "33456789", "10:00 - 22:00", -17.7550, -63.1980, "Santa Cruz de la Sierra"),
+        ("Sucursal Calacoto", "Av. Ballivián #1200, La Paz", "22789012", "09:00 - 20:00", -16.5390, -68.0890, "La Paz"),
+        ("Sucursal Cochabamba Plaza", "Av. Heroínas #450, Cochabamba", "44123456", "09:00 - 20:00", -17.3935, -66.1570, "Cochabamba"),
+    ]
+
+    sucursales_map = {}
+    for nombre_s, dir_s, tel_s, hor_s, lat_s, lon_s, ciud_nom in sucursales_data:
+        res_s = await db.execute(select(Sucursal).where(Sucursal.nombre == nombre_s))
+        s_obj = res_s.scalar_one_or_none()
+        if not s_obj:
+            s_obj = Sucursal(
+                nombre=nombre_s,
+                direccion=dir_s,
+                telefono=tel_s,
+                horario_atencion=hor_s,
+                estado=EstadoSucursal.ACTIVO,
+                latitud=lat_s,
+                longitud=lon_s,
+                ciudad_id=ciudades_map[ciud_nom].id
+            )
+            db.add(s_obj)
+            await db.flush()
+            print(f"  [+] Sucursal creada: {s_obj.nombre}")
+        else:
+            # Actualizar coordenadas si no las tenía
+            if s_obj.latitud is None or s_obj.longitud is None:
+                s_obj.latitud = lat_s
+                s_obj.longitud = lon_s
+                await db.flush()
+        sucursales_map[nombre_s] = s_obj
+
+    return sucursales_map
+
+
+# =====================================================================
+# 3. PROVEEDORES, TEMPORADAS Y COLECCIONES
+# =====================================================================
+
+async def seed_proveedores(db: AsyncSession) -> Dict[str, Proveedor]:
+    """Crea proveedores iniciales."""
+    proveedores_data = [
+        ("Textiles Andinos S.A.", "1029384019", "Juan Valdez", "71234567", "ventas@textilesandinos.bo", "Parque Industrial Mza 12, Santa Cruz"),
+        ("Moda Express Bolivia S.R.L.", "2039485028", "Elena Rojas", "72345678", "contacto@modaexpress.bo", "Av. Arce #2145, La Paz"),
+        ("Confecciones del Valle", "3049586037", "Mario Suarez", "73456789", "info@confeccionesvalle.bo", "Av. Heroínas #560, Cochabamba"),
+    ]
+    prov_map = {}
+    for nom, nit, cont, tel, corr, direc in proveedores_data:
+        res = await db.execute(select(Proveedor).where(Proveedor.nit == nit))
+        p = res.scalar_one_or_none()
+        if not p:
+            p = Proveedor(nombre=nom, nit=nit, contacto=cont, telefono=tel, correo=corr, direccion=direc)
+            db.add(p)
+            await db.flush()
+            print(f"  [+] Proveedor creado: {p.nombre}")
+        prov_map[nom] = p
+    return prov_map
+
+
+async def seed_temporadas_colecciones(db: AsyncSession) -> tuple[Temporada, Coleccion]:
+    """Crea temporadas y colecciones iniciales."""
+    res_temp = await db.execute(select(Temporada).where(Temporada.nombre == "Primavera - Verano 2026"))
+    temp = res_temp.scalar_one_or_none()
+    if not temp:
+        temp = Temporada(
+            nombre="Primavera - Verano 2026",
+            fecha_inicio=date(2026, 1, 1),
+            fecha_fin=date(2026, 6, 30),
+            descripcion="Colección fresca y dinámica de prendas y accesorios para la temporada de verano 2026"
+        )
+        db.add(temp)
+        await db.flush()
+        print(f"  [+] Temporada creada: {temp.nombre}")
+
+    res_col = await db.execute(select(Coleccion).where(Coleccion.nombre == "Urban Casual & Heritage 2026"))
+    col = res_col.scalar_one_or_none()
+    if not col:
+        col = Coleccion(
+            nombre="Urban Casual & Heritage 2026",
+            descripcion="Prendas de alta durabilidad, estilo urbano y carácter auténtico",
+            temporada_id=temp.id
+        )
+        db.add(col)
+        await db.flush()
+        print(f"  [+] Colección creada: {col.nombre}")
+
+    return temp, col
+
+
+# =====================================================================
+# 4. PRODUCTOS CON IMÁGENES CLOUDINARY, VARIANTES E INVENTARIOS
+# =====================================================================
+
+async def seed_productos_y_stock(
+    db: AsyncSession,
+    sucursales: Dict[str, Sucursal],
+    proveedor: Proveedor,
+    temporada: Temporada,
+    coleccion: Coleccion
+):
+    """
+    Registra los 10 productos reales con sus URLs de Cloudinary,
+    sus variantes de tallas y colores, e inventario en cada sucursal.
+    """
+    # Mapeo de Categorías
+    cats = (await db.execute(select(Categoria))).scalars().all()
+    cat_map = {c.nombre: c.id for c in cats}
+
+    # Mapeo de Tallas y Colores
+    tallas = (await db.execute(select(Talla))).scalars().all()
+    talla_map = {t.valor: t.id for t in tallas}
+
+    colores = (await db.execute(select(Color))).scalars().all()
+    color_map = {c.nombre: c.id for c in colores}
+
+    # Catálogo de Productos Reales (con Cloudinary URLs y descripciones exactas)
+    productos_catalogo = [
+        {
+            "sku": "PRD-3243",
+            "nombre": "Polera Everyday Workwear Graphic Tee 5 Pitch Black",
+            "descripcion": "Polera casual de cuello redondo, confeccionada en algodón suave y resistente con el clásico logo Caterpillar estampado en el pecho.",
+            "precio": Decimal("249.00"),
+            "categoria": "Poleras",
+            "imagenes": [
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789337535/fashionstore/productos/jr1qkimknvehnmnaz2dx.png"
+            ],
+            "variantes": [
+                {"sku": "PRD-3243-3-1", "talla": "M", "color": "Negro", "stock": {"Sucursal Central": 30, "Sucursal Equipetrol": 15, "Sucursal Ventura Mall": 15, "Sucursal Calacoto": 10, "Sucursal Cochabamba Plaza": 10}},
+                {"sku": "PRD-3243-2-1", "talla": "S", "color": "Negro", "stock": {"Sucursal Central": 20, "Sucursal Equipetrol": 10, "Sucursal Ventura Mall": 10, "Sucursal Calacoto": 8, "Sucursal Cochabamba Plaza": 8}},
+                {"sku": "PRD-3243-4-1", "talla": "L", "color": "Negro", "stock": {"Sucursal Central": 25, "Sucursal Equipetrol": 12, "Sucursal Ventura Mall": 12, "Sucursal Calacoto": 8, "Sucursal Cochabamba Plaza": 8}},
+            ]
+        },
+        {
+            "sku": "PRD-6274",
+            "nombre": "Polera Hombre Caterpillar Trademark Logo Tee Laurel Green",
+            "descripcion": "Polera de corte regular en tono verde laurel, ideal para el uso diario al aire libre o actividades casuales.",
+            "precio": Decimal("249.00"),
+            "categoria": "Poleras",
+            "imagenes": [
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789102474/fashionstore/productos/ezyk5wbumilcvcfrxcht.jpg",
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789102473/fashionstore/productos/kk5mdkm2qzelcrvindak.jpg"
+            ],
+            "variantes": [
+                {"sku": "PRD-6274-3-6", "talla": "M", "color": "Verde", "stock": {"Sucursal Central": 35, "Sucursal Equipetrol": 15, "Sucursal Ventura Mall": 15, "Sucursal Calacoto": 10, "Sucursal Cochabamba Plaza": 10}},
+                {"sku": "PRD-6274-4-6", "talla": "L", "color": "Verde", "stock": {"Sucursal Central": 20, "Sucursal Equipetrol": 10, "Sucursal Ventura Mall": 10, "Sucursal Calacoto": 8, "Sucursal Cochabamba Plaza": 8}},
+            ]
+        },
+        {
+            "sku": "PRD-7989",
+            "nombre": "CAT Polera Heritage Peoria Graphic Hombre",
+            "descripcion": "La Caterpillar Heritage Peoria Graphic es una polera para hombre que rinde homenaje al legado industrial de la marca. Su diseño clásico con gráfico frontal combina comodidad y durabilidad, convirtiéndola en una prenda esencial para un estilo casual con carácter auténtico.",
+            "precio": Decimal("249.00"),
+            "categoria": "Poleras",
+            "imagenes": [
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789102899/fashionstore/productos/htjhwbchptb7qjop1hv8.jpg",
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789102898/fashionstore/productos/zdvbt0fo0m6l8duzifof.jpg"
+            ],
+            "variantes": [
+                {"sku": "PRD-7989-3-3", "talla": "M", "color": "Gris", "stock": {"Sucursal Central": 25, "Sucursal Equipetrol": 12, "Sucursal Ventura Mall": 12, "Sucursal Calacoto": 8, "Sucursal Cochabamba Plaza": 8}},
+                {"sku": "PRD-7989-4-3", "talla": "L", "color": "Gris", "stock": {"Sucursal Central": 18, "Sucursal Equipetrol": 10, "Sucursal Ventura Mall": 10, "Sucursal Calacoto": 6, "Sucursal Cochabamba Plaza": 6}},
+            ]
+        },
+        {
+            "sku": "PRD-6798",
+            "nombre": "Polera Hombre Caterpillar Logo Heather Grey Yellow",
+            "descripcion": "Polera juvenil de color Gris con acentos amarillos, suave textura y máxima frescura para el día a día.",
+            "precio": Decimal("180.00"),
+            "categoria": "Poleras",
+            "imagenes": [
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789103014/fashionstore/productos/usof4dhptw8wqpvtvcgb.jpg"
+            ],
+            "variantes": [
+                {"sku": "PRD-6798-3-3", "talla": "M", "color": "Gris", "stock": {"Sucursal Central": 30, "Sucursal Equipetrol": 15, "Sucursal Ventura Mall": 15, "Sucursal Calacoto": 10, "Sucursal Cochabamba Plaza": 10}},
+                {"sku": "PRD-6798-2-3", "talla": "S", "color": "Gris", "stock": {"Sucursal Central": 15, "Sucursal Equipetrol": 8, "Sucursal Ventura Mall": 8, "Sucursal Calacoto": 5, "Sucursal Cochabamba Plaza": 5}},
+            ]
+        },
+        {
+            "sku": "PRD-2697",
+            "nombre": "Polera Hombre Cat Logo Detroit Blue White",
+            "descripcion": "Polera para las temporadas de verano en tono azul Detroit, confeccionada en algodón premium respirable.",
+            "precio": Decimal("249.00"),
+            "categoria": "Poleras",
+            "imagenes": [
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789103218/fashionstore/productos/d03vioo1qir4yqpxxetu.jpg"
+            ],
+            "variantes": [
+                {"sku": "PRD-2697-3-4", "talla": "M", "color": "Azul", "stock": {"Sucursal Central": 25, "Sucursal Equipetrol": 12, "Sucursal Ventura Mall": 12, "Sucursal Calacoto": 8, "Sucursal Cochabamba Plaza": 8}},
+                {"sku": "PRD-2697-4-4", "talla": "L", "color": "Azul", "stock": {"Sucursal Central": 20, "Sucursal Equipetrol": 10, "Sucursal Ventura Mall": 10, "Sucursal Calacoto": 6, "Sucursal Cochabamba Plaza": 6}},
+            ]
+        },
+        {
+            "sku": "PRD-9730",
+            "nombre": "CAT Polera Heritage Peoria Graphic Hombre Negro",
+            "descripcion": "La Caterpillar Heritage Peoria Graphic Tee es una polera para hombre que rinde homenaje al legado industrial de la marca. Su diseño clásico en color negro profundo combina comodidad y durabilidad.",
+            "precio": Decimal("249.00"),
+            "categoria": "Poleras",
+            "imagenes": [
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789103405/fashionstore/productos/epy4rmnfuwwct1bximd3.jpg",
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789103404/fashionstore/productos/dm2grh2phghazebpaiul.jpg"
+            ],
+            "variantes": [
+                {"sku": "PRD-9730-3-1", "talla": "M", "color": "Negro", "stock": {"Sucursal Central": 25, "Sucursal Equipetrol": 12, "Sucursal Ventura Mall": 12, "Sucursal Calacoto": 8, "Sucursal Cochabamba Plaza": 8}},
+                {"sku": "PRD-9730-4-1", "talla": "L", "color": "Negro", "stock": {"Sucursal Central": 20, "Sucursal Equipetrol": 10, "Sucursal Ventura Mall": 10, "Sucursal Calacoto": 6, "Sucursal Cochabamba Plaza": 6}},
+            ]
+        },
+        {
+            "sku": "PRD-1009",
+            "nombre": "Gorra Cat Logo Hombre Yellow",
+            "descripcion": "Gorra clásica ajustable con visera curva y logo CAT bordado en amarillo brillante de alta densidad.",
+            "precio": Decimal("210.00"),
+            "categoria": "Accesorios",
+            "imagenes": [
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789103692/fashionstore/productos/u2pv3wukhjlizyfdytev.jpg",
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789103693/fashionstore/productos/zdm8vsoyesywllqcpoal.jpg"
+            ],
+            "variantes": [
+                {"sku": "PRD-1009-4-7", "talla": "L", "color": "Amarillo", "stock": {"Sucursal Central": 25, "Sucursal Equipetrol": 10, "Sucursal Ventura Mall": 12, "Sucursal Calacoto": 6, "Sucursal Cochabamba Plaza": 6}},
+                {"sku": "PRD-1009-3-7", "talla": "M", "color": "Amarillo", "stock": {"Sucursal Central": 20, "Sucursal Equipetrol": 8, "Sucursal Ventura Mall": 10, "Sucursal Calacoto": 5, "Sucursal Cochabamba Plaza": 5}},
+            ]
+        },
+        {
+            "sku": "PRD-2630",
+            "nombre": "Gorra Caterpillar 100Th Hombre Pitch Black",
+            "descripcion": "Gorra de algodón edición especial 100Th aniversario, resistente y ventilada para climas cálidos y uso rudo.",
+            "precio": Decimal("280.00"),
+            "categoria": "Accesorios",
+            "imagenes": [
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789132323/fashionstore/productos/sacencilrabr5qtf3cwa.jpg",
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789132322/fashionstore/productos/bxg2zvs8fjxlunpbdzzv.jpg"
+            ],
+            "variantes": [
+                {"sku": "PRD-2630-4-1", "talla": "L", "color": "Negro", "stock": {"Sucursal Central": 15, "Sucursal Equipetrol": 8, "Sucursal Ventura Mall": 10, "Sucursal Calacoto": 5, "Sucursal Cochabamba Plaza": 5}},
+                {"sku": "PRD-2630-3-1", "talla": "M", "color": "Negro", "stock": {"Sucursal Central": 15, "Sucursal Equipetrol": 8, "Sucursal Ventura Mall": 8, "Sucursal Calacoto": 5, "Sucursal Cochabamba Plaza": 5}},
+            ]
+        },
+        {
+            "sku": "PRD-9664",
+            "nombre": "Gorra Cat Logo Hombre Barn Red-White",
+            "descripcion": "Gorra trucker bicolor en rojo granero y blanco con malla transpirable trasera y broche snapback regulable.",
+            "precio": Decimal("250.00"),
+            "categoria": "Accesorios",
+            "imagenes": [
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789133522/fashionstore/productos/uegzagcdbopu7bulx26u.jpg",
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789133522/fashionstore/productos/evns90lew3tysevdar4u.jpg"
+            ],
+            "variantes": [
+                {"sku": "PRD-9664-3-5", "talla": "M", "color": "Rojo", "stock": {"Sucursal Central": 15, "Sucursal Equipetrol": 8, "Sucursal Ventura Mall": 8, "Sucursal Calacoto": 5, "Sucursal Cochabamba Plaza": 5}},
+                {"sku": "PRD-9664-4-5", "talla": "L", "color": "Rojo", "stock": {"Sucursal Central": 12, "Sucursal Equipetrol": 6, "Sucursal Ventura Mall": 6, "Sucursal Calacoto": 4, "Sucursal Cochabamba Plaza": 4}},
+            ]
+        },
+        {
+            "sku": "PRD-9453",
+            "nombre": "CAT Chaqueta Softshell Hombre",
+            "descripcion": "La CAT Softshell Jacket está diseñada para ofrecer protección, flexibilidad y confort en actividades dinámicas. Su construcción técnica combina resistencia al clima con una excelente movilidad, convirtiéndola en una prenda ideal para el trabajo activo y el uso diario en exteriores. Equipada con tecnología Storm Blocker®, repele el agua, bloquea el viento y mantiene una óptima transpirabilidad.",
+            "precio": Decimal("990.00"),
+            "categoria": "Abrigos",
+            "imagenes": [
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789133785/fashionstore/productos/ybkjbqrdqvvkepg8nlwy.jpg",
+                "https://res.cloudinary.com/dw9etiykm/image/upload/v1789133783/fashionstore/productos/kmkeszphuo7d7z13uacr.jpg"
+            ],
+            "variantes": [
+                {"sku": "PRD-9453-4-1", "talla": "L", "color": "Negro", "stock": {"Sucursal Central": 20, "Sucursal Equipetrol": 10, "Sucursal Ventura Mall": 10, "Sucursal Calacoto": 8, "Sucursal Cochabamba Plaza": 8}},
+                {"sku": "PRD-9453-3-1", "talla": "M", "color": "Negro", "stock": {"Sucursal Central": 15, "Sucursal Equipetrol": 8, "Sucursal Ventura Mall": 8, "Sucursal Calacoto": 5, "Sucursal Cochabamba Plaza": 5}},
+                {"sku": "PRD-9453-5-1", "talla": "XL", "color": "Negro", "stock": {"Sucursal Central": 10, "Sucursal Equipetrol": 5, "Sucursal Ventura Mall": 5, "Sucursal Calacoto": 4, "Sucursal Cochabamba Plaza": 4}},
+            ]
+        },
+    ]
+
+    total_prods = 0
+    total_vars = 0
+    total_invs = 0
+
+    for item in productos_catalogo:
+        # 1. Asegurar Producto
+        res_p = await db.execute(select(Producto).where(Producto.sku == item["sku"]))
+        prod = res_p.scalar_one_or_none()
+        cat_id = cat_map.get(item["categoria"])
+
+        if not prod:
+            prod = Producto(
+                sku=item["sku"],
+                nombre=item["nombre"],
+                descripcion=item["descripcion"],
+                precio=item["precio"],
+                imagenes=item["imagenes"],
+                estado=EstadoProducto.ACTIVO,
+                categoria_id=cat_id,
+                temporada_id=temporada.id if temporada else None,
+                proveedor_id=proveedor.id if proveedor else None
+            )
+            db.add(prod)
+            await db.flush()
+            total_prods += 1
+            print(f"  [+] Producto creado: {prod.sku} - {prod.nombre[:40]}")
+        else:
+            # Asegurar que las imágenes y categoria estén al día
+            prod.imagenes = item["imagenes"]
+            if cat_id:
+                prod.categoria_id = cat_id
+            await db.flush()
+
+        # Asociar a Colección si no está
+        if coleccion:
+            res_pc = await db.execute(
+                select(ProductoColeccion).where(
+                    ProductoColeccion.producto_id == prod.id,
+                    ProductoColeccion.coleccion_id == coleccion.id
+                )
+            )
+            if not res_pc.scalar_one_or_none():
+                db.add(ProductoColeccion(producto_id=prod.id, coleccion_id=coleccion.id))
+                await db.flush()
+
+        # 2. Variantes de Producto
+        for v_item in item["variantes"]:
+            t_id = talla_map.get(v_item["talla"])
+            c_id = color_map.get(v_item["color"])
+
+            res_v = await db.execute(
+                select(VarianteProducto).where(VarianteProducto.sku_variante == v_item["sku"])
+            )
+            var_obj = res_v.scalar_one_or_none()
+            if not var_obj:
+                var_obj = VarianteProducto(
+                    producto_id=prod.id,
+                    talla_id=t_id,
+                    color_id=c_id,
+                    sku_variante=v_item["sku"],
+                    precio_variante=item["precio"]
+                )
+                db.add(var_obj)
+                await db.flush()
+                total_vars += 1
+
+            # 3. Inventario por Sucursal
+            for suc_nombre, cant in v_item["stock"].items():
+                if suc_nombre not in sucursales:
+                    continue
+                suc_obj = sucursales[suc_nombre]
+
+                res_inv = await db.execute(
+                    select(Inventario).where(
+                        Inventario.variante_producto_id == var_obj.id,
+                        Inventario.sucursal_id == suc_obj.id
+                    )
+                )
+                inv_obj = res_inv.scalar_one_or_none()
+                if not inv_obj:
+                    inv_obj = Inventario(
+                        variante_producto_id=var_obj.id,
+                        sucursal_id=suc_obj.id,
+                        cantidad=cant,
+                        cantidad_reservada=0,
+                        cantidad_vendida=0,
+                        stock_minimo=5,
+                        estado=EstadoStock.DISPONIBLE
+                    )
+                    db.add(inv_obj)
+                    await db.flush()
+                    total_invs += 1
+
+                    # Registrar movimiento de recepción inicial
+                    mov = MovimientoInventario(
+                        inventario_id=inv_obj.id,
+                        tipo=TipoMovimiento.RECEPCION,
+                        cantidad=cant,
+                        motivo="Carga inicial de inventario - Catálogo FashionStore"
+                    )
+                    db.add(mov)
+                    await db.flush()
+
+    print(f"  [OK] Catálogo sincronizado: {len(productos_catalogo)} productos ({total_prods} nuevos, {total_vars} variantes nuevas, {total_invs} inventarios creados)")
+
+
+# =====================================================================
+# 5. USUARIOS POR ROL
+# =====================================================================
 
 async def _asegurar_usuario(
     db: AsyncSession,
@@ -278,6 +655,10 @@ async def seed_usuarios(db: AsyncSession, roles: dict, sucursal: Sucursal):
         print(f"  {'[+] Creado' if cli_creado else '[=] Existente'} Cliente: {cli_user.correo} (NIT/CI: {nit} | Contraseña: {pwd})")
 
 
+# =====================================================================
+# 6. EJECUTOR PRINCIPAL
+# =====================================================================
+
 async def run_seeders():
     """Ejecuta el proceso completo de seeding."""
     print("=" * 65)
@@ -294,12 +675,29 @@ async def run_seeders():
             permisos = await seed_permisos(session)
             roles = await seed_roles(session, permisos)
             
-            print("\n2. Verificando datos básicos del catálogo...")
+            print("\n2. Verificando datos básicos del catálogo (Categorías, Tallas, Colores)...")
             await DatosInicialesCatalogoService.crear_datos_iniciales(session)
-            sucursal = await seed_sucursal_por_defecto(session)
             
-            print("\n3. Verificando y creando usuarios por tipo...")
-            await seed_usuarios(session, roles, sucursal)
+            print("\n3. Verificando Ciudades y Sucursales con coordenadas...")
+            sucursales_map = await seed_ciudades_y_sucursales(session)
+            sucursal_central = sucursales_map["Sucursal Central"]
+            
+            print("\n4. Verificando Proveedores, Temporadas y Colecciones...")
+            proveedores = await seed_proveedores(session)
+            prov_principal = proveedores["Textiles Andinos S.A."]
+            temporada, coleccion = await seed_temporadas_colecciones(session)
+            
+            print("\n5. Verificando y poblando Catálogo de Productos con Cloudinary...")
+            await seed_productos_y_stock(
+                session,
+                sucursales=sucursales_map,
+                proveedor=prov_principal,
+                temporada=temporada,
+                coleccion=coleccion
+            )
+            
+            print("\n6. Verificando y creando usuarios por tipo...")
+            await seed_usuarios(session, roles, sucursal_central)
             
             await session.commit()
             print("\n" + "=" * 65)

@@ -112,6 +112,7 @@ class Cliente(Base):
     usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False, unique=True)
     nit_ci = Column(String(20), unique=True, nullable=False)
     direccion_envio = Column(String(500), nullable=True)
+    preferencias = Column(Text, nullable=True)  # JSON serializado como texto
     
     # Relaciones
     usuario = relationship("Usuario", back_populates="cliente")
@@ -191,6 +192,24 @@ class Bitacora(Base):
     # Relaciones
     usuario = relationship("Usuario", back_populates="bitacoras")
     
+    @property
+    def created_at(self):
+        return self.fecha_hora
+
+    @property
+    def ip_origen(self):
+        return self.ip_address
+
+    @property
+    def tabla_afectada(self):
+        return self.modulo
+
+    @property
+    def usuario_nombre(self):
+        if self.usuario:
+            return f"{self.usuario.nombre} {self.usuario.apellido}".strip()
+        return None
+
     def __repr__(self):
         return f"<Bitacora {self.fecha_hora} - {self.accion}>"
 

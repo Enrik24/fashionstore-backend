@@ -1,10 +1,10 @@
 """
 Servicios de negocio para Gestión de Catálogo, Productos e Inventario.
 """
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_, func
+from sqlalchemy import select, and_, or_, func, exists
 from sqlalchemy.orm import selectinload
 
 from app.apps.gestion_catalogo.models import (
@@ -18,7 +18,8 @@ from app.apps.gestion_catalogo.schemas import (
     TemporadaCreate, TemporadaUpdate,
     ColeccionCreate, ColeccionUpdate, ProveedorCreate, ProveedorUpdate,
     ProductoCreate, ProductoUpdate, VarianteProductoCreate, InventarioCreate,
-    MovimientoInventarioCreate, AgregarVarianteRequest, StockPorSucursalRequest
+    MovimientoInventarioCreate, AgregarVarianteRequest, StockPorSucursalRequest,
+    ProductoFilter
 )
 from app.exceptions import (
     NotFoundException, ConflictException, ValidationException, InventoryException
@@ -66,7 +67,11 @@ class CiudadService:
     @staticmethod
     async def delete(db: AsyncSession, ciudad_id: int):
         ciudad = await CiudadService.get(db, ciudad_id)
-        if ciudad.sucursales:
+        # Verificar sucursales con query explícita (evita lazy load en sesión async)
+        count_result = await db.execute(
+            select(func.count()).select_from(Sucursal).where(Sucursal.ciudad_id == ciudad_id)
+        )
+        if count_result.scalar() > 0:
             raise ConflictException("No se puede eliminar una ciudad con sucursales asociadas")
         await db.delete(ciudad)
         await db.commit()
@@ -240,8 +245,11 @@ class CategoriaService:
     async def delete(db: AsyncSession, categoria_id: int):
         categoria = await CategoriaService.get(db, categoria_id)
         
-        # Verificar si tiene productos asociados
-        if categoria.productos:
+        # Verificar productos con query explícita (evita lazy load en sesión async)
+        count_result = await db.execute(
+            select(func.count()).select_from(Producto).where(Producto.categoria_id == categoria_id)
+        )
+        if count_result.scalar() > 0:
             raise ConflictException("No se puede eliminar una categoría con productos asociados")
         
         await db.delete(categoria)
@@ -334,7 +342,11 @@ class TemporadaService:
     @staticmethod
     async def delete(db: AsyncSession, temporada_id: int):
         temporada = await TemporadaService.get(db, temporada_id)
-        if temporada.productos:
+        # Verificar productos con query explícita (evita lazy load en sesión async)
+        count_result = await db.execute(
+            select(func.count()).select_from(Producto).where(Producto.temporada_id == temporada_id)
+        )
+        if count_result.scalar() > 0:
             raise ConflictException("No se puede eliminar una temporada con productos asociados")
         await db.delete(temporada)
         await db.commit()
@@ -474,7 +486,11 @@ class ProveedorService:
     async def delete(db: AsyncSession, proveedor_id: int):
         proveedor = await ProveedorService.get(db, proveedor_id)
         
-        if proveedor.productos:
+        # Verificar productos con query explícita (evita lazy load en sesión async)
+        count_result = await db.execute(
+            select(func.count()).select_from(Producto).where(Producto.proveedor_id == proveedor_id)
+        )
+        if count_result.scalar() > 0:
             raise ConflictException("No se puede eliminar un proveedor con productos asociados")
         
         await db.delete(proveedor)
@@ -506,18 +522,70 @@ class ProductoService:
         stock_list = stock_por_sucursal or getattr(datos, "stock_por_sucursal", None)
         if stock_list:
             for stock in stock_list:
-                inventario = Inventario(
-                    variante_producto_id=None,  # Se configurará con las variantes
-                    sucursal_id=stock.sucursal_id,
-                    cantidad=stock.cantidad,
-                    cantidad_reservada=0,
-                    cantidad_vendida=0
-                )
-                db.add(inventario)
+                talla_id = getattr(stock, "talla_id", None)
+                color_id = getattr(stock, "color_id", None)
+                
+                # Si no se especificó color, intentar obtener el primero disponible en el sistema
+                if not color_id:
+                    color_res = await db.execute(select(Color).limit(1))
+                    color_obj = color_res.scalar_one_or_none()
+                    if color_obj:
+                        color_id = color_obj.id
+                
+                # Crear variante e inventario si hay un color definido (la talla puede ser None para gorras/accesorios)
+                if color_id:
+                    conditions = [
+                        VarianteProducto.producto_id == producto.id,
+                        VarianteProducto.color_id == color_id
+                    ]
+                    if talla_id is not None:
+                        conditions.append(VarianteProducto.talla_id == talla_id)
+                    else:
+                        conditions.append(VarianteProducto.talla_id.is_(None))
+                    
+                    var_result = await db.execute(
+                        select(VarianteProducto).where(and_(*conditions))
+                    )
+                    variante = var_result.scalar_one_or_none()
+                    if not variante:
+                        talla_part = f"T{talla_id}" if talla_id is not None else "ST"
+                        sku_var = f"{producto.sku}-{talla_part}-C{color_id}"
+                        variante = VarianteProducto(
+                            producto_id=producto.id,
+                            talla_id=talla_id,
+                            color_id=color_id,
+                            sku_variante=sku_var
+                        )
+                        db.add(variante)
+                        await db.flush()
+                    
+                    # Verificar si ya existe inventario para esta variante en la misma sucursal
+                    inv_res = await db.execute(
+                        select(Inventario).where(
+                            and_(
+                                Inventario.variante_producto_id == variante.id,
+                                Inventario.sucursal_id == stock.sucursal_id
+                            )
+                        )
+                    )
+                    exist_inv = inv_res.scalar_one_or_none()
+                    if exist_inv:
+                        exist_inv.cantidad += stock.cantidad
+                        if exist_inv.cantidad > 0:
+                            exist_inv.estado = EstadoStock.DISPONIBLE
+                    else:
+                        inventario = Inventario(
+                            variante_producto_id=variante.id,
+                            sucursal_id=stock.sucursal_id,
+                            cantidad=stock.cantidad,
+                            cantidad_reservada=0,
+                            cantidad_vendida=0,
+                            estado=EstadoStock.DISPONIBLE if stock.cantidad > 0 else EstadoStock.AGOTADO
+                        )
+                        db.add(inventario)
         
         await db.commit()
-        await db.refresh(producto)
-        return producto
+        return await ProductoService.get(db, producto.id)
     
     @staticmethod
     async def get(db: AsyncSession, producto_id: int) -> Producto:
@@ -550,6 +618,8 @@ class ProductoService:
     ) -> Tuple[List[Producto], int]:
         query = select(Producto).options(
             selectinload(Producto.categoria),
+            selectinload(Producto.temporada),
+            selectinload(Producto.proveedor),
             selectinload(Producto.variantes)
         )
         
@@ -582,6 +652,125 @@ class ProductoService:
         return result.scalars().all(), total
     
     @staticmethod
+    async def search_productos_publicos(
+        db: AsyncSession, filtros: ProductoFilter
+    ) -> Tuple[List[Producto], int]:
+        """Búsqueda y filtrado avanzado de productos para el catálogo público."""
+        query = (
+            select(Producto)
+            .options(
+                selectinload(Producto.categoria),
+                selectinload(Producto.temporada),
+                selectinload(Producto.proveedor),
+                selectinload(Producto.variantes).selectinload(VarianteProducto.talla),
+                selectinload(Producto.variantes).selectinload(VarianteProducto.color)
+            )
+            .where(Producto.estado == EstadoProducto.ACTIVO)
+        )
+        
+        # Filtro de texto libre
+        if filtros.q:
+            q_term = f"%{filtros.q.strip()}%"
+            query = query.where(
+                or_(
+                    Producto.nombre.ilike(q_term),
+                    Producto.descripcion.ilike(q_term),
+                    Producto.sku.ilike(q_term)
+                )
+            )
+            
+        # Filtro por categoría
+        if filtros.categoria_id:
+            query = query.where(Producto.categoria_id == filtros.categoria_id)
+            
+        # Filtro por temporada
+        if filtros.temporada_id:
+            query = query.where(Producto.temporada_id == filtros.temporada_id)
+            
+        # Filtro por rango de precios
+        if filtros.precio_min is not None:
+            query = query.where(Producto.precio >= filtros.precio_min)
+        if filtros.precio_max is not None:
+            query = query.where(Producto.precio <= filtros.precio_max)
+            
+        # Filtros por variante (talla / color) usando subconsulta EXISTS para evitar DISTINCT sobre columnas JSON
+        if filtros.talla_id or filtros.color_id:
+            variant_conditions = [VarianteProducto.producto_id == Producto.id]
+            if filtros.talla_id:
+                variant_conditions.append(VarianteProducto.talla_id == filtros.talla_id)
+            if filtros.color_id:
+                variant_conditions.append(VarianteProducto.color_id == filtros.color_id)
+            query = query.where(
+                exists(select(VarianteProducto.id).where(and_(*variant_conditions)))
+            )
+            
+        # Ordenamiento
+        if filtros.ordenar_por == "precio_asc":
+            query = query.order_by(Producto.precio.asc())
+        elif filtros.ordenar_por == "precio_desc":
+            query = query.order_by(Producto.precio.desc())
+        elif filtros.ordenar_por == "nombre":
+            query = query.order_by(Producto.nombre.asc())
+        else:
+            query = query.order_by(Producto.fecha_creacion.desc())
+            
+        # Total sin paginación (eliminando order_by en la subconsulta para mejor rendimiento)
+        count_query = select(func.count()).select_from(query.order_by(None).subquery())
+        total_result = await db.execute(count_query)
+        total = total_result.scalar() or 0
+        
+        # Paginación
+        skip = (filtros.pagina - 1) * filtros.limite
+        query = query.offset(skip).limit(filtros.limite)
+        result = await db.execute(query)
+        
+        return list(result.scalars().all()), total
+
+    @staticmethod
+    async def get_productos_populares(db: AsyncSession, limit: int = 10) -> List[Producto]:
+        """Obtiene los productos más recientes o populares del catálogo."""
+        query = (
+            select(Producto)
+            .options(
+                selectinload(Producto.categoria),
+                selectinload(Producto.temporada),
+                selectinload(Producto.variantes).selectinload(VarianteProducto.talla),
+                selectinload(Producto.variantes).selectinload(VarianteProducto.color)
+            )
+            .where(Producto.estado == EstadoProducto.ACTIVO)
+            .order_by(Producto.fecha_creacion.desc())
+            .limit(limit)
+        )
+        result = await db.execute(query)
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def get_productos_relacionados(db: AsyncSession, producto_id: int, limit: int = 6) -> List[Producto]:
+        """Obtiene productos relacionados de la misma categoría o temporada."""
+        prod = await ProductoService.get(db, producto_id)
+        query = (
+            select(Producto)
+            .options(
+                selectinload(Producto.categoria),
+                selectinload(Producto.temporada),
+                selectinload(Producto.variantes).selectinload(VarianteProducto.talla),
+                selectinload(Producto.variantes).selectinload(VarianteProducto.color)
+            )
+            .where(
+                Producto.id != producto_id,
+                Producto.estado == EstadoProducto.ACTIVO
+            )
+        )
+        if prod.categoria_id:
+            query = query.where(Producto.categoria_id == prod.categoria_id)
+        elif prod.temporada_id:
+            query = query.where(Producto.temporada_id == prod.temporada_id)
+            
+        query = query.order_by(Producto.fecha_creacion.desc()).limit(limit)
+        result = await db.execute(query)
+        return list(result.scalars().all())
+    
+    @staticmethod
     async def update(db: AsyncSession, producto_id: int, datos: ProductoUpdate) -> Producto:
         producto = await ProductoService.get(db, producto_id)
         
@@ -597,8 +786,7 @@ class ProductoService:
             setattr(producto, field, value)
         
         await db.commit()
-        await db.refresh(producto)
-        return producto
+        return await ProductoService.get(db, producto.id)
     
     @staticmethod
     async def delete(db: AsyncSession, producto_id: int):
@@ -633,14 +821,17 @@ class ProductoService:
             raise ConflictException("Ya existe una variante con este SKU")
         
         # Verificar que la combinación no exista
+        conds = [
+            VarianteProducto.producto_id == producto_id,
+            VarianteProducto.color_id == datos.color_id
+        ]
+        if datos.talla_id is not None:
+            conds.append(VarianteProducto.talla_id == datos.talla_id)
+        else:
+            conds.append(VarianteProducto.talla_id.is_(None))
+        
         result = await db.execute(
-            select(VarianteProducto).where(
-                and_(
-                    VarianteProducto.producto_id == producto_id,
-                    VarianteProducto.talla_id == datos.talla_id,
-                    VarianteProducto.color_id == datos.color_id
-                )
-            )
+            select(VarianteProducto).where(and_(*conds))
         )
         if result.scalar_one_or_none():
             raise ConflictException("Ya existe una variante con esta combinación de talla y color")
@@ -692,7 +883,9 @@ class InventarioService:
         estado: Optional[str] = None
     ) -> Tuple[List[Inventario], int]:
         query = select(Inventario).options(
-            selectinload(Inventario.variante_producto).selectinload(VarianteProducto.producto),
+            selectinload(Inventario.variante_producto).selectinload(VarianteProducto.producto).selectinload(Producto.categoria),
+            selectinload(Inventario.variante_producto).selectinload(VarianteProducto.producto).selectinload(Producto.temporada),
+            selectinload(Inventario.variante_producto).selectinload(VarianteProducto.producto).selectinload(Producto.proveedor),
             selectinload(Inventario.variante_producto).selectinload(VarianteProducto.talla),
             selectinload(Inventario.variante_producto).selectinload(VarianteProducto.color),
             selectinload(Inventario.sucursal)
@@ -877,12 +1070,21 @@ class DisponibilidadService:
         producto_id: int,
         talla_id: Optional[int] = None,
         color_id: Optional[int] = None
-    ):
-        """Obtiene la disponibilidad de un producto por sucursal."""
-        await ProductoService.get(db, producto_id)
+    ) -> Dict[str, Any]:
+        """Obtiene la disponibilidad de un producto por sucursal.
+
+        Devuelve la estructura ``DisponibilidadProductoResponse`` que el frontend
+        espera (producto + lista ``disponibilidad``), con el stock agregado por
+        sucursal (sumando las cantidades de todas las variantes del producto).
+        """
+        producto = await ProductoService.get(db, producto_id)
         
         # Construir query para variantes
-        query = select(VarianteProducto).where(VarianteProducto.producto_id == producto_id)
+        query = select(VarianteProducto).options(
+            selectinload(VarianteProducto.inventarios).selectinload(Inventario.sucursal),
+            selectinload(VarianteProducto.talla),
+            selectinload(VarianteProducto.color)
+        ).where(VarianteProducto.producto_id == producto_id)
         
         if talla_id:
             query = query.where(VarianteProducto.talla_id == talla_id)
@@ -892,19 +1094,59 @@ class DisponibilidadService:
         result = await db.execute(query)
         variantes = result.scalars().all()
         
-        disponibilidad = []
+        # Agregar stock por sucursal (una fila por sucursal, sumando variantes)
+        sucursal_map: Dict[int, Dict[str, Any]] = {}
         for variante in variantes:
-            # Obtener inventario por sucursal
             for inventario in variante.inventarios:
-                disponibilidad.append({
-                    "sucursal_id": inventario.sucursal_id,
-                    "sucursal_nombre": inventario.sucursal.nombre,
-                    "cantidad_disponible": inventario.cantidad_disponible,
-                    "cantidad_reservada": inventario.cantidad_reservada,
-                    "estado": inventario.estado
-                })
+                if inventario.sucursal is None:
+                    continue
+                if inventario.sucursal_id not in sucursal_map:
+                    sucursal_map[inventario.sucursal_id] = {
+                        "sucursal_id": inventario.sucursal_id,
+                        "sucursal_nombre": inventario.sucursal.nombre,
+                        "cantidad_disponible": int(inventario.cantidad_disponible),
+                        "cantidad_reservada": int(inventario.cantidad_reservada),
+                        "estado": EstadoStock.DISPONIBLE,
+                        "latitud": getattr(inventario.sucursal, "latitud", None),
+                        "longitud": getattr(inventario.sucursal, "longitud", None),
+                        "direccion": getattr(inventario.sucursal, "direccion", None),
+                        "horario_atencion": getattr(inventario.sucursal, "horario_atencion", None)
+                    }
+                else:
+                    entry = sucursal_map[inventario.sucursal_id]
+                    entry["cantidad_disponible"] += int(inventario.cantidad_disponible)
+                    entry["cantidad_reservada"] += int(inventario.cantidad_reservada)
         
-        return disponibilidad
+        # Derivar estado agregado por sucursal
+        for entry in sucursal_map.values():
+            if entry["cantidad_disponible"] > 0:
+                entry["estado"] = EstadoStock.DISPONIBLE
+            elif entry["cantidad_reservada"] > 0:
+                entry["estado"] = EstadoStock.RESERVADO
+            else:
+                entry["estado"] = EstadoStock.AGOTADO
+        
+        disponibilidad = sorted(
+            sucursal_map.values(),
+            key=lambda x: x["sucursal_nombre"].lower()
+        )
+        
+        # Valores de talla/color cuando se filtra por una combinación específica
+        talla_valor = None
+        color_nombre = None
+        if talla_id and variantes and variantes[0].talla:
+            talla_valor = variantes[0].talla.valor
+        if color_id and variantes and variantes[0].color:
+            color_nombre = variantes[0].color.nombre
+        
+        return {
+            "producto_id": producto.id,
+            "producto_nombre": producto.nombre,
+            "sku": producto.sku,
+            "talla": talla_valor,
+            "color": color_nombre,
+            "disponibilidad": disponibilidad
+        }
     
     @staticmethod
     async def verificar_stock_reserva(
@@ -929,6 +1171,82 @@ class DisponibilidadService:
         
         return inventario.cantidad_disponible >= cantidad
 
+    @staticmethod
+    async def get_disponibilidad_variante(
+        db: AsyncSession,
+        variante_id: int
+    ) -> Dict[str, Any]:
+        """Obtiene la disponibilidad de una variante en todas las sucursales."""
+        q_var = (
+            select(VarianteProducto)
+            .options(
+                selectinload(VarianteProducto.inventarios).selectinload(Inventario.sucursal)
+            )
+            .where(VarianteProducto.id == variante_id)
+        )
+        res = await db.execute(q_var)
+        variante = res.scalar_one_or_none()
+        if not variante:
+            raise NotFoundException(f"Variante #{variante_id} no encontrada")
+            
+        sucursales_info = []
+        for inv in variante.inventarios:
+            sucursales_info.append({
+                "sucursal_id": inv.sucursal_id,
+                "sucursal_nombre": inv.sucursal.nombre if inv.sucursal else "Sucursal",
+                "cantidad_disponible": inv.cantidad_disponible,
+                "cantidad_reservada": inv.cantidad_reservada,
+                "estado": inv.estado,
+                "latitud": getattr(inv.sucursal, "latitud", None) if inv.sucursal else None,
+                "longitud": getattr(inv.sucursal, "longitud", None) if inv.sucursal else None,
+                "direccion": getattr(inv.sucursal, "direccion", None) if inv.sucursal else None,
+                "horario_atencion": getattr(inv.sucursal, "horario_atencion", None) if inv.sucursal else None
+            })
+            
+        return {
+            "variante_id": variante.id,
+            "sku_variante": variante.sku_variante,
+            "sucursales": sucursales_info
+        }
+
+    @staticmethod
+    async def get_stock_por_sucursal(
+        db: AsyncSession,
+        producto_id: int,
+        sucursal_id: int
+    ) -> List[Dict[str, Any]]:
+        """Obtiene el stock de todas las variantes de un producto en una sucursal específica."""
+        await ProductoService.get(db, producto_id)
+        
+        query = (
+            select(Inventario)
+            .options(
+                selectinload(Inventario.variante_producto).selectinload(VarianteProducto.talla),
+                selectinload(Inventario.variante_producto).selectinload(VarianteProducto.color),
+                selectinload(Inventario.sucursal)
+            )
+            .join(VarianteProducto, Inventario.variante_producto_id == VarianteProducto.id)
+            .where(
+                VarianteProducto.producto_id == producto_id,
+                Inventario.sucursal_id == sucursal_id
+            )
+        )
+        result = await db.execute(query)
+        inventarios = result.scalars().all()
+        
+        items = []
+        for inv in inventarios:
+            items.append({
+                "variante_id": inv.variante_producto_id,
+                "sku_variante": inv.variante_producto.sku_variante if inv.variante_producto else "",
+                "talla": inv.variante_producto.talla.valor if inv.variante_producto and inv.variante_producto.talla else None,
+                "color": inv.variante_producto.color.nombre if inv.variante_producto and inv.variante_producto.color else None,
+                "cantidad_disponible": inv.cantidad_disponible,
+                "cantidad_reservada": inv.cantidad_reservada,
+                "estado": inv.estado
+            })
+        return items
+
 
 # ============================================
 # Datos Iniciales
@@ -943,6 +1261,7 @@ class DatosInicialesCatalogoService:
         
         # Crear categorías
         categorias_data = [
+            ("Poleras", "Poleras y camisetas para hombre y mujer"),
             ("Camisas", "Camisas de manga corta y larga"),
             ("Pantalones", "Pantalones de diferentes estilos"),
             ("Vestidos", "Vestidos formales y casuales"),

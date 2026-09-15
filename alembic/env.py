@@ -15,7 +15,7 @@ from app.config import settings
 from app.apps.gestion_usuarios.models import *
 from app.apps.gestion_catalogo.models import *
 from app.apps.gestion_ventas.models import *
-from app.apps.servicios_intelientes.models import *
+from app.apps.servicios_inteligentes.models import *
 
 # this is the Alembic Config object
 config = context.config

@@ -1,7 +1,6 @@
 """
 Modelos SQLAlchemy para la Gestión de Ventas, Reservas y Pagos.
-Contiene: Carrito, Orden, VentaPresencial, Reserva, TransaccionPago, Comprobante, PasarelaPago.
-(Implementación completa en Iteración 2)
+Contiene: Cupon, Carrito, ItemCarrito, Orden, DetalleOrden, VentaPresencial, Reserva, DetalleReserva, TransaccionPago, Comprobante, PasarelaPago.
 """
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Text, Numeric, Time, JSON
 from sqlalchemy.orm import relationship
@@ -11,8 +10,19 @@ import enum
 from app.database import Base
 
 
-# Enumeraciones - Se importarán de otros módulos cuando estén definidos
-# Aquí definimos las enumeraciones locales para esta iteración
+# Enumeraciones
+
+class TipoCupon(str, enum.Enum):
+    PORCENTAJE = "PORCENTAJE"
+    MONTO_FIJO = "MONTO_FIJO"
+
+
+class EstadoCupon(str, enum.Enum):
+    ACTIVO = "ACTIVO"
+    INACTIVO = "INACTIVO"
+    EXPIRADO = "EXPIRADO"
+    AGOTADO = "AGOTADO"
+
 
 class EstadoCarrito(str, enum.Enum):
     ACTIVO = "ACTIVO"
@@ -89,6 +99,32 @@ class EstadoPasarela(str, enum.Enum):
     MANTENIMIENTO = "MANTENIMIENTO"
 
 
+# Modelo: Cupon
+class Cupon(Base):
+    """Tabla de cupones de descuento."""
+    __tablename__ = "cupones"
+    
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    codigo = Column(String(50), unique=True, nullable=False, index=True)
+    tipo = Column(Enum(TipoCupon), nullable=False)
+    valor = Column(Numeric(10, 2), nullable=False)
+    descripcion = Column(String(255), nullable=True)
+    fecha_inicio = Column(DateTime(timezone=True), nullable=False)
+    fecha_fin = Column(DateTime(timezone=True), nullable=False)
+    usos_maximos = Column(Integer, nullable=True)
+    usos_actuales = Column(Integer, default=0, nullable=False)
+    monto_minimo = Column(Numeric(10, 2), nullable=True)
+    estado = Column(Enum(EstadoCupon), default=EstadoCupon.ACTIVO, nullable=False)
+    creado_por_id = Column(Integer, ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relaciones
+    creado_por = relationship("Usuario")
+    
+    def __repr__(self):
+        return f"<Cupon {self.codigo} - {self.tipo}: {self.valor}>"
+
+
 # Modelo: Carrito
 class Carrito(Base):
     """Tabla de carrito de compras."""
@@ -98,10 +134,13 @@ class Carrito(Base):
     cliente_id = Column(Integer, ForeignKey("clientes.id", ondelete="CASCADE"), nullable=False)
     fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
     estado = Column(Enum(EstadoCarrito), default=EstadoCarrito.ACTIVO)
+    cupon_id = Column(Integer, ForeignKey("cupones.id", ondelete="SET NULL"), nullable=True)
+    descuento_aplicado = Column(Numeric(10, 2), default=0)
     
     # Relaciones
     cliente = relationship("Cliente", back_populates="carritos")
-    items = relationship("ItemCarrito", back_populates="carrito")
+    items = relationship("ItemCarrito", back_populates="carrito", cascade="all, delete-orphan")
+    cupon = relationship("Cupon")
     
     def __repr__(self):
         return f"<Carrito {self.id} - Cliente {self.cliente_id}>"
@@ -142,14 +181,16 @@ class Orden(Base):
     total = Column(Numeric(10, 2), nullable=False)
     impuestos = Column(Numeric(10, 2), default=0)
     descuentos = Column(Numeric(10, 2), default=0)
+    cupon_id = Column(Integer, ForeignKey("cupones.id", ondelete="SET NULL"), nullable=True)
     direccion_envio = Column(String(500), nullable=True)
     
     # Relaciones
     cliente = relationship("Cliente", back_populates="ordenes")
     sucursal = relationship("Sucursal")
-    detalles = relationship("DetalleOrden", back_populates="orden")
-    transacciones = relationship("TransaccionPago", back_populates="orden")
+    detalles = relationship("DetalleOrden", back_populates="orden", cascade="all, delete-orphan")
+    transacciones = relationship("TransaccionPago", back_populates="orden", cascade="all, delete-orphan")
     comprobante = relationship("Comprobante", back_populates="orden", uselist=False)
+    cupon = relationship("Cupon")
     
     def __repr__(self):
         return f"<Orden {self.numero_orden}>"
@@ -216,7 +257,7 @@ class Reserva(Base):
     # Relaciones
     cliente = relationship("Cliente", back_populates="reservas")
     sucursal = relationship("Sucursal")
-    detalles = relationship("DetalleReserva", back_populates="reserva")
+    detalles = relationship("DetalleReserva", back_populates="reserva", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Reserva {self.numero_reserva}>"
@@ -250,7 +291,7 @@ class TransaccionPago(Base):
     orden_id = Column(Integer, ForeignKey("ordenes.id", ondelete="CASCADE"), nullable=False)
     pasarela_pago_id = Column(Integer, ForeignKey("pasarelas_pago.id", ondelete="SET NULL"), nullable=True)
     monto = Column(Numeric(10, 2), nullable=False)
-    moneda = Column(String(3), default="GTQ")
+    moneda = Column(String(3), default="USD")
     metodo_pago = Column(Enum(MetodoPagoDigital), nullable=False)
     estado = Column(Enum(EstadoTransaccion), default=EstadoTransaccion.PENDIENTE)
     referencia_externa = Column(String(255), nullable=True)
@@ -303,6 +344,6 @@ class PasarelaPago(Base):
         return f"<PasarelaPago {self.nombre}>"
 
 
-# Importar modelos que faltan
-from app.apps.gestion_usuarios.models import Cliente, Cajero
+# Importar modelos relacionados para registrar relaciones
+from app.apps.gestion_usuarios.models import Usuario, Cliente, Cajero
 from app.apps.gestion_catalogo.models import VarianteProducto, Sucursal

@@ -19,8 +19,8 @@ class Settings(BaseSettings):
     DB_PORT: int = 5432
     DATABASE_URL: str = ""
     
-    # SSL para proveedores cloud como Supabase (True por defecto para producción)
-    DB_SSL: bool = True
+    # SSL para proveedores cloud como Supabase (False por defecto, se activa automáticamente para cloud)
+    DB_SSL: bool = False
     
     # JWT
     SECRET_KEY: str

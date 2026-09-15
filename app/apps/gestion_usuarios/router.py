@@ -2,7 +2,7 @@
 Router - Gestión de Usuarios y Autenticación
 Contiene todos los endpoints de la App 1.
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,7 +13,7 @@ import csv
 import io
 
 from app.database import get_db
-from app.security import get_current_user, require_role
+from app.security import get_current_user, require_role, get_client_ip
 from app.apps.gestion_usuarios.models import Usuario, Cliente
 from app.apps.gestion_usuarios import services as usuario_services
 from app.apps.gestion_usuarios.schemas import (
@@ -41,6 +41,7 @@ router = APIRouter(prefix="/api/v1", tags=["Gestión de Usuarios y Autenticació
 @router.post("/auth/login", response_model=TokenResponse, name="login")
 async def login(
     datos: UsuarioLogin,
+    request: Request,
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -49,17 +50,20 @@ async def login(
     Returns:
         Token de acceso y token de refresco
     """
-    tokens, usuario = await usuario_services.AuthService.login(db, datos)
+    ip_address = get_client_ip(request)
+    tokens, usuario = await usuario_services.AuthService.login(db, datos, ip_address=ip_address)
     return tokens
 
 
 @router.post("/auth/logout", name="logout")
 async def logout(
+    request: Request,
     current_user: Usuario = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Cierra la sesión del usuario."""
-    await usuario_services.AuthService.logout(db, current_user.id)
+    ip_address = get_client_ip(request)
+    await usuario_services.AuthService.logout(db, current_user.id, ip_address=ip_address)
     return {"message": "Sesión cerrada exitosamente"}
 
 
@@ -84,6 +88,7 @@ async def refresh_token(
 @router.post("/auth/register", response_model=TokenResponse, name="register")
 async def registro(
     datos: ClienteCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -92,7 +97,8 @@ async def registro(
     Returns:
         Token de acceso y token de refresco
     """
-    cliente, tokens = await usuario_services.ClienteService.registro_cliente(db, datos)
+    ip_address = get_client_ip(request)
+    cliente, tokens = await usuario_services.ClienteService.registro_cliente(db, datos, ip_address=ip_address)
     return tokens
 
 
@@ -125,12 +131,37 @@ async def actualizar_perfil(
 @router.post("/auth/change-password", name="change_password")
 async def cambiar_contrasena(
     datos: CambioContrasena,
+    request: Request,
     current_user: Usuario = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Cambia la contraseña del usuario actual."""
+    ip_address = get_client_ip(request)
     await usuario_services.ClienteService.cambiar_contrasena(
-        db, current_user.id, datos.contrasena_actual, datos.contrasena_nueva
+        db, current_user.id, datos.contrasena_actual, datos.contrasena_nueva, ip_address=ip_address
+    )
+    return {"message": "Contraseña cambiada exitosamente"}
+
+
+@router.post("/cliente/change-password", name="client_change_password")
+async def cambiar_contrasena_cliente(
+    datos: dict,
+    request: Request,
+    current_user: Usuario = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Cambia la contraseña del cliente (endpoint alternativo que acepta formato frontend)."""
+    ip_address = get_client_ip(request)
+    
+    # Mapear campos del frontend (password_actual/password_nuevo) a backend (contrasena_actual/contrasena_nueva)
+    password_actual = datos.get('password_actual') or datos.get('contrasena_actual')
+    password_nuevo = datos.get('password_nuevo') or datos.get('contrasena_nueva')
+    
+    if not password_actual or not password_nuevo:
+        raise HTTPException(status_code=400, detail="Se requieren password_actual y password_nuevo")
+    
+    await usuario_services.ClienteService.cambiar_contrasena(
+        db, current_user.id, password_actual, password_nuevo, ip_address=ip_address
     )
     return {"message": "Contraseña cambiada exitosamente"}
 
@@ -311,12 +342,16 @@ async def listar_bitacora(
     usuario_id: Optional[int] = None,
     accion: Optional[str] = None,
     modulo: Optional[str] = None,
+    tabla: Optional[str] = None,
+    fecha_inicio: Optional[datetime] = None,
+    fecha_fin: Optional[datetime] = None,
     current_user: Usuario = Depends(require_role("Administrador")),
     db: AsyncSession = Depends(get_db)
 ):
     """Consulta la bitácora del sistema (solo administradores)."""
+    modulo_filtro = modulo or tabla
     bitacoras, total = await usuario_services.BitacoraService.get_bitacora(
-        db, skip, limit, usuario_id, accion, modulo
+        db, skip, limit, usuario_id, accion, modulo_filtro, fecha_inicio, fecha_fin
     )
     return bitacoras
 
@@ -346,7 +381,17 @@ async def obtener_perfil(
     db: AsyncSession = Depends(get_db)
 ):
     """Obtiene el perfil del cliente actual."""
+    import json
+    
     cliente = await usuario_services.ClienteService.get_cliente_by_usuario(db, current_user.id)
+    
+    # Deserializar preferencias si existen
+    preferencias = None
+    if cliente.preferencias:
+        try:
+            preferencias = json.loads(cliente.preferencias)
+        except:
+            preferencias = None
     
     # Devolver perfil formateado
     return {
@@ -358,6 +403,7 @@ async def obtener_perfil(
         "correo": current_user.correo,
         "telefono": current_user.telefono,
         "fecha_registro": current_user.fecha_registro,
+        "preferencias": preferencias,
     }
 
 
@@ -375,14 +421,14 @@ async def actualizar_perfil(
         current_user.nombre = datos.nombre
     if datos.apellido:
         current_user.apellido = datos.apellido
-    if datos.telefono:
+    if datos.telefono is not None:  # Permitir vacío para borrar
         current_user.telefono = datos.telefono
     
     await db.commit()
     await db.refresh(current_user)
     
-    # Actualizar datos de cliente
-    if datos.direccion_envio:
+    # Actualizar datos de cliente (dirección)
+    if datos.direccion_envio is not None:  # Permitir vacío para borrar
         cliente.direccion_envio = datos.direccion_envio
         await db.commit()
         await db.refresh(cliente)
@@ -401,13 +447,21 @@ async def actualizar_perfil(
 
 @router.put("/cliente/direccion", name="update_client_address")
 async def actualizar_direccion(
-    direccion: str,
+    datos: dict,
     current_user: Usuario = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Actualiza la dirección de envío del cliente."""
     cliente = await usuario_services.ClienteService.get_cliente_by_usuario(db, current_user.id)
-    cliente.direccion_envio = direccion
+    
+    # Combinar los campos en una dirección completa
+    direccion_completa = datos.get('direccion', '')
+    if datos.get('ciudad'):
+        direccion_completa += f", {datos['ciudad']}"
+    if datos.get('referencia'):
+        direccion_completa += f" (Ref: {datos['referencia']})"
+    
+    cliente.direccion_envio = direccion_completa
     await db.commit()
     
     return {"message": "Dirección actualizada exitosamente"}
@@ -420,8 +474,15 @@ async def actualizar_preferencias(
     db: AsyncSession = Depends(get_db)
 ):
     """Actualiza las preferencias del cliente."""
-    # TODO: Implementar preferencias de cliente
-    return {"message": "Preferencias actualizadas exitosamente"}
+    import json
+    
+    cliente = await usuario_services.ClienteService.get_cliente_by_usuario(db, current_user.id)
+    
+    # Guardar preferencias como JSON
+    cliente.preferencias = json.dumps(datos)
+    await db.commit()
+    
+    return {"message": "Preferencias actualizadas exitosamente", "preferencias": datos}
 
 
 @router.get("/cliente/historial-compras", name="get_purchase_history")
@@ -432,8 +493,12 @@ async def historial_compras(
     db: AsyncSession = Depends(get_db)
 ):
     """Obtiene el historial de compras del cliente."""
-    # Se implementará en la App 3
-    return {"message": "Historial de compras - pendiente de implementar en App 3"}
+    from app.apps.gestion_ventas.services import OrdenService
+    res_c = await db.execute(select(Cliente).where(Cliente.usuario_id == current_user.id))
+    cliente = res_c.scalar_one_or_none()
+    if not cliente:
+        raise HTTPException(status_code=404, detail="Perfil de cliente no encontrado")
+    return await OrdenService.obtener_ordenes_cliente(db, cliente.id, skip=skip, limit=limit)
 
 
 @router.get("/cliente/historial-reservas", name="get_reservations_history")
@@ -444,8 +509,62 @@ async def historial_reservas(
     db: AsyncSession = Depends(get_db)
 ):
     """Obtiene el historial de reservas del cliente."""
-    # Se implementará en la App 3
-    return {"message": "Historial de reservas - pendiente de implementar en App 3"}
+    from app.apps.gestion_ventas.services import ReservaService
+    res_c = await db.execute(select(Cliente).where(Cliente.usuario_id == current_user.id))
+    cliente = res_c.scalar_one_or_none()
+    if not cliente:
+        raise HTTPException(status_code=404, detail="Perfil de cliente no encontrado")
+    return await ReservaService.listar_reservas_cliente(db, cliente.id)
+
+
+# ============================================
+# Endpoints de Búsqueda de Clientes (POS / Ventas)
+# ============================================
+
+@router.get("/clientes/buscar", response_model=List[PerfilClienteResponse], name="search_clients")
+async def buscar_clientes(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(10, ge=1, le=50),
+    current_user: Usuario = Depends(require_role("Administrador", "Encargado", "Cajero")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Busca clientes por NIT/CI, nombre, apellido, correo o teléfono."""
+    clientes = await usuario_services.ClienteService.buscar_clientes(db, q, limit)
+    return [
+        {
+            "id": c.id,
+            "nit_ci": c.nit_ci,
+            "direccion_envio": c.direccion_envio,
+            "nombre": c.usuario.nombre if c.usuario else "",
+            "apellido": c.usuario.apellido if c.usuario else "",
+            "correo": c.usuario.correo if c.usuario else "",
+            "telefono": c.usuario.telefono if c.usuario else "",
+            "fecha_registro": c.usuario.fecha_registro if c.usuario else datetime.now(),
+        }
+        for c in clientes
+    ]
+
+
+@router.get("/clientes/por-nit/{nit_ci}", response_model=PerfilClienteResponse, name="get_client_by_nit")
+async def obtener_cliente_por_nit(
+    nit_ci: str,
+    current_user: Usuario = Depends(require_role("Administrador", "Encargado", "Cajero")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Obtiene un cliente por su NIT/CI exacto."""
+    c = await usuario_services.ClienteService.get_cliente_by_nit(db, nit_ci)
+    if not c:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado con ese NIT/CI")
+    return {
+        "id": c.id,
+        "nit_ci": c.nit_ci,
+        "direccion_envio": c.direccion_envio,
+        "nombre": c.usuario.nombre if c.usuario else "",
+        "apellido": c.usuario.apellido if c.usuario else "",
+        "correo": c.usuario.correo if c.usuario else "",
+        "telefono": c.usuario.telefono if c.usuario else "",
+        "fecha_registro": c.usuario.fecha_registro if c.usuario else datetime.now(),
+    }
 
 
 # ============================================

@@ -239,7 +239,7 @@ class VarianteProducto(Base):
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     producto_id = Column(Integer, ForeignKey("productos.id", ondelete="CASCADE"), nullable=False)
-    talla_id = Column(Integer, ForeignKey("tallas.id", ondelete="CASCADE"), nullable=False)
+    talla_id = Column(Integer, ForeignKey("tallas.id", ondelete="SET NULL"), nullable=True)
     color_id = Column(Integer, ForeignKey("colores.id", ondelete="CASCADE"), nullable=False)
     sku_variante = Column(String(50), unique=True, nullable=False)
     precio_variante = Column(Numeric(10, 2), nullable=True)

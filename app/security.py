@@ -5,13 +5,32 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from fastapi import HTTPException, status, Depends
+from fastapi import HTTPException, status, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.config import settings
 from app.database import get_db
+
+
+def get_client_ip(request: Request) -> str:
+    """
+    Extrae la dirección IP del cliente, priorizando cabeceras de proxy
+    como X-Forwarded-For y X-Real-IP cuando está detrás de Nginx/Render/Cloudflare.
+    """
+    x_forwarded_for = request.headers.get("X-Forwarded-For")
+    if x_forwarded_for:
+        return x_forwarded_for.split(",")[0].strip()
+    
+    x_real_ip = request.headers.get("X-Real-IP")
+    if x_real_ip:
+        return x_real_ip.strip()
+        
+    if request.client and request.client.host:
+        return request.client.host
+        
+    return "127.0.0.1"
 
 # Contexto para hashing de contraseñas
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -137,8 +156,16 @@ async def get_current_user(
             detail="Token inválido: identificador no válido"
         )
     
-    # Buscar el usuario en la base de datos
-    result = await db.execute(select(Usuario).where(Usuario.id == user_id))
+    from sqlalchemy.orm import selectinload
+    # Buscar el usuario en la base de datos con roles y cliente precargados
+    result = await db.execute(
+        select(Usuario)
+        .options(
+            selectinload(Usuario.roles),
+            selectinload(Usuario.cliente)
+        )
+        .where(Usuario.id == user_id)
+    )
     user = result.scalar_one_or_none()
     
     if user is None:

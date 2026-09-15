@@ -183,10 +183,14 @@ class BitacoraResponse(BaseModel):
     """Schema para respuesta de bitácora."""
     id: int
     fecha_hora: datetime
+    created_at: Optional[datetime] = None
     usuario_id: Optional[int] = None
+    usuario_nombre: Optional[str] = None
     ip_address: Optional[str] = None
+    ip_origen: Optional[str] = None
     accion: str
     modulo: Optional[str] = None
+    tabla_afectada: Optional[str] = None
     detalles: Optional[str] = None
     
     model_config = ConfigDict(from_attributes=True)
@@ -205,6 +209,7 @@ class PerfilClienteResponse(BaseModel):
     correo: str
     telefono: Optional[str] = None
     fecha_registro: datetime
+    preferencias: Optional[dict] = None  # Preferencias del cliente
     
     model_config = ConfigDict(from_attributes=True)
 

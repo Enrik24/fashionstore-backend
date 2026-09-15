@@ -9,10 +9,14 @@ import logging
 
 from app.config import settings
 from app.database import engine, Base
+import app.apps.gestion_usuarios.models
+import app.apps.gestion_catalogo.models
 import app.apps.gestion_ventas.models
-import app.apps.servicios_intelientes.models
+import app.apps.servicios_inteligentes.models
 from app.apps.gestion_usuarios.router import router as router_usuarios
 from app.apps.gestion_catalogo.router import router as router_catalogo
+from app.apps.gestion_ventas.router import router as router_ventas
+from app.apps.servicios_inteligentes.router import router as router_inteligencia
 from app.apps.gestion_usuarios.services import DatosInicialesService
 from app.apps.gestion_catalogo.services import DatosInicialesCatalogoService
 
@@ -80,6 +84,8 @@ app.add_middleware(
 # Incluir routers
 app.include_router(router_usuarios)
 app.include_router(router_catalogo)
+app.include_router(router_ventas)
+app.include_router(router_inteligencia)
 
 
 @app.get("/", tags=["Root"])

@@ -4,7 +4,7 @@ Servicios de negocio para Gestión de Usuarios y Autenticación.
 from typing import Optional, List, Tuple
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, and_, delete
+from sqlalchemy import select, or_, and_, delete, func
 from sqlalchemy.orm import selectinload
 import secrets
 
@@ -541,13 +541,18 @@ class ClienteService:
     """Servicio de gestión de clientes."""
     
     @staticmethod
-    async def registro_cliente(db: AsyncSession, datos: ClienteCreate) -> Tuple[Cliente, dict]:
+    async def registro_cliente(
+        db: AsyncSession, 
+        datos: ClienteCreate, 
+        ip_address: Optional[str] = None
+    ) -> Tuple[Cliente, dict]:
         """
         Registra un nuevo cliente en la plataforma.
         
         Args:
             db: Sesión de base de datos
             datos: Datos del cliente
+            ip_address: Dirección IP del cliente
         
         Returns:
             Tupla con (cliente, tokens)
@@ -608,7 +613,8 @@ class ClienteService:
             usuario_id=usuario.id,
             accion="REGISTRO_CLIENTE",
             modulo="Autenticacion",
-            detalles="Nuevo cliente registrado"
+            detalles="Nuevo cliente registrado",
+            ip_address=ip_address
         )
         db.add(bitacora)
         await db.commit()
@@ -670,13 +676,47 @@ class ClienteService:
         await db.refresh(cliente)
         
         return cliente
+
+    @staticmethod
+    async def buscar_clientes(db: AsyncSession, q: str, limit: int = 10) -> List[Cliente]:
+        """Busca clientes por NIT/CI, nombre, apellido, correo o teléfono."""
+        q_clean = f"%{q.strip()}%"
+        query = (
+            select(Cliente)
+            .join(Usuario, Cliente.usuario_id == Usuario.id)
+            .options(selectinload(Cliente.usuario))
+            .where(
+                or_(
+                    Cliente.nit_ci.ilike(q_clean),
+                    Usuario.nombre.ilike(q_clean),
+                    Usuario.apellido.ilike(q_clean),
+                    Usuario.correo.ilike(q_clean),
+                    Usuario.telefono.ilike(q_clean)
+                )
+            )
+            .limit(limit)
+        )
+        res = await db.execute(query)
+        return list(res.scalars().all())
+
+    @staticmethod
+    async def get_cliente_by_nit(db: AsyncSession, nit_ci: str) -> Optional[Cliente]:
+        """Obtiene un cliente por su NIT/CI exacto."""
+        query = (
+            select(Cliente)
+            .options(selectinload(Cliente.usuario))
+            .where(Cliente.nit_ci == nit_ci.strip())
+        )
+        res = await db.execute(query)
+        return res.scalar_one_or_none()
     
     @staticmethod
     async def cambiar_contrasena(
         db: AsyncSession, 
         usuario_id: int, 
         contrasena_actual: str, 
-        contrasena_nueva: str
+        contrasena_nueva: str,
+        ip_address: Optional[str] = None
     ):
         """Cambia la contraseña de un usuario."""
         result = await db.execute(
@@ -700,7 +740,8 @@ class ClienteService:
             usuario_id=usuario_id,
             accion="CAMBIO_CONTRASENA",
             modulo="Perfil",
-            detalles="Usuario cambió su contraseña"
+            detalles="Usuario cambió su contraseña",
+            ip_address=ip_address
         )
         db.add(bitacora)
         await db.commit()
@@ -713,6 +754,27 @@ class ClienteService:
 class BitacoraService:
     """Servicio de bitácora del sistema."""
     
+    @staticmethod
+    async def registrar_evento(
+        db: AsyncSession,
+        accion: str,
+        usuario_id: Optional[int] = None,
+        ip_address: Optional[str] = None,
+        modulo: Optional[str] = None,
+        detalles: Optional[str] = None
+    ) -> Bitacora:
+        """Registra un evento en la bitácora."""
+        bitacora = Bitacora(
+            usuario_id=usuario_id,
+            accion=accion,
+            modulo=modulo,
+            detalles=detalles,
+            ip_address=ip_address
+        )
+        db.add(bitacora)
+        await db.commit()
+        return bitacora
+
     @staticmethod
     async def get_bitacora(
         db: AsyncSession,
@@ -730,28 +792,38 @@ class BitacoraService:
         Returns:
             Tupla con (registros, total)
         """
-        query = select(Bitacora).order_by(Bitacora.fecha_hora.desc())
+        query = (
+            select(Bitacora)
+            .options(selectinload(Bitacora.usuario))
+            .order_by(Bitacora.fecha_hora.desc())
+        )
+        count_query = select(func.count(Bitacora.id))
         
         if usuario_id:
             query = query.where(Bitacora.usuario_id == usuario_id)
+            count_query = count_query.where(Bitacora.usuario_id == usuario_id)
         if accion:
             query = query.where(Bitacora.accion.ilike(f"%{accion}%"))
+            count_query = count_query.where(Bitacora.accion.ilike(f"%{accion}%"))
         if modulo:
-            query = query.where(Bitacora.modulo == modulo)
+            query = query.where(Bitacora.modulo.ilike(f"%{modulo}%"))
+            count_query = count_query.where(Bitacora.modulo.ilike(f"%{modulo}%"))
         if fecha_inicio:
             query = query.where(Bitacora.fecha_hora >= fecha_inicio)
+            count_query = count_query.where(Bitacora.fecha_hora >= fecha_inicio)
         if fecha_fin:
             query = query.where(Bitacora.fecha_hora <= fecha_fin)
+            count_query = count_query.where(Bitacora.fecha_hora <= fecha_fin)
         
         # Contar total
-        count_result = await db.execute(query)
-        total = len(count_result.scalars().all())
+        count_result = await db.execute(count_query)
+        total = count_result.scalar_one() or 0
         
         # Aplicar paginación
         query = query.offset(skip).limit(limit)
         result = await db.execute(query)
         
-        return result.scalars().all(), total
+        return list(result.scalars().all()), total
     
     @staticmethod
     async def exportar_bitacora_csv(db: AsyncSession) -> str:
