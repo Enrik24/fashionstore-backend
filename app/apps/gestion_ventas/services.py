@@ -9,16 +9,18 @@ Implementa:
 - ReservaService: Flujo completo de reservas en sucursal con reserva/liberación de stock
 - PagoService: Pasarelas Stripe y PayPal con registro de transacciones
 """
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Optional, List, Dict, Any, Tuple
 import uuid
+import secrets
 import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, and_, or_, desc, func
+from sqlalchemy import select, update, delete, and_, or_, desc, func
 from sqlalchemy.orm import selectinload, joinedload
 
+from app.config import settings
 from app.exceptions import NotFoundException, BadRequestException, ConflictException, ForbiddenException
 from app.apps.gestion_ventas.models import (
     Cupon, TipoCupon, EstadoCupon,
@@ -27,20 +29,47 @@ from app.apps.gestion_ventas.models import (
     VentaPresencial, MetodoPagoPresencial,
     Reserva, DetalleReserva, EstadoReserva, EstadoDetalleReserva,
     TransaccionPago, MetodoPagoDigital, EstadoTransaccion,
-    Comprobante, TipoComprobante, PasarelaPago, EstadoPasarela
+    Comprobante, TipoComprobante, PasarelaPago, EstadoPasarela,
+    SolicitudDevolucion, DetalleSolicitudDevolucion,
+    TipoSolicitudDevolucion, MotivoDevolucion, EstadoSolicitudDevolucion
 )
+from app.apps.gestion_marketing.models import CuponProducto, CuponCategoria
 from app.apps.gestion_ventas.schemas import (
-    CuponCreate, CuponUpdate, ItemCarritoCreate, ItemCarritoUpdate,
-    ReservaCreate, CompletarReservaRequest, DetalleVentaPresencialCreate
+    CuponCreate, CuponUpdate, CuponResponse, ItemCarritoCreate, ItemCarritoUpdate,
+    ReservaCreate, CompletarReservaRequest, DetalleVentaPresencialCreate,
+    SolicitudDevolucionCreate, RevisionSolicitudRequest, SolicitudDevolucionResponse,
+    DetalleSolicitudDevolucionResponse, VarianteResumenResponse
 )
 from app.apps.gestion_catalogo.models import (
     VarianteProducto, Producto, Inventario, MovimientoInventario, TipoMovimiento, EstadoStock, Sucursal
 )
-from app.apps.gestion_usuarios.models import Cliente, Cajero, Usuario
+from app.apps.gestion_usuarios.models import Cliente, Cajero, Usuario, EncargadoSucursal
 from app.services.stripe_service import StripeService
 from app.services.paypal_service import PayPalService
+from app.services.firebase_service import FirebaseService
 
 logger = logging.getLogger(__name__)
+
+
+def _resolver_costo_unitario(variante: Optional["VarianteProducto"]) -> Optional[Decimal]:
+    """Costo vigente: costo_variante ?? producto.costo_compra ?? None (fallback precio*0.6 en reportes)."""
+    if variante is None:
+        return None
+    cv = getattr(variante, "costo_variante", None)
+    if cv is not None:
+        try:
+            return Decimal(str(cv))
+        except Exception:
+            pass
+    prod = getattr(variante, "producto", None)
+    if prod is not None and getattr(prod, "costo_compra", None) is not None:
+        try:
+            c = Decimal(str(prod.costo_compra))
+            if c > 0:
+                return c
+        except Exception:
+            pass
+    return None
 
 
 # ==============================================================================
@@ -103,6 +132,32 @@ class InventarioVentasService:
             inventario_id=inv.id,
             tipo=TipoMovimiento.VENTA,
             cantidad=-cantidad,
+            motivo=motivo,
+            usuario_id=usuario_id
+        )
+        db.add(movimiento)
+        await db.flush()
+        return inv
+
+    @classmethod
+    async def reintegrar_stock_devolucion(
+        cls, db: AsyncSession, variante_id: int, sucursal_id: int, cantidad: int, usuario_id: Optional[int] = None, motivo: str = "Devolución de prenda"
+    ) -> Inventario:
+        """Reintegra stock al inventario por devolución o cambio de prenda (CU19 / CU28)."""
+        inv = await cls.obtener_o_crear_inventario(db, variante_id, sucursal_id)
+        inv.cantidad += cantidad
+        if inv.cantidad_vendida >= cantidad:
+            inv.cantidad_vendida -= cantidad
+        else:
+            inv.cantidad_vendida = 0
+            
+        if inv.cantidad > 0 and inv.estado == EstadoStock.AGOTADO:
+            inv.estado = EstadoStock.DISPONIBLE
+
+        movimiento = MovimientoInventario(
+            inventario_id=inv.id,
+            tipo=TipoMovimiento.DEVOLUCION,
+            cantidad=cantidad,
             motivo=motivo,
             usuario_id=usuario_id
         )
@@ -191,25 +246,80 @@ class CuponService:
             creado_por_id=creado_por_id
         )
         db.add(cupon)
+        await db.flush()
+
+        # Asociar productos y categorías
+        for pid in set(cupon_in.producto_ids or []):
+            db.add(CuponProducto(cupon_id=cupon.id, producto_id=pid))
+
+        for cid in set(cupon_in.categoria_ids or []):
+            db.add(CuponCategoria(cupon_id=cupon.id, categoria_id=cid))
+
         await db.commit()
-        await db.refresh(cupon)
-        return cupon
+        return await CuponService.obtener_por_id(db, cupon.id)
 
     @staticmethod
     async def obtener_por_id(db: AsyncSession, cupon_id: int) -> Optional[Cupon]:
-        query = select(Cupon).where(Cupon.id == cupon_id)
+        query = (
+            select(Cupon)
+            .options(
+                selectinload(Cupon.cupon_productos),
+                selectinload(Cupon.cupon_categorias)
+            )
+            .where(Cupon.id == cupon_id)
+        )
         res = await db.execute(query)
         return res.scalar_one_or_none()
 
     @staticmethod
     async def obtener_por_codigo(db: AsyncSession, codigo: str) -> Optional[Cupon]:
-        query = select(Cupon).where(Cupon.codigo == codigo.strip().upper())
+        query = (
+            select(Cupon)
+            .options(
+                selectinload(Cupon.cupon_productos),
+                selectinload(Cupon.cupon_categorias)
+            )
+            .where(Cupon.codigo == codigo.strip().upper())
+        )
         res = await db.execute(query)
         return res.scalar_one_or_none()
 
     @staticmethod
     async def listar_cupones(db: AsyncSession, skip: int = 0, limit: int = 50) -> List[Cupon]:
-        query = select(Cupon).offset(skip).limit(limit).order_by(desc(Cupon.fecha_creacion))
+        query = (
+            select(Cupon)
+            .options(
+                selectinload(Cupon.cupon_productos),
+                selectinload(Cupon.cupon_categorias)
+            )
+            .offset(skip)
+            .limit(limit)
+            .order_by(desc(Cupon.fecha_creacion))
+        )
+        res = await db.execute(query)
+        return list(res.scalars().all())
+
+    @classmethod
+    async def listar_disponibles(cls, db: AsyncSession) -> List[Cupon]:
+        """Obtiene cupones activos, vigentes y con usos disponibles para clientes (CU27)."""
+        ahora = datetime.now(timezone.utc)
+        query = (
+            select(Cupon)
+            .options(
+                selectinload(Cupon.cupon_productos),
+                selectinload(Cupon.cupon_categorias)
+            )
+            .where(
+                Cupon.estado == EstadoCupon.ACTIVO,
+                Cupon.fecha_inicio <= ahora,
+                Cupon.fecha_fin >= ahora,
+                or_(
+                    Cupon.usos_maximos.is_(None),
+                    Cupon.usos_actuales < Cupon.usos_maximos
+                )
+            )
+            .order_by(Cupon.fecha_fin.asc())
+        )
         res = await db.execute(query)
         return list(res.scalars().all())
 
@@ -236,11 +346,21 @@ class CuponService:
             raise BadRequestException("La fecha de fin debe ser posterior a la fecha de inicio")
 
         for key, val in update_data.items():
-            setattr(cupon, key, val)
+            if key not in ["producto_ids", "categoria_ids"]:
+                setattr(cupon, key, val)
+
+        if cupon_in.producto_ids is not None:
+            await db.execute(delete(CuponProducto).where(CuponProducto.cupon_id == cupon.id))
+            for pid in set(cupon_in.producto_ids):
+                db.add(CuponProducto(cupon_id=cupon.id, producto_id=pid))
+
+        if cupon_in.categoria_ids is not None:
+            await db.execute(delete(CuponCategoria).where(CuponCategoria.cupon_id == cupon.id))
+            for cid in set(cupon_in.categoria_ids):
+                db.add(CuponCategoria(cupon_id=cupon.id, categoria_id=cid))
 
         await db.commit()
-        await db.refresh(cupon)
-        return cupon
+        return await cls.obtener_por_id(db, cupon.id)
 
     @classmethod
     async def eliminar_cupon(cls, db: AsyncSession, cupon_id: int) -> bool:
@@ -261,7 +381,13 @@ class CuponService:
         return True
 
     @classmethod
-    async def validar_cupon(cls, db: AsyncSession, codigo: str, subtotal: Decimal) -> Tuple[bool, str, Optional[Cupon], Decimal]:
+    async def validar_cupon(
+        cls,
+        db: AsyncSession,
+        codigo: str,
+        subtotal: Decimal,
+        items: Optional[List[Any]] = None
+    ) -> Tuple[bool, str, Optional[Cupon], Decimal]:
         cupon = await cls.obtener_por_codigo(db, codigo)
         if not cupon:
             return False, "El cupón no existe", None, Decimal("0.00")
@@ -289,11 +415,47 @@ class CuponService:
         if cupon.monto_minimo is not None and subtotal < cupon.monto_minimo:
             return False, f"El subtotal mínimo para este cupón es de ${cupon.monto_minimo:.2f}", cupon, Decimal("0.00")
             
+        # Validar aplicabilidad por productos y categorías (CU27)
+        prod_ids = {cp.producto_id for cp in (cupon.cupon_productos or [])}
+        cat_ids = {cc.categoria_id for cc in (cupon.cupon_categorias or [])}
+
+        subtotal_base = subtotal
+        if prod_ids or cat_ids:
+            if items:
+                subtotal_aplicable = Decimal("0.00")
+                for it in items:
+                    pid = getattr(it, "producto_id", None)
+                    cid = getattr(it, "categoria_id", None)
+                    # Si no vienen en el item directo, intentar resolver desde variante
+                    if pid is None and hasattr(it, "variante_producto") and it.variante_producto:
+                        pid = getattr(it.variante_producto, "producto_id", None)
+                        if hasattr(it.variante_producto, "producto") and it.variante_producto.producto:
+                            cid = getattr(it.variante_producto.producto, "categoria_id", None)
+                    
+                    # Si falta categoria_id pero tenemos producto_id, buscar categoria del producto
+                    if cid is None and pid is not None:
+                        q_p = select(Producto.categoria_id).where(Producto.id == pid)
+                        res_p = await db.execute(q_p)
+                        cid = res_p.scalar_one_or_none()
+
+                    it_precio = getattr(it, "precio_unitario", Decimal("0.00"))
+                    it_cant = getattr(it, "cantidad", 1)
+                    it_subtotal = getattr(it, "subtotal", it_precio * it_cant)
+
+                    es_aplicable = (pid in prod_ids) or (cid is not None and cid in cat_ids)
+                    if es_aplicable:
+                        subtotal_aplicable += Decimal(str(it_subtotal))
+
+                if subtotal_aplicable <= Decimal("0.00"):
+                    return False, "El cupón no es aplicable a los productos del carrito", cupon, Decimal("0.00")
+                
+                subtotal_base = subtotal_aplicable
+
         # Calcular descuento
         if cupon.tipo == TipoCupon.PORCENTAJE:
-            descuento = (subtotal * cupon.valor) / Decimal("100.00")
+            descuento = (subtotal_base * cupon.valor) / Decimal("100.00")
         else:
-            descuento = min(cupon.valor, subtotal)
+            descuento = min(cupon.valor, subtotal_base)
             
         return True, "Cupón válido", cupon, descuento
 
@@ -351,7 +513,7 @@ class CarritoService:
                 cupon = res_cup.scalar_one_or_none()
                 
             if cupon:
-                valido, _, _, desc_calc = await CuponService.validar_cupon(db, cupon.codigo, subtotal)
+                valido, _, _, desc_calc = await CuponService.validar_cupon(db, cupon.codigo, subtotal, items=carrito.items)
                 if valido:
                     descuento = desc_calc
                 else:
@@ -533,13 +695,23 @@ class OrdenService:
         db.add(orden)
         await db.flush()
         
-        # Crear los detalles de orden
+        # Crear los detalles de orden (congelar costo vigente)
+        variante_ids = [item.variante_producto_id for item in carrito.items]
+        variantes_map: Dict[int, VarianteProducto] = {}
+        if variante_ids:
+            r_vars = await db.execute(
+                select(VarianteProducto).options(joinedload(VarianteProducto.producto))
+                .where(VarianteProducto.id.in_(variante_ids))
+            )
+            for v in r_vars.scalars().all():
+                variantes_map[v.id] = v
         for item in carrito.items:
             detalle = DetalleOrden(
                 orden_id=orden.id,
                 variante_producto_id=item.variante_producto_id,
                 cantidad=item.cantidad,
                 precio_unitario=item.precio_unitario,
+                costo_unitario=_resolver_costo_unitario(variantes_map.get(item.variante_producto_id)),
                 subtotal=item.subtotal
             )
             db.add(detalle)
@@ -807,6 +979,7 @@ class VentaPresencialService:
                 "variante_id": det.variante_producto_id,
                 "cantidad": det.cantidad,
                 "precio": precio,
+                "costo": _resolver_costo_unitario(variante),
                 "subtotal": st
             })
             
@@ -850,6 +1023,7 @@ class VentaPresencialService:
                 variante_producto_id=item["variante_id"],
                 cantidad=item["cantidad"],
                 precio_unitario=item["precio"],
+                costo_unitario=item.get("costo"),
                 subtotal=item["subtotal"]
             )
             db.add(det_ord)
@@ -957,7 +1131,22 @@ class ReservaService:
             db.add(det_res)
             
         await db.commit()
-        return await cls.obtener_reserva(db, reserva.id)
+        reserva_creada = await cls.obtener_reserva(db, reserva.id)
+
+        # CU12: Notificar a la sucursal sobre la nueva reserva
+        try:
+            nombre_sucursal = reserva_creada.sucursal.nombre if reserva_creada.sucursal else "Sucursal"
+            await FirebaseService.enviar_notificacion_sucursal(
+                db=db,
+                sucursal_id=reserva_in.sucursal_id,
+                titulo=f"Nueva Reserva: #{reserva_creada.numero_reserva}",
+                cuerpo=f"Se ha recibido una nueva reserva en {nombre_sucursal} ({len(reserva_in.detalles)} prenda(s) por apartar).",
+                data={"reserva_id": str(reserva_creada.id), "tipo": "NUEVA_RESERVA", "url": "/branch/reservations"}
+            )
+        except Exception as e:
+            logger.warning(f"Error al enviar notificación FCM por nueva reserva: {e}")
+
+        return reserva_creada
 
     @staticmethod
     async def obtener_reserva(db: AsyncSession, reserva_id: int) -> Reserva:
@@ -1024,9 +1213,18 @@ class ReservaService:
         cls, db: AsyncSession, reserva_id: int, nuevo_estado: EstadoReserva, usuario_id: Optional[int] = None
     ) -> Reserva:
         reserva = await cls.obtener_reserva(db, reserva_id)
+        estado_anterior = reserva.estado
         
-        # Si se cancela, liberar stock
-        if nuevo_estado in (EstadoReserva.CANCELADA, EstadoReserva.CADUCADA) and reserva.estado not in (EstadoReserva.CANCELADA, EstadoReserva.CADUCADA, EstadoReserva.COMPLETADA):
+        # CU13 Excepción: Si la reserva ya está en "Preparada" o posterior, no se permite cancelar
+        if nuevo_estado == EstadoReserva.CANCELADA:
+            if estado_anterior in (EstadoReserva.PREPARADA, EstadoReserva.EN_PRUEBA, EstadoReserva.COMPLETADA):
+                raise BadRequestException(
+                    f"No se puede cancelar una reserva en estado '{estado_anterior.value}'. "
+                    f"Solo se permiten cancelaciones si la reserva está en estado 'PENDIENTE'."
+                )
+
+        # Si se cancela o caduca, liberar stock reservado
+        if nuevo_estado in (EstadoReserva.CANCELADA, EstadoReserva.CADUCADA) and estado_anterior not in (EstadoReserva.CANCELADA, EstadoReserva.CADUCADA, EstadoReserva.COMPLETADA):
             for det in reserva.detalles:
                 await InventarioVentasService.liberar_stock_reserva(
                     db, det.variante_producto_id, reserva.sucursal_id, det.cantidad, usuario_id=usuario_id, comprar=False
@@ -1035,7 +1233,56 @@ class ReservaService:
                 
         reserva.estado = nuevo_estado
         await db.commit()
-        return await cls.obtener_reserva(db, reserva_id)
+        reserva_actualizada = await cls.obtener_reserva(db, reserva_id)
+
+        # Disparo de Notificaciones Push (FCM) según el cambio de estado
+        try:
+            nombre_suc = reserva_actualizada.sucursal.nombre if reserva_actualizada.sucursal else "Sucursal"
+            num_res = reserva_actualizada.numero_reserva or f"#{reserva_actualizada.id}"
+            
+            # 1. Notificar al cliente si la prenda ya fue PREPARADA
+            if nuevo_estado == EstadoReserva.PREPARADA and reserva_actualizada.cliente:
+                await FirebaseService.enviar_notificacion_usuario(
+                    db=db,
+                    usuario_id=reserva_actualizada.cliente.usuario_id,
+                    titulo="¡Tus prendas están listas para prueba!",
+                    cuerpo=f"Tu reserva {num_res} ya está preparada en {nombre_suc}. Puedes pasar hoy a probártelas.",
+                    data={"reserva_id": str(reserva_id), "tipo": "RESERVA_PREPARADA", "url": "/profile/reservations"}
+                )
+
+            # 2. Notificar cancelación a cliente y sucursal
+            elif nuevo_estado == EstadoReserva.CANCELADA:
+                # Notificar a la sucursal para devolver prendas
+                await FirebaseService.enviar_notificacion_sucursal(
+                    db=db,
+                    sucursal_id=reserva_actualizada.sucursal_id,
+                    titulo=f"Reserva Cancelada: {num_res}",
+                    cuerpo=f"La reserva {num_res} ha sido cancelada. Las prendas han sido liberadas a inventario.",
+                    data={"reserva_id": str(reserva_id), "tipo": "RESERVA_CANCELADA", "url": "/branch/reservations"}
+                )
+                # Confirmar al cliente si la cancelación la hizo la tienda o el sistema
+                if reserva_actualizada.cliente:
+                    await FirebaseService.enviar_notificacion_usuario(
+                        db=db,
+                        usuario_id=reserva_actualizada.cliente.usuario_id,
+                        titulo=f"Reserva Cancelada: {num_res}",
+                        cuerpo=f"Tu reserva {num_res} ha sido cancelada correctamente.",
+                        data={"reserva_id": str(reserva_id), "tipo": "RESERVA_CANCELADA", "url": "/profile/reservations"}
+                    )
+
+            # 3. Notificar al cliente cuando se completa la prueba / retiro
+            elif nuevo_estado == EstadoReserva.COMPLETADA and reserva_actualizada.cliente:
+                await FirebaseService.enviar_notificacion_usuario(
+                    db=db,
+                    usuario_id=reserva_actualizada.cliente.usuario_id,
+                    titulo=f"¡Gracias por tu visita! Reserva {num_res}",
+                    cuerpo=f"Tu atención de reserva en {nombre_suc} ha finalizado con éxito.",
+                    data={"reserva_id": str(reserva_id), "tipo": "RESERVA_COMPLETADA", "url": "/profile/reservations"}
+                )
+        except Exception as e:
+            logger.warning(f"Error al enviar notificación FCM por cambio de estado de reserva: {e}")
+
+        return reserva_actualizada
 
     @classmethod
     async def completar_reserva(
@@ -1074,6 +1321,7 @@ class ReservaService:
                     "variante_id": det.variante_producto_id,
                     "cantidad": det.cantidad,
                     "precio": precio,
+                    "costo": _resolver_costo_unitario(variante),
                     "subtotal": precio * det.cantidad
                 })
             else:
@@ -1107,6 +1355,7 @@ class ReservaService:
                     variante_producto_id=item["variante_id"],
                     cantidad=item["cantidad"],
                     precio_unitario=item["precio"],
+                    costo_unitario=item.get("costo"),
                     subtotal=item["subtotal"]
                 )
                 db.add(det_ord)
@@ -1195,21 +1444,43 @@ class PagoService:
             await db.commit()
 
     @staticmethod
+    @staticmethod
     async def crear_orden_paypal(
         db: AsyncSession, orden_id: int, return_url: Optional[str] = None, cancel_url: Optional[str] = None
     ) -> Dict[str, Any]:
         orden = await OrdenService.obtener_orden(db, orden_id)
         if orden.estado == EstadoOrden.PAGADO:
             raise BadRequestException("La orden ya se encuentra pagada")
-            
-        paypal_data = await PayPalService.create_order(
-            orden_id=orden.id,
-            numero_orden=orden.numero_orden,
-            total=orden.total,
-            moneda="USD",
-            return_url=return_url,
-            cancel_url=cancel_url
-        )
+        
+        logger.info(f"Creando orden PayPal para orden #{orden_id}")
+        
+        try:
+            paypal_data = await PayPalService.create_order(
+                orden_id=orden.id,
+                numero_orden=orden.numero_orden,
+                total=orden.total,
+                moneda="USD",
+                return_url=return_url,
+                cancel_url=cancel_url
+            )
+        except ValueError as e:
+            logger.error(f"Error al crear orden PayPal: {str(e)}")
+            # Registrar transacción fallida
+            transaccion = TransaccionPago(
+                orden_id=orden.id,
+                monto=orden.total,
+                moneda="USD",
+                metodo_pago=MetodoPagoDigital.PAYPAL,
+                estado=EstadoTransaccion.RECHAZADO,
+                referencia_externa=None,
+                datos_respuesta={"error": str(e)}
+            )
+            db.add(transaccion)
+            await db.commit()
+            raise BadRequestException(f"Error al crear orden en PayPal: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error inesperado al crear orden PayPal: {str(e)}")
+            raise BadRequestException(f"Error inesperado al procesar el pago con PayPal: {str(e)}")
         
         # Registrar transacción
         transaccion = TransaccionPago(
@@ -1223,6 +1494,8 @@ class PagoService:
         )
         db.add(transaccion)
         await db.commit()
+        
+        logger.info(f"Orden PayPal creada exitosamente: {paypal_data['order_id']}")
         
         return paypal_data
 
@@ -1255,3 +1528,399 @@ class PagoService:
         query = select(TransaccionPago).where(TransaccionPago.orden_id == orden_id).order_by(desc(TransaccionPago.fecha))
         res = await db.execute(query)
         return list(res.scalars().all())
+
+
+# ==============================================================================
+# DEVOLUCIONES Y CAMBIOS (CU28)
+# ==============================================================================
+
+class DevolucionService:
+    """Servicio de lógica de negocio para devoluciones y cambios de prendas (CU28)."""
+
+    @classmethod
+    def _ahora(cls) -> datetime:
+        return datetime.now(timezone.utc)
+
+    @classmethod
+    def _generar_numero_solicitud(cls) -> str:
+        fecha_str = datetime.now().strftime("%Y%m%d")
+        random_str = secrets.token_hex(2).upper()
+        return f"DEV-{fecha_str}-{random_str}"
+
+    @classmethod
+    async def crear_solicitud(
+        cls,
+        db: AsyncSession,
+        cliente_id: int,
+        datos: SolicitudDevolucionCreate
+    ) -> SolicitudDevolucion:
+        ahora = cls._ahora()
+
+        # 1. Obtener orden
+        q_orden = (
+            select(Orden)
+            .options(selectinload(Orden.detalles))
+            .where(Orden.id == datos.orden_id)
+        )
+        res_orden = await db.execute(q_orden)
+        orden = res_orden.scalar_one_or_none()
+        if not orden:
+            raise NotFoundException(f"Orden con ID {datos.orden_id} no encontrada")
+
+        if orden.cliente_id != cliente_id:
+            raise ForbiddenException("No tienes permiso para solicitar devoluciones de órdenes ajenas")
+
+        estados_permitidos = [EstadoOrden.PAGADO, EstadoOrden.EN_PROCESO, EstadoOrden.ENVIADO, EstadoOrden.ENTREGADO]
+        if orden.estado not in estados_permitidos:
+            raise BadRequestException(f"No se puede solicitar devolución para una orden en estado {orden.estado.value}")
+
+        # 2. Validar plazo de devolución
+        orden_fecha = orden.fecha if orden.fecha.tzinfo else orden.fecha.replace(tzinfo=timezone.utc)
+        plazo_dias = getattr(settings, "PLAZO_DEVOLUCION_DIAS", 30)
+        if orden_fecha + timedelta(days=plazo_dias) < ahora:
+            raise BadRequestException(
+                f"El plazo de devolución de {plazo_dias} días ha vencido para esta orden (comprada el {orden_fecha.strftime('%d/%m/%Y')})."
+            )
+
+        # 3. Validar items de la orden
+        detalles_orden_map = {d.id: d for d in orden.detalles}
+        monto_total_reembolso = Decimal("0.00")
+        sucursal_id = datos.sucursal_id or orden.sucursal_id
+
+        # Verificar que no existan solicitudes pendientes/en revisión/aprobadas para estos detalles
+        detalle_ids_solicitados = [it.detalle_orden_id for it in datos.items]
+        q_sol_exist = (
+            select(DetalleSolicitudDevolucion)
+            .join(SolicitudDevolucion, SolicitudDevolucion.id == DetalleSolicitudDevolucion.solicitud_id)
+            .where(
+                DetalleSolicitudDevolucion.detalle_orden_id.in_(detalle_ids_solicitados),
+                SolicitudDevolucion.estado.in_([
+                    EstadoSolicitudDevolucion.PENDIENTE,
+                    EstadoSolicitudDevolucion.EN_REVISION,
+                    EstadoSolicitudDevolucion.APROBADA,
+                    EstadoSolicitudDevolucion.PENDIENTE_REEMBOLSO
+                ])
+            )
+        )
+        res_sol_exist = await db.execute(q_sol_exist)
+        if res_sol_exist.scalars().all():
+            raise ConflictException("Ya existe una solicitud activa para uno o más productos de esta orden")
+
+        detalles_solicitud: List[DetalleSolicitudDevolucion] = []
+        for it in datos.items:
+            if it.detalle_orden_id not in detalles_orden_map:
+                raise BadRequestException(f"El detalle de orden ID {it.detalle_orden_id} no pertenece a la orden ID {datos.orden_id}")
+
+            det_orden = detalles_orden_map[it.detalle_orden_id]
+            if it.cantidad > det_orden.cantidad:
+                raise BadRequestException(
+                    f"La cantidad a devolver ({it.cantidad}) supera la cantidad comprada ({det_orden.cantidad}) en el detalle ID {it.detalle_orden_id}"
+                )
+
+            # Si es cambio, validar disponibilidad de la nueva variante
+            if datos.tipo == TipoSolicitudDevolucion.CAMBIO:
+                if not it.variante_cambio_id:
+                    raise BadRequestException("Para solicitudes de CAMBIO es obligatorio especificar la nueva variante deseada")
+                
+                if sucursal_id:
+                    stock_disp = await InventarioVentasService.validar_stock_disponible(
+                        db, it.variante_cambio_id, sucursal_id, it.cantidad
+                    )
+                    if not stock_disp:
+                        raise BadRequestException(
+                            f"No hay stock suficiente en la sucursal para la nueva variante ID {it.variante_cambio_id}. Considere solicitar DEVOLUCIÓN."
+                        )
+
+            precio_unit = det_orden.precio_unitario
+            monto_total_reembolso += (precio_unit * it.cantidad)
+
+            detalles_solicitud.append(
+                DetalleSolicitudDevolucion(
+                    detalle_orden_id=it.detalle_orden_id,
+                    variante_producto_id=det_orden.variante_producto_id,
+                    cantidad=it.cantidad,
+                    variante_cambio_id=it.variante_cambio_id,
+                    precio_unitario=precio_unit
+                )
+            )
+
+        solicitud = SolicitudDevolucion(
+            numero_solicitud=cls._generar_numero_solicitud(),
+            cliente_id=cliente_id,
+            orden_id=datos.orden_id,
+            sucursal_id=sucursal_id,
+            tipo=datos.tipo,
+            motivo=datos.motivo,
+            motivo_detalle=datos.motivo_detalle,
+            estado=EstadoSolicitudDevolucion.PENDIENTE,
+            monto_reembolso=monto_total_reembolso,
+            detalles=detalles_solicitud
+        )
+        db.add(solicitud)
+        await db.commit()
+        await db.refresh(solicitud)
+
+        try:
+            if sucursal_id:
+                q_enc = select(EncargadoSucursal.usuario_id).where(EncargadoSucursal.sucursal_id == sucursal_id)
+                res_enc = await db.execute(q_enc)
+                u_ids = res_enc.scalars().all()
+                for uid in u_ids:
+                    await FirebaseService.enviar_notificacion(
+                        db=db,
+                        usuario_id=uid,
+                        titulo="Nueva solicitud de devolución/cambio",
+                        mensaje=f"Se ha recibido la solicitud {solicitud.numero_solicitud} de tipo {solicitud.tipo.value}.",
+                        tipo="DEVOLUCION_NUEVA",
+                        datos_adicionales={"solicitud_id": str(solicitud.id)}
+                    )
+        except Exception as e:
+            logger.warning(f"Error al enviar notificación push de devolución: {e}")
+
+        return await cls.obtener_solicitud_detalle(db, solicitud.id)
+
+    @classmethod
+    async def obtener_solicitud_detalle(cls, db: AsyncSession, solicitud_id: int) -> SolicitudDevolucion:
+        query = (
+            select(SolicitudDevolucion)
+            .options(
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_producto).selectinload(VarianteProducto.producto),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_producto).selectinload(VarianteProducto.talla),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_producto).selectinload(VarianteProducto.color),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_cambio).selectinload(VarianteProducto.producto),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_cambio).selectinload(VarianteProducto.talla),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_cambio).selectinload(VarianteProducto.color),
+                selectinload(SolicitudDevolucion.cliente),
+                selectinload(SolicitudDevolucion.orden),
+                selectinload(SolicitudDevolucion.sucursal)
+            )
+            .where(SolicitudDevolucion.id == solicitud_id)
+        )
+        res = await db.execute(query)
+        sol = res.scalar_one_or_none()
+        if not sol:
+            raise NotFoundException(f"Solicitud de devolución ID {solicitud_id} no encontrada")
+        return sol
+
+    @classmethod
+    async def mis_solicitudes(cls, db: AsyncSession, cliente_id: int, skip: int = 0, limit: int = 50) -> List[SolicitudDevolucion]:
+        query = (
+            select(SolicitudDevolucion)
+            .options(
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_producto).selectinload(VarianteProducto.producto),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_producto).selectinload(VarianteProducto.talla),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_producto).selectinload(VarianteProducto.color),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_cambio).selectinload(VarianteProducto.producto),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_cambio).selectinload(VarianteProducto.talla),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_cambio).selectinload(VarianteProducto.color)
+            )
+            .where(SolicitudDevolucion.cliente_id == cliente_id)
+            .order_by(desc(SolicitudDevolucion.fecha_solicitud))
+            .offset(skip)
+            .limit(limit)
+        )
+        res = await db.execute(query)
+        return list(res.scalars().all())
+
+    @classmethod
+    async def listar_para_staff(
+        cls,
+        db: AsyncSession,
+        sucursal_id: Optional[int] = None,
+        estado: Optional[EstadoSolicitudDevolucion] = None,
+        skip: int = 0,
+        limit: int = 50
+    ) -> List[SolicitudDevolucion]:
+        query = (
+            select(SolicitudDevolucion)
+            .options(
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_producto).selectinload(VarianteProducto.producto),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_producto).selectinload(VarianteProducto.talla),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_producto).selectinload(VarianteProducto.color),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_cambio).selectinload(VarianteProducto.producto),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_cambio).selectinload(VarianteProducto.talla),
+                selectinload(SolicitudDevolucion.detalles).selectinload(DetalleSolicitudDevolucion.variante_cambio).selectinload(VarianteProducto.color)
+            )
+            .order_by(desc(SolicitudDevolucion.fecha_solicitud))
+        )
+        if sucursal_id is not None:
+            query = query.where(SolicitudDevolucion.sucursal_id == sucursal_id)
+        if estado is not None:
+            query = query.where(SolicitudDevolucion.estado == estado)
+
+        query = query.offset(skip).limit(limit)
+        res = await db.execute(query)
+        return list(res.scalars().all())
+
+    @classmethod
+    async def revisar_solicitud(
+        cls,
+        db: AsyncSession,
+        solicitud_id: int,
+        staff_user: Usuario,
+        datos: RevisionSolicitudRequest
+    ) -> SolicitudDevolucion:
+        solicitud = await cls.obtener_solicitud_detalle(db, solicitud_id)
+        ahora = cls._ahora()
+
+        if solicitud.estado not in [EstadoSolicitudDevolucion.PENDIENTE, EstadoSolicitudDevolucion.EN_REVISION]:
+            raise BadRequestException(f"La solicitud ya se encuentra en estado {solicitud.estado.value}")
+
+        accion_norm = datos.accion.strip().upper()
+        if accion_norm == "RECHAZAR":
+            if not datos.observaciones:
+                raise BadRequestException("Las observaciones son obligatorias al rechazar una solicitud")
+            solicitud.estado = EstadoSolicitudDevolucion.RECHAZADA
+            solicitud.observaciones_staff = datos.observaciones
+            solicitud.revisado_por_id = staff_user.id
+            solicitud.fecha_resolucion = ahora
+            await db.commit()
+
+            if solicitud.cliente_id:
+                q_cli = select(Cliente.usuario_id).where(Cliente.id == solicitud.cliente_id)
+                res_cli = await db.execute(q_cli)
+                u_cli_id = res_cli.scalar_one_or_none()
+                if u_cli_id:
+                    try:
+                        await FirebaseService.enviar_notificacion(
+                            db=db,
+                            usuario_id=u_cli_id,
+                            titulo="Solicitud de devolución rechazada",
+                            mensaje=f"Tu solicitud {solicitud.numero_solicitud} ha sido rechazada: {datos.observaciones}",
+                            tipo="DEVOLUCION_RECHAZADA",
+                            datos_adicionales={"solicitud_id": str(solicitud.id)}
+                        )
+                    except Exception:
+                        pass
+            return await cls.obtener_solicitud_detalle(db, solicitud.id)
+
+        elif accion_norm == "APROBAR":
+            solicitud.revisado_por_id = staff_user.id
+            solicitud.observaciones_staff = datos.observaciones
+            solicitud.estado = EstadoSolicitudDevolucion.APROBADA
+            return await cls.procesar(db, solicitud, staff_user)
+
+        else:
+            raise BadRequestException("Acción no reconocida. Use 'APROBAR' o 'RECHAZAR'")
+
+    @classmethod
+    async def procesar(
+        cls,
+        db: AsyncSession,
+        solicitud: SolicitudDevolucion,
+        staff_user: Usuario
+    ) -> SolicitudDevolucion:
+        ahora = cls._ahora()
+        sucursal_id = solicitud.sucursal_id
+        if not sucursal_id:
+            res_suc = await db.execute(select(Sucursal.id).limit(1))
+            sucursal_id = res_suc.scalar_one_or_none()
+
+        if sucursal_id:
+            if solicitud.tipo == TipoSolicitudDevolucion.CAMBIO:
+                for it in solicitud.detalles:
+                    if it.variante_producto_id:
+                        await InventarioVentasService.reintegrar_stock_devolucion(
+                            db=db,
+                            variante_id=it.variante_producto_id,
+                            sucursal_id=sucursal_id,
+                            cantidad=it.cantidad,
+                            usuario_id=staff_user.id,
+                            motivo=f"Reintegro por cambio {solicitud.numero_solicitud}"
+                        )
+                    if it.variante_cambio_id:
+                        await InventarioVentasService.descontar_stock_venta(
+                            db=db,
+                            variante_id=it.variante_cambio_id,
+                            sucursal_id=sucursal_id,
+                            cantidad=it.cantidad,
+                            usuario_id=staff_user.id,
+                            motivo=f"Entrega por cambio {solicitud.numero_solicitud}"
+                        )
+
+            elif solicitud.tipo == TipoSolicitudDevolucion.DEVOLUCION:
+                for it in solicitud.detalles:
+                    if it.variante_producto_id:
+                        await InventarioVentasService.reintegrar_stock_devolucion(
+                            db=db,
+                            variante_id=it.variante_producto_id,
+                            sucursal_id=sucursal_id,
+                            cantidad=it.cantidad,
+                            usuario_id=staff_user.id,
+                            motivo=f"Reintegro por devolución {solicitud.numero_solicitud}"
+                        )
+
+        if solicitud.tipo == TipoSolicitudDevolucion.CAMBIO:
+            solicitud.estado = EstadoSolicitudDevolucion.COMPLETADA
+            solicitud.fecha_resolucion = ahora
+        elif solicitud.tipo == TipoSolicitudDevolucion.DEVOLUCION:
+            q_tx = (
+                select(TransaccionPago)
+                .where(
+                    TransaccionPago.orden_id == solicitud.orden_id,
+                    TransaccionPago.estado == EstadoTransaccion.CONFIRMADO
+                )
+            )
+            res_tx = await db.execute(q_tx)
+            tx = res_tx.scalar_one_or_none()
+
+            if tx and tx.metodo_pago in [MetodoPagoDigital.STRIPE, MetodoPagoDigital.PAYPAL]:
+                try:
+                    reembolso_ok = True
+                    if tx.metodo_pago == MetodoPagoDigital.STRIPE and tx.referencia_externa and hasattr(StripeService, "refund"):
+                        try:
+                            await StripeService.refund(tx.referencia_externa, float(solicitud.monto_reembolso or 0))
+                        except Exception as e_stripe:
+                            logger.error(f"Error procesando refund en Stripe: {e_stripe}")
+                            reembolso_ok = False
+                    
+                    if reembolso_ok:
+                        tx.estado = EstadoTransaccion.REEMBOLSADO
+                        solicitud.estado = EstadoSolicitudDevolucion.COMPLETADA
+                        solicitud.fecha_resolucion = ahora
+                    else:
+                        solicitud.estado = EstadoSolicitudDevolucion.PENDIENTE_REEMBOLSO
+                except Exception as e:
+                    logger.error(f"Fallo en pasarela de reembolso: {e}")
+                    solicitud.estado = EstadoSolicitudDevolucion.PENDIENTE_REEMBOLSO
+            else:
+                solicitud.estado = EstadoSolicitudDevolucion.COMPLETADA
+                solicitud.fecha_resolucion = ahora
+
+        await db.commit()
+
+        if solicitud.cliente_id:
+            q_cli = select(Cliente.usuario_id).where(Cliente.id == solicitud.cliente_id)
+            res_cli = await db.execute(q_cli)
+            u_cli_id = res_cli.scalar_one_or_none()
+            if u_cli_id:
+                try:
+                    await FirebaseService.enviar_notificacion(
+                        db=db,
+                        usuario_id=u_cli_id,
+                        titulo="Solicitud de devolución procesada",
+                        mensaje=f"Tu solicitud {solicitud.numero_solicitud} ha sido {solicitud.estado.value.lower()}.",
+                        tipo="DEVOLUCION_RESUELTA",
+                        datos_adicionales={"solicitud_id": str(solicitud.id), "estado": solicitud.estado.value}
+                    )
+                except Exception:
+                    pass
+
+        return await cls.obtener_solicitud_detalle(db, solicitud.id)
+
+    @classmethod
+    async def procesar_reembolso_pendiente(
+        cls,
+        db: AsyncSession,
+        solicitud_id: int,
+        staff_user: Usuario
+    ) -> SolicitudDevolucion:
+        solicitud = await cls.obtener_solicitud_detalle(db, solicitud_id)
+        if solicitud.estado != EstadoSolicitudDevolucion.PENDIENTE_REEMBOLSO:
+            raise BadRequestException(f"La solicitud no se encuentra en estado PENDIENTE_REEMBOLSO (actual: {solicitud.estado.value})")
+
+        solicitud.estado = EstadoSolicitudDevolucion.COMPLETADA
+        solicitud.fecha_resolucion = cls._ahora()
+        solicitud.revisado_por_id = staff_user.id
+        await db.commit()
+        return await cls.obtener_solicitud_detalle(db, solicitud.id)

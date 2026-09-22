@@ -16,7 +16,8 @@ from decimal import Decimal
 from app.apps.gestion_ventas.models import (
     TipoCupon, EstadoCupon, EstadoCarrito, TipoOrden, EstadoOrden,
     MetodoPagoPresencial, EstadoReserva, EstadoDetalleReserva,
-    MetodoPagoDigital, EstadoTransaccion, TipoComprobante, EstadoPasarela
+    MetodoPagoDigital, EstadoTransaccion, TipoComprobante, EstadoPasarela,
+    TipoSolicitudDevolucion, MotivoDevolucion, EstadoSolicitudDevolucion
 )
 from app.apps.gestion_catalogo.schemas import ProductoResumenResponse, TallaResponse, ColorResponse
 
@@ -38,7 +39,8 @@ class CuponBase(BaseModel):
 
 
 class CuponCreate(CuponBase):
-    pass
+    producto_ids: Optional[List[int]] = Field(default_factory=list, description="IDs de productos aplicables (vacío = todos)")
+    categoria_ids: Optional[List[int]] = Field(default_factory=list, description="IDs de categorías aplicables (vacío = todas)")
 
 
 class CuponUpdate(BaseModel):
@@ -51,6 +53,8 @@ class CuponUpdate(BaseModel):
     usos_maximos: Optional[int] = Field(None, ge=1)
     monto_minimo: Optional[Decimal] = Field(None, ge=0)
     estado: Optional[EstadoCupon] = None
+    producto_ids: Optional[List[int]] = None
+    categoria_ids: Optional[List[int]] = None
 
 
 class CuponResponse(CuponBase):
@@ -58,12 +62,27 @@ class CuponResponse(CuponBase):
     usos_actuales: int
     creado_por_id: Optional[int] = None
     fecha_creacion: datetime
+    producto_ids: List[int] = Field(default_factory=list)
+    categoria_ids: List[int] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class AplicarCuponRequest(BaseModel):
     codigo: str = Field(..., description="Código del cupón a aplicar al carrito")
+
+
+class ItemValidacionCupon(BaseModel):
+    producto_id: int
+    categoria_id: Optional[int] = None
+    cantidad: int = 1
+    precio_unitario: Decimal
+
+
+class ValidarCuponRequest(BaseModel):
+    codigo: str = Field(..., description="Código del cupón a validar")
+    subtotal: Optional[Decimal] = Field(None, ge=0)
+    items: Optional[List[ItemValidacionCupon]] = None
 
 
 class CuponValidacionResponse(BaseModel):
@@ -344,3 +363,62 @@ class PasarelaPagoResponse(BaseModel):
     estado: EstadoPasarela
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ==============================================================================
+# DEVOLUCIONES Y CAMBIOS (CU28)
+# ==============================================================================
+
+class ItemSolicitudDevolucionCreate(BaseModel):
+    detalle_orden_id: int = Field(..., description="ID del ítem de la orden original")
+    cantidad: int = Field(1, ge=1, description="Cantidad de prendas a devolver o cambiar")
+    variante_cambio_id: Optional[int] = Field(None, description="ID de la nueva variante deseada en caso de cambio")
+
+
+class SolicitudDevolucionCreate(BaseModel):
+    orden_id: int = Field(..., description="ID de la orden de compra")
+    sucursal_id: Optional[int] = Field(None, description="Sucursal donde se procesará o entregará la prenda")
+    tipo: TipoSolicitudDevolucion = Field(..., description="DEVOLUCION o CAMBIO")
+    motivo: MotivoDevolucion = Field(..., description="Motivo de la solicitud")
+    motivo_detalle: Optional[str] = Field(None, description="Descripción adicional del motivo")
+    items: List[ItemSolicitudDevolucionCreate] = Field(..., min_length=1, description="Prendas incluidas en la solicitud")
+
+
+class DetalleSolicitudDevolucionResponse(BaseModel):
+    id: int
+    solicitud_id: int
+    detalle_orden_id: int
+    variante_producto_id: Optional[int] = None
+    cantidad: int
+    variante_cambio_id: Optional[int] = None
+    precio_unitario: Decimal
+    variante_producto: Optional[VarianteResumenResponse] = None
+    variante_cambio: Optional[VarianteResumenResponse] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SolicitudDevolucionResponse(BaseModel):
+    id: int
+    numero_solicitud: str
+    cliente_id: Optional[int] = None
+    orden_id: int
+    sucursal_id: Optional[int] = None
+    tipo: TipoSolicitudDevolucion
+    motivo: MotivoDevolucion
+    motivo_detalle: Optional[str] = None
+    estado: EstadoSolicitudDevolucion
+    monto_reembolso: Optional[Decimal] = None
+    observaciones_staff: Optional[str] = None
+    revisado_por_id: Optional[int] = None
+    fecha_solicitud: datetime
+    fecha_resolucion: Optional[datetime] = None
+    detalles: List[DetalleSolicitudDevolucionResponse] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RevisionSolicitudRequest(BaseModel):
+    accion: str = Field(..., description="Acción de resolución: 'APROBAR' o 'RECHAZAR'")
+    observaciones: Optional[str] = Field(None, description="Observaciones del personal que revisa la solicitud")
+

@@ -6,6 +6,7 @@ Proporciona:
 - Interpretación de comandos de voz para reportes gerenciales (CU22)
 - Análisis de tendencias de moda (CU20)
 """
+import io
 import json
 import logging
 from typing import List, Dict, Any, Optional
@@ -25,6 +26,7 @@ class GroqService:
     # devuelven 404 model_not_found, por eso se usan los modelos GPT-OSS públicos.
     MODELO_DEFAULT = "openai/gpt-oss-120b"
     MODELO_RAPIDO = "openai/gpt-oss-20b"
+    MODELO_STT = "whisper-large-v3-turbo"
 
     def __init__(self):
         self.api_key = settings.GROQ_API_KEY
@@ -68,19 +70,26 @@ class GroqService:
                 "estilo_detectado": "Casual Contemporáneo"
             }
 
-        prompt_sistema = """Eres el estilista y motor de recomendaciones de FashionStore, una tienda de moda de alta calidad.
-Tu objetivo es analizar el historial de compras o gustos del cliente y recomendar los mejores productos del catálogo disponible.
+        prompt_sistema = """Eres el estilista de moda y motor de recomendaciones inteligente de FashionStore.
+Tu objetivo es analizar el historial de compras previas o gustos del cliente y seleccionar las mejores prendas complementarias del catálogo disponible.
+
+REGLAS DE RECOMENDACIÓN DE MODA:
+1. Combinación y Cross-selling: Si el cliente compró una prenda específica (ej. un pantalón o jean), prioriza recomendar prendas que completen el outfit o hagan match (ej. calzado, poleras, camisas, chaquetas, cinturones o accesorios).
+2. Coherencia de género y estilo: Si el cliente suele comprar prendas de hombre o mujer, sugiere prendas afines a su estilo detectado.
+3. Catálogo Real: Utiliza ÚNICAMENTE los IDs y nombres de los productos que aparecen en la lista "Catálogo disponible actualmente". NO inventes productos ni IDs.
+4. Razón persuasiva y elegante: En el campo "razon", redacta una breve frase que explique por qué combina perfectamente (ej. "Combina idealmente con tu pantalón para un estilo urbano y fresco").
+
 Debes responder ESTRICTAMENTE en formato JSON con la siguiente estructura:
 {
   "recomendaciones": [
     {
       "producto_id": 1,
       "nombre": "Nombre de la prenda",
-      "razon": "Por qué combina con su estilo o compras previas"
+      "razon": "Por qué combina con su compra previa o estilo"
     }
   ],
-  "mensaje_personalizado": "Mensaje cordial para el cliente",
-  "estilo_detectado": "Estilo inferido (ej. Urbano Chic, Elegante Casual, etc.)"
+  "mensaje_personalizado": "Mensaje cordial para el cliente destacando cómo estas sugerencias complementan sus compras recientes",
+  "estilo_detectado": "Estilo inferido (ej. Urbano Contemporáneo, Smart Casual, Elegante Noche, etc.)"
 }"""
 
         prompt_usuario = f"""Cliente: {cliente_nombre}
@@ -140,29 +149,40 @@ Por favor, selecciona hasta 5 productos recomendados y genera la respuesta JSON.
             }
 
         prompt_sistema = """Eres el Asistente Virtual Inteligente de 'FashionStore'.
-Eres un asesor de imagen y estilista profesional, amable, elegante, moderno y servicial.
-Ayudas a los clientes a encontrar prendas ideales, combinar atuendos según ocasiones (bodas, trabajo, citas, verano, etc.), responder sobre tallas, telas, cuidados y promociones.
+Eres un asesor de imagen, estilista y asistente personal de compras para los clientes de FashionStore, amable, elegante, moderno y servicial.
+Ayudas a los clientes a encontrar prendas ideales, combinar atuendos según ocasiones (bodas, trabajo, citas, verano, etc.), responder sobre tallas, telas, cuidados, promociones, gestionar su carrito de compras y consultar o generar reportes de sus compras y reservas en tienda.
 
-REGLAS DE PRESENTACIÓN (MUY IMPORTANTES):
+REGLAS DE PRESENTACIÓN Y ACCIONES (MUY IMPORTANTES):
 - NUNCA muestres IDs, códigos internos, SKUs ni referencias técnicas al cliente en el texto de `respuesta`.
-- Cuando el cliente pida VER productos (ej. "muéstrame las gorras"): escribe una introducción breve y amigable (máximo 2 frases) y NO listes los productos en el texto; la interfaz mostrará tarjetas visuales con imagen, nombre y precio automáticamente. En el texto puedes comentar brevemente lo destacado de cada producto (colores, material, estilo) usando la `descripcion` del catálogo.
+- Cuando el cliente pida VER productos (ej. "muéstrame las gorras"): escribe una introducción breve y amigable (máximo 2 frases) y NO listes los productos en el texto; la interfaz mostrará tarjetas visuales con imagen, nombre y precio automáticamente.
 - Si el cliente menciona una categoría concreta (gorras, camisas, pantalones, vestidos, etc.), menciona SOLO productos que correspondan a esa categoría.
 - Si el cliente pide combinar prendas o armar un look/outfit, propón 2 a 4 prendas complementarias del catálogo y usa "tipo_respuesta": "outfit".
-- Los IDs de los productos en `productos_mencionados` son SOLO para uso interno del sistema y nunca deben aparecer en el texto visible al cliente.
+- ACCIÓN DE AGREGAR AL CARRITO: Si el cliente pide agregar el look, outfit o prendas al carrito (ej. "agrega este outfit al carrito", "añade las prendas a mi carrito", "lo quiero comprar todo", "agregar al carrito"):
+  1. Devuelve `"accion": "agregar_carrito"`.
+  2. En `"productos_mencionados"` coloca la lista de IDs de los productos a agregar (los del outfit o mencionados previamente).
+  3. En `"respuesta"` confirma amablemente que has procedido a agregar el look a su carrito.
+
+- ACCIÓN DE REPORTE DE COMPRAS: Si el cliente pide un reporte, historial, resumen o balance de sus compras/pedidos/gastos (ej. "genera un reporte de mis compras", "reporte de mis pedidos en pdf", "cuánto he gastado", "mis compras en excel"):
+  1. Devuelve `"accion": "reporte_compras"`.
+  2. Usa `"tipo_respuesta": "reporte"`.
+  3. Si el cliente mencionó un formato específico ("pdf", "excel", "csv"), colócalo en `"formato_reporte"`; si no, usa `"pdf"`.
+  4. En `"respuesta"`, ofrece un resumen conversacional de sus compras (cuántos pedidos tiene, total gastado o estado de sus últimos pedidos) basándote en la información de `Contexto del cliente`, e indícale amablemente que puede descargar su reporte completo con los botones interactivos que aparecen abajo.
+
+- ACCIÓN DE REPORTE DE RESERVAS: Si el cliente pide un reporte, historial o consulta de sus reservas en tienda (ej. "reporte de mis reservas", "qué reservas tengo pendientes", "descargar mis reservas en excel"):
+  1. Devuelve `"accion": "reporte_reservas"`.
+  2. Usa `"tipo_respuesta": "reporte"`.
+  3. Si el cliente mencionó un formato específico ("pdf", "excel", "csv"), colócalo en `"formato_reporte"`; si no, usa `"pdf"`.
+  4. En `"respuesta"`, resume brevemente el estado de sus reservas (cuántas activas tiene, en qué sucursal) e indícale que puede descargar el comprobante/reporte con los botones de abajo.
 
 Responde ESTRICTAMENTE en formato JSON con la siguiente estructura:
 {
-  "respuesta": "Texto de tu respuesta al cliente en tono cercano y profesional, sin IDs ni códigos",
+  "respuesta": "Texto de tu respuesta al cliente en tono cercano y profesional, sin IDs ni códigos técnicos",
   "sugerencias": ["Pregunta sugerida 1", "Pregunta sugerida 2", "Pregunta sugerida 3"],
   "productos_mencionados": [1, 2],
-  "tipo_respuesta": "texto" | "catalogo" | "producto" | "outfit"
-}
-
-Uso de tipo_respuesta:
-- "texto": respuesta conversacional sin productos mencionados.
-- "catalogo": cuando muestras 2 o más productos que el cliente pidió ver.
-- "producto": cuando se analiza o recomienda un único producto en detalle.
-- "outfit": cuando recomiendas una combinación completa de prendas (look)."""
+  "tipo_respuesta": "texto" | "catalogo" | "producto" | "outfit" | "reporte",
+  "accion": "agregar_carrito" | "reporte_compras" | "reporte_reservas" | null,
+  "formato_reporte": "pdf" | "excel" | "csv" | null
+}"""
 
         messages = [{"role": "system", "content": prompt_sistema}]
 
@@ -340,6 +360,60 @@ Responde ESTRICTAMENTE en formato JSON con la siguiente estructura:
                 "categorias_en_alza": ["Casual", "Temporada actual"],
                 "prediccion_demanda": "Demanda sostenida con crecimiento en ventas online."
             }
+
+
+
+
+    async def transcribir_audio(self, audio_bytes: bytes, filename: str = "audio.webm") -> str:
+        """
+        Transcribe audio a texto usando Whisper de Groq.
+        Reemplazo del webkitSpeechRecognition del navegador: el backend
+        recibe el blob de audio grabado por getUserMedia/MediaRecorder y
+        devuelve el texto transcrito.
+        """
+        self._verificar_cliente()
+        if not self.client:
+            logger.warning("GROQ_API_KEY no configurada. No se puede transcribir audio.")
+            return ""
+
+        try:
+            audio_file = io.BytesIO(audio_bytes)
+            audio_file.name = filename
+
+            transcript = await self.client.audio.transcriptions.create(
+                file=audio_file,
+                model=self.MODELO_STT,
+                language="es",
+                prompt="Comandos de reportes de ventas, inventario, reservas, clientes y financiero en PDF o Excel.",
+                temperature=0.0
+            )
+
+            texto = (transcript.text or "").strip()
+
+            # Filtrar alucinaciones conocidas de Whisper causadas por silencio o ruido ambiente
+            alucinaciones = [
+                "suscribete al canal",
+                "suscríbete al canal",
+                "suscribete",
+                "suscríbete",
+                "subtitulos por la comunidad",
+                "subtítulos por la comunidad",
+                "amara.org",
+                "gracias por ver el video",
+                "gracias por ver",
+                "hasta la proxima",
+                "hasta la próxima"
+            ]
+            texto_norm = texto.lower().replace("¡", "").replace("!", "").replace(".", "").strip()
+            if any(h in texto_norm for h in alucinaciones) and len(texto) < 40:
+                logger.info(f"Alucinación de Whisper por silencio/ambiente descartada: '{texto}'")
+                return ""
+
+            logger.info(f"Whisper transcribió: '{texto[:50]}...' ({len(texto)} caracteres)")
+            return texto
+        except Exception as e:
+            logger.error(f"Error transcribiendo audio con Whisper: {e}")
+            return ""
 
 
 groq_service = GroqService()

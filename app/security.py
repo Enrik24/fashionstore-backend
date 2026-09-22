@@ -37,6 +37,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Security scheme
 security = HTTPBearer()
+security_optional = HTTPBearer(auto_error=False)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -182,6 +183,42 @@ async def get_current_user(
         )
     
     return user
+
+
+async def get_optional_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_optional),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Dependencia opcional para obtener el usuario actual si el token JWT está presente.
+    Si no hay token o es inválido, retorna None sin lanzar excepción 401.
+    """
+    if not credentials or not credentials.credentials:
+        return None
+    try:
+        from app.apps.gestion_usuarios.models import Usuario, EstadoUsuario
+        from sqlalchemy.orm import selectinload
+
+        token = credentials.credentials
+        payload = decode_token(token)
+        user_id_raw = payload.get("sub")
+        if user_id_raw is None:
+            return None
+        user_id = int(user_id_raw)
+        result = await db.execute(
+            select(Usuario)
+            .options(
+                selectinload(Usuario.roles),
+                selectinload(Usuario.cliente)
+            )
+            .where(Usuario.id == user_id)
+        )
+        user = result.scalar_one_or_none()
+        if user and (user.estado == EstadoUsuario.ACTIVO or user.estado == "ACTIVO"):
+            return user
+        return None
+    except Exception:
+        return None
 
 
 async def get_current_active_user(current_user = Depends(get_current_user)):

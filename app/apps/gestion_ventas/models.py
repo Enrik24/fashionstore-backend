@@ -206,6 +206,7 @@ class DetalleOrden(Base):
     variante_producto_id = Column(Integer, ForeignKey("variantes_producto.id", ondelete="SET NULL"), nullable=True)
     cantidad = Column(Integer, nullable=False)
     precio_unitario = Column(Numeric(10, 2), nullable=False)
+    costo_unitario = Column(Numeric(10, 2), nullable=True)
     subtotal = Column(Numeric(10, 2), nullable=False)
     
     # Relaciones
@@ -344,6 +345,86 @@ class PasarelaPago(Base):
         return f"<PasarelaPago {self.nombre}>"
 
 
+# Enumeraciones adicionales para CU28
+class TipoSolicitudDevolucion(str, enum.Enum):
+    DEVOLUCION = "DEVOLUCION"
+    CAMBIO = "CAMBIO"
+
+
+class MotivoDevolucion(str, enum.Enum):
+    TALLA_INCORRECTA = "TALLA_INCORRECTA"
+    COLOR_INCORRECTO = "COLOR_INCORRECTO"
+    DEFECTO_FABRICA = "DEFECTO_FABRICA"
+    OTRO = "OTRO"
+
+
+class EstadoSolicitudDevolucion(str, enum.Enum):
+    PENDIENTE = "PENDIENTE"
+    EN_REVISION = "EN_REVISION"
+    APROBADA = "APROBADA"
+    RECHAZADA = "RECHAZADA"
+    COMPLETADA = "COMPLETADA"
+    PENDIENTE_REEMBOLSO = "PENDIENTE_REEMBOLSO"
+
+
+# Modelo: SolicitudDevolucion (CU28)
+class SolicitudDevolucion(Base):
+    """Tabla de solicitudes de devolución y cambio."""
+    __tablename__ = "solicitudes_devolucion"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    numero_solicitud = Column(String(50), unique=True, nullable=False, index=True)
+    cliente_id = Column(Integer, ForeignKey("clientes.id", ondelete="SET NULL"), nullable=True)
+    orden_id = Column(Integer, ForeignKey("ordenes.id", ondelete="CASCADE"), nullable=False)
+    sucursal_id = Column(Integer, ForeignKey("sucursales.id", ondelete="SET NULL"), nullable=True)
+    tipo = Column(Enum(TipoSolicitudDevolucion), nullable=False)
+    motivo = Column(Enum(MotivoDevolucion), nullable=False)
+    motivo_detalle = Column(Text, nullable=True)
+    estado = Column(Enum(EstadoSolicitudDevolucion), default=EstadoSolicitudDevolucion.PENDIENTE, nullable=False)
+    monto_reembolso = Column(Numeric(10, 2), nullable=True)
+    observaciones_staff = Column(Text, nullable=True)
+    revisado_por_id = Column(Integer, ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True)
+    fecha_solicitud = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_resolucion = Column(DateTime(timezone=True), nullable=True)
+
+    # Relaciones
+    cliente = relationship("Cliente", back_populates="solicitudes_devolucion")
+    orden = relationship("Orden", back_populates="solicitudes_devolucion")
+    sucursal = relationship("Sucursal")
+    revisado_por = relationship("Usuario")
+    detalles = relationship("DetalleSolicitudDevolucion", back_populates="solicitud", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<SolicitudDevolucion {self.numero_solicitud} - {self.tipo}: {self.estado}>"
+
+
+# Modelo: DetalleSolicitudDevolucion (CU28)
+class DetalleSolicitudDevolucion(Base):
+    """Tabla de detalles de solicitud de devolución/cambio."""
+    __tablename__ = "detalles_solicitud_devolucion"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    solicitud_id = Column(Integer, ForeignKey("solicitudes_devolucion.id", ondelete="CASCADE"), nullable=False)
+    detalle_orden_id = Column(Integer, ForeignKey("detalles_orden.id", ondelete="CASCADE"), nullable=False)
+    variante_producto_id = Column(Integer, ForeignKey("variantes_producto.id", ondelete="SET NULL"), nullable=True)
+    cantidad = Column(Integer, nullable=False)
+    variante_cambio_id = Column(Integer, ForeignKey("variantes_producto.id", ondelete="SET NULL"), nullable=True)
+    precio_unitario = Column(Numeric(10, 2), nullable=False)
+
+    # Relaciones
+    solicitud = relationship("SolicitudDevolucion", back_populates="detalles")
+    detalle_orden = relationship("DetalleOrden")
+    variante_producto = relationship("VarianteProducto", foreign_keys=[variante_producto_id])
+    variante_cambio = relationship("VarianteProducto", foreign_keys=[variante_cambio_id])
+
+    def __repr__(self):
+        return f"<DetalleSolicitudDevolucion {self.id} - Solicitud {self.solicitud_id}>"
+
+
 # Importar modelos relacionados para registrar relaciones
 from app.apps.gestion_usuarios.models import Usuario, Cliente, Cajero
 from app.apps.gestion_catalogo.models import VarianteProducto, Sucursal
+
+# Inyectar relaciones en Orden y Cliente
+Orden.solicitudes_devolucion = relationship("SolicitudDevolucion", back_populates="orden", cascade="all, delete-orphan")
+Cliente.solicitudes_devolucion = relationship("SolicitudDevolucion", back_populates="cliente")

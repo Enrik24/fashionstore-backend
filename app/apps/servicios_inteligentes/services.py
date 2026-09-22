@@ -37,7 +37,7 @@ from app.apps.servicios_inteligentes.schemas import (
 
 from app.apps.gestion_ventas.models import (
     Orden, DetalleOrden, Reserva, DetalleReserva,
-    VentaPresencial, TransaccionPago, EstadoOrden, EstadoReserva, TipoOrden
+    VentaPresencial, TransaccionPago, EstadoOrden, EstadoReserva, EstadoTransaccion, TipoOrden
 )
 from app.apps.gestion_catalogo.models import (
     Producto, VarianteProducto, Inventario, Categoria, Temporada, Coleccion, EstadoProducto
@@ -45,16 +45,33 @@ from app.apps.gestion_catalogo.models import (
 from app.apps.gestion_usuarios.models import Usuario, Cliente, Administrador
 
 
+def _lista_imagenes(valor: Any) -> List[str]:
+    """Normaliza el campo `imagenes`: a veces viene como string serializado '["url"]'."""
+    if not valor:
+        return []
+    if isinstance(valor, list):
+        return [str(x) for x in valor if x]
+    if isinstance(valor, str):
+        s = valor.strip()
+        if not s:
+            return []
+        try:
+            import json as _json
+            parsed = _json.loads(s)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed if x]
+            return [s]
+        except (ValueError, TypeError):
+            return [s]
+    return []
+
+
 def _imagen_principal(producto: Any) -> Optional[str]:
     """Devuelve la primera imagen del producto (campo `imagenes`) o None."""
-    if producto is None or not producto.imagenes:
+    if producto is None or not getattr(producto, "imagenes", None):
         return None
-    imgs = producto.imagenes
-    if isinstance(imgs, list):
-        return imgs[0] if imgs else None
-    if isinstance(imgs, str):
-        return imgs
-    return None
+    imgs = _lista_imagenes(producto.imagenes)
+    return imgs[0] if imgs else None
 
 
 def _normalizar_texto(texto: Optional[str]) -> str:
@@ -82,6 +99,117 @@ _KEYWORDS_CATEGORIA = {
 }
 
 
+def _costo_detalle(det) -> Optional[float]:
+    """Costo por unidad: congelado ?? costo_variante ?? costo_compra.
+
+    Devuelve None cuando no hay ningún costo real cargado (antes se estimaba
+    precio*0.6, lo que hacía pasar un estimado por "beneficio real").
+    """
+    try:
+        frozen = getattr(det, "costo_unitario", None)
+        if frozen is not None:
+            return float(frozen)
+        var = getattr(det, "variante_producto", None)
+        if var is not None:
+            cv = getattr(var, "costo_variante", None)
+            if cv is not None:
+                return float(cv)
+            prod = getattr(var, "producto", None)
+            if prod is not None and getattr(prod, "costo_compra", None) is not None:
+                c = float(prod.costo_compra)
+                if c > 0:
+                    return c
+        return None
+    except Exception:
+        return None
+
+
+def _costo_total(ordenes, ventas_presenciales) -> Dict[str, Any]:
+    """Suma costo*cantidad de todos los detalles no cancelados (online + presencial).
+
+    Devuelve {"total": float, "tiene_costos_reales": bool}: si ningún detalle
+    tiene costo real cargado, el total es 0 y tiene_costos_reales es False para
+    que la UI muestre el estimado en lugar de un "real" inventado.
+    """
+    total = 0.0
+    tiene_reales = False
+    for o in (ordenes or []):
+        try:
+            if getattr(o, "estado", None) == EstadoOrden.CANCELADO:
+                continue
+            for d in (getattr(o, "detalles", None) or []):
+                c = _costo_detalle(d)
+                if c is None:
+                    continue
+                tiene_reales = True
+                total += c * (getattr(d, "cantidad", 0) or 0)
+        except Exception:
+            continue
+    for v in (ventas_presenciales or []):
+        try:
+            ord_ = getattr(v, "orden", None)
+            if ord_ is None or getattr(ord_, "estado", None) == EstadoOrden.CANCELADO:
+                continue
+            for d in (getattr(ord_, "detalles", None) or []):
+                c = _costo_detalle(d)
+                if c is None:
+                    continue
+                tiene_reales = True
+                total += c * (getattr(d, "cantidad", 0) or 0)
+        except Exception:
+            continue
+    return {"total": round(total, 2), "tiene_costos_reales": tiene_reales}
+
+
+def _serie_diaria_ventas(ordenes, ventas_presenciales, fecha_inicio, fecha_fin):
+    """Agrega totales por día (retrocompatible: solo se incluye con incluir_serie=true)."""
+    from collections import defaultdict
+    from datetime import date as _date
+    fi = fecha_inicio.date() if hasattr(fecha_inicio, "date") else None
+    ff = fecha_fin.date() if hasattr(fecha_fin, "date") else None
+    if not fi or not ff:
+        ff = datetime.now(timezone.utc).date()
+        fi = ff - timedelta(days=29)
+    dias = (ff - fi).days
+    if dias < 0 or dias > 366:
+        ff = datetime.now(timezone.utc).date()
+        fi = ff - timedelta(days=29)
+        dias = 29
+    acc = defaultdict(lambda: {"total": 0.0, "online": 0.0, "presencial": 0.0})
+    for o in (ordenes or []):
+        try:
+            if getattr(o, "estado", None) == EstadoOrden.CANCELADO:
+                continue
+            f = getattr(o, "fecha", None)
+            d = f.date() if hasattr(f, "date") else None
+            if d and fi <= d <= ff:
+                acc[d.isoformat()]["online"] += float(getattr(o, "total", 0) or 0)
+                acc[d.isoformat()]["total"] += float(getattr(o, "total", 0) or 0)
+        except Exception:
+            continue
+    for v in (ventas_presenciales or []):
+        try:
+            ord_ = getattr(v, "orden", None)
+            if ord_ is None or getattr(ord_, "estado", None) == EstadoOrden.CANCELADO:
+                continue
+            f = getattr(v, "fecha", None) or getattr(ord_, "fecha", None)
+            d = f.date() if hasattr(f, "date") else None
+            if d and fi <= d <= ff:
+                acc[d.isoformat()]["presencial"] += float(getattr(ord_, "total", 0) or 0)
+                acc[d.isoformat()]["total"] += float(getattr(ord_, "total", 0) or 0)
+        except Exception:
+            continue
+    out = []
+    cur = fi
+    while cur <= ff:
+        k = cur.isoformat()
+        out.append({"fecha": k, "total": round(acc[k]["total"], 2),
+                    "online": round(acc[k]["online"], 2),
+                    "presencial": round(acc[k]["presencial"], 2)})
+        cur += timedelta(days=1)
+    return out
+
+
 def _detectar_filtro_categoria(mensaje: Optional[str]) -> Optional[str]:
     """Detecta si el mensaje pide una categoría concreta (ej. 'gorras', 'camisas')."""
     if not mensaje:
@@ -92,6 +220,33 @@ def _detectar_filtro_categoria(mensaje: Optional[str]) -> Optional[str]:
             if _normalizar_texto(sin) in texto:
                 return palabra_clave
     return None
+
+
+def _genero_dominante(historial_compras) -> Optional[str]:
+    """Género dominante del historial (solo HOMBRE vs MUJER; el unisex no vota).
+
+    Devuelve "HOMBRE", "MUJER" o None cuando hay empate, no hay historial o
+    todo es unisex (en esos casos se dejan los 3 géneros como hasta ahora).
+    """
+    h = sum(1 for it in (historial_compras or []) if str((it or {}).get("genero") or "").upper() == "HOMBRE")
+    m = sum(1 for it in (historial_compras or []) if str((it or {}).get("genero") or "").upper() == "MUJER")
+    if h > m:
+        return "HOMBRE"
+    if m > h:
+        return "MUJER"
+    return None
+
+
+def _genero_producto(p) -> str:
+    g = p.genero.value if hasattr(getattr(p, "genero", None), "value") else (str(p.genero) if getattr(p, "genero", None) else "UNISEX")
+    return (g or "UNISEX").upper()
+
+
+def _filtrar_productos_por_genero(productos, genero_dominante):
+    """Limita el catálogo al género dominante + UNISEX (siempre incluido)."""
+    if not genero_dominante:
+        return list(productos)
+    return [p for p in productos if _genero_producto(p) in (genero_dominante, "UNISEX")]
 
 
 # ==============================================================================
@@ -105,7 +260,8 @@ class ReporteService:
         db: AsyncSession,
         fecha_inicio: Optional[datetime] = None,
         fecha_fin: Optional[datetime] = None,
-        sucursal_id: Optional[int] = None
+        sucursal_id: Optional[int] = None,
+        incluir_serie: bool = False
     ) -> Dict[str, Any]:
         """Genera datos agregados del reporte de ventas."""
         condiciones_orden = [Orden.tipo == TipoOrden.DIGITAL]  # Órdenes en línea (excluye POS y reservas)
@@ -117,10 +273,13 @@ class ReporteService:
         if fecha_fin:
             condiciones_orden.append(Orden.fecha <= fecha_fin)
             condiciones_presencial.append(VentaPresencial.fecha <= fecha_fin)
+        if sucursal_id:
+            condiciones_orden.append(Orden.sucursal_id == sucursal_id)
+            condiciones_presencial.append(VentaPresencial.sucursal_id == sucursal_id)
 
         # 1. Órdenes Online
         q_ordenes = select(Orden).options(
-            selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto)
+            selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto).selectinload(VarianteProducto.producto)
         )
         if condiciones_orden:
             q_ordenes = q_ordenes.where(and_(*condiciones_orden))
@@ -132,7 +291,7 @@ class ReporteService:
 
         # 2. Ventas Presenciales
         q_presencial = select(VentaPresencial).options(
-            selectinload(VentaPresencial.orden).selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto)
+            selectinload(VentaPresencial.orden).selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto).selectinload(VarianteProducto.producto)
         )
         if sucursal_id:
             condiciones_presencial.append(VentaPresencial.sucursal_id == sucursal_id)
@@ -141,8 +300,11 @@ class ReporteService:
         res_presencial = await db.execute(q_presencial)
         ventas_presenciales = res_presencial.scalars().all()
 
-        total_presencial = sum(float(v.orden.total or 0) for v in ventas_presenciales if v.orden is not None)
-        ventas_presenciales_count = len([v for v in ventas_presenciales if v.orden is not None])
+        def _orden_valida(v) -> bool:
+            return v.orden is not None and v.orden.estado != EstadoOrden.CANCELADO
+
+        total_presencial = sum(float(v.orden.total or 0) for v in ventas_presenciales if _orden_valida(v))
+        ventas_presenciales_count = len([v for v in ventas_presenciales if _orden_valida(v)])
 
         # 3. Agregación de productos más vendidos
         conteo_productos = {}
@@ -154,7 +316,7 @@ class ReporteService:
                         conteo_productos[pid] = conteo_productos.get(pid, 0) + d.cantidad
 
         for v in ventas_presenciales:
-            if v.orden is not None:
+            if _orden_valida(v):
                 for d in v.orden.detalles:
                     pid = d.variante_producto.producto_id if d.variante_producto else None
                     if pid:
@@ -162,7 +324,7 @@ class ReporteService:
 
         top_productos_info = []
         if conteo_productos:
-            sorted_pids = sorted(conteo_productos.items(), key=lambda x: x[1], reverse=True)[:5]
+            sorted_pids = sorted(conteo_productos.items(), key=lambda x: x[1], reverse=True)[:10]
             pids = [item[0] for item in sorted_pids]
             res_p = await db.execute(select(Producto).where(Producto.id.in_(pids)))
             prods_map = {p.id: p.nombre for p in res_p.scalars().all()}
@@ -173,7 +335,8 @@ class ReporteService:
                     "unidades_vendidas": qty
                 })
 
-        return {
+        costo_info = _costo_total(ordenes, ventas_presenciales)
+        resultado = {
             "periodo": {
                 "inicio": fecha_inicio.isoformat() if fecha_inicio else "Historico",
                 "fin": fecha_fin.isoformat() if fecha_fin else "Actual"
@@ -186,14 +349,23 @@ class ReporteService:
                 "cantidad_ventas_presenciales": ventas_presenciales_count,
                 "ticket_promedio": round((total_online + total_presencial) / max(1, pedidos_online_count + ventas_presenciales_count), 2)
             },
+            "costos": {
+                "costo_total_bienes": costo_info["total"],
+                "tiene_costos_reales": costo_info["tiene_costos_reales"],
+            },
             "top_productos": top_productos_info
         }
+        if incluir_serie:
+            resultado["serie_diaria"] = _serie_diaria_ventas(ordenes, ventas_presenciales, fecha_inicio, fecha_fin)
+        return resultado
 
     @staticmethod
     async def generar_reporte_inventario(
         db: AsyncSession,
         categoria_id: Optional[int] = None,
-        solo_bajo_stock: bool = False
+        solo_bajo_stock: bool = False,
+        sucursal_id: Optional[int] = None,
+        limite: int = 500
     ) -> Dict[str, Any]:
         """Genera el reporte del estado del inventario y rotación."""
         q = select(Inventario).options(
@@ -204,6 +376,8 @@ class ReporteService:
         )
         if solo_bajo_stock:
             q = q.where((Inventario.cantidad - Inventario.cantidad_reservada) <= Inventario.stock_minimo)
+        if sucursal_id:
+            q = q.where(Inventario.sucursal_id == sucursal_id)
 
         res = await db.execute(q)
         items = res.scalars().all()
@@ -226,29 +400,32 @@ class ReporteService:
             detalles_inventario.append({
                 "inventario_id": inv.id,
                 "producto_id": prod.id if prod else None,
-                "producto_nombre": prod.nombre if prod else "N/A",
-                "sku": var.sku_variante if var else "N/A",
-                "talla": var.talla.valor if (var and var.talla) else "N/A",
-                "color": var.color.nombre if (var and var.color) else "N/A",
-                "sucursal": inv.sucursal.nombre if inv.sucursal else "General",
+                "producto_nombre": prod.nombre if prod else None,
+                "sku": var.sku_variante if var else None,
+                "talla": var.talla.valor if (var and var.talla) else None,
+                "color": var.color.nombre if (var and var.color) else None,
+                "sucursal": inv.sucursal.nombre if inv.sucursal else None,
                 "cantidad_disponible": inv.cantidad_disponible,
                 "cantidad_reservada": inv.cantidad_reservada,
                 "cantidad_minima": inv.stock_minimo,
                 "alerta_bajo_stock": es_bajo
             })
 
+        limite = max(1, min(limite or 500, 2000))
         return {
             "total_items_registrados": len(detalles_inventario),
             "total_unidades_disponibles": total_unidades,
             "items_con_bajo_stock": items_bajo_stock,
-            "inventario": detalles_inventario[:50]
+            "limite_mostrados": limite,
+            "inventario": detalles_inventario[:limite]
         }
 
     @staticmethod
     async def generar_reporte_reservas(
         db: AsyncSession,
         fecha_inicio: Optional[datetime] = None,
-        fecha_fin: Optional[datetime] = None
+        fecha_fin: Optional[datetime] = None,
+        sucursal_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """Genera métricas de efectividad y conversión de reservas en tienda."""
         q = select(Reserva).options(
@@ -259,6 +436,8 @@ class ReporteService:
             conds.append(Reserva.fecha_creacion >= fecha_inicio)
         if fecha_fin:
             conds.append(Reserva.fecha_creacion <= fecha_fin)
+        if sucursal_id:
+            conds.append(Reserva.sucursal_id == sucursal_id)
         if conds:
             q = q.where(and_(*conds))
 
@@ -305,7 +484,8 @@ class ReporteService:
         res_c = await db.execute(
             select(Cliente).options(
                 selectinload(Cliente.usuario),
-                selectinload(Cliente.ordenes)
+                selectinload(Cliente.ordenes),
+                selectinload(Cliente.ventas_presenciales).selectinload(VentaPresencial.orden)
             )
         )
         clientes = res_c.scalars().all()
@@ -316,14 +496,23 @@ class ReporteService:
         for c in clientes:
             ordenes_validas = [o for o in c.ordenes if o.estado != EstadoOrden.CANCELADO]
             total_gastado = sum(float(o.total or 0) for o in ordenes_validas)
-            if ordenes_validas:
+            pedidos_pos = 0
+            for v in (c.ventas_presenciales or []):
+                if v.orden is not None and v.orden.estado != EstadoOrden.CANCELADO:
+                    total_gastado += float(v.orden.total or 0)
+                    pedidos_pos += 1
+            total_pedidos = len(ordenes_validas) + pedidos_pos
+            if total_pedidos:
                 clientes_con_compras += 1
+            else:
+                continue  # Fuera del top: sin compras no aporta al ranking
 
             top_clientes.append({
                 "cliente_id": c.id,
                 "nombre": f"{c.usuario.nombre} {c.usuario.apellido}" if c.usuario else "Desconocido",
-                "correo": c.usuario.correo if c.usuario else "N/A",
-                "total_pedidos": len(ordenes_validas),
+                "correo": c.usuario.correo if c.usuario else None,
+                "email": c.usuario.correo if c.usuario else None,
+                "total_pedidos": total_pedidos,
                 "total_gastado": round(total_gastado, 2)
             })
 
@@ -339,28 +528,71 @@ class ReporteService:
     async def generar_reporte_financiero(
         db: AsyncSession,
         fecha_inicio: Optional[datetime] = None,
-        fecha_fin: Optional[datetime] = None
+        fecha_fin: Optional[datetime] = None,
+        sucursal_id: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Genera balance de ingresos, métodos de pago y comisiones estimadas."""
-        ventas_data = await ReporteService.generar_reporte_ventas(db, fecha_inicio, fecha_fin)
-        
-        q_pagos = select(TransaccionPago)
+        """Genera balance de ingresos, métodos de pago y beneficios.
+
+        El desglose por método combina pagos digitales confirmados
+        (TransaccionPago) con ventas presenciales (VentaPresencial), que antes
+        no aparecían y dejaban el bloque vacío.
+        """
+        ventas_data = await ReporteService.generar_reporte_ventas(db, fecha_inicio, fecha_fin, sucursal_id)
+
+        q_pagos = select(TransaccionPago).join(Orden, TransaccionPago.orden_id == Orden.id).where(
+            TransaccionPago.estado == EstadoTransaccion.CONFIRMADO
+        )
         if fecha_inicio:
             q_pagos = q_pagos.where(TransaccionPago.fecha >= fecha_inicio)
         if fecha_fin:
             q_pagos = q_pagos.where(TransaccionPago.fecha <= fecha_fin)
+        if sucursal_id:
+            q_pagos = q_pagos.where(Orden.sucursal_id == sucursal_id)
         res_pagos = await db.execute(q_pagos)
         pagos = res_pagos.scalars().all()
 
-        metodos = {}
+        metodos: Dict[str, float] = {}
         for p in pagos:
             m = p.metodo_pago.value if hasattr(p.metodo_pago, 'value') else str(p.metodo_pago)
             metodos[m] = metodos.get(m, 0.0) + float(p.monto or 0)
 
+        # Ventas presenciales (caja): no generan TransaccionPago, se agregan por método
+        q_vp = select(VentaPresencial).options(selectinload(VentaPresencial.orden))
+        conds_vp = []
+        if fecha_inicio:
+            conds_vp.append(VentaPresencial.fecha >= fecha_inicio)
+        if fecha_fin:
+            conds_vp.append(VentaPresencial.fecha <= fecha_fin)
+        if sucursal_id:
+            conds_vp.append(VentaPresencial.sucursal_id == sucursal_id)
+        if conds_vp:
+            q_vp = q_vp.where(and_(*conds_vp))
+        res_vp = await db.execute(q_vp)
+        for v in res_vp.scalars().all():
+            if v.orden is None or v.orden.estado == EstadoOrden.CANCELADO:
+                continue
+            m = v.metodo_pago.value if hasattr(v.metodo_pago, 'value') else str(v.metodo_pago)
+            metodos[m] = metodos.get(m, 0.0) + float(v.orden.total or 0)
+
+        total_rec = float(ventas_data["resumen"]["total_recaudado"] or 0)
+        costos = ventas_data.get("costos") or {}
+        costo_total = float(costos.get("costo_total_bienes") or 0)
+        if costos.get("tiene_costos_reales"):
+            beneficio_real: Optional[float] = round(total_rec - costo_total, 2)
+            margen_pct: Optional[float] = round((beneficio_real / total_rec * 100) if total_rec else 0, 2)
+        else:
+            # Sin costos reales cargados: no inventar un "beneficio real"
+            beneficio_real = None
+            margen_pct = None
+            costo_total = 0.0
+
         return {
             "ingresos": ventas_data["resumen"],
             "desglose_por_metodo_pago": {k: round(v, 2) for k, v in metodos.items()},
-            "beneficio_estimado_margen_40pct": round(ventas_data["resumen"]["total_recaudado"] * 0.4, 2)
+            "costo_total_bienes": round(costo_total, 2),
+            "beneficio_real": beneficio_real,
+            "margen_real_pct": margen_pct,
+            "beneficio_estimado_margen_40pct": round(total_rec * 0.4, 2)
         }
 
     @staticmethod
@@ -493,7 +725,6 @@ class KPIService:
     @staticmethod
     async def crear_kpi(db: AsyncSession, data: IndicadorKPICreate) -> IndicadorKPI:
         datos_kpi = data.model_dump(exclude_unset=True)
-        datos_kpi.pop("unidad_medida", None)  # Campo del schema que no existe en el modelo
         kpi = IndicadorKPI(**datos_kpi)
         db.add(kpi)
         await db.commit()
@@ -508,8 +739,6 @@ class KPIService:
             raise NotFoundException("Indicador KPI no encontrado")
 
         for field, val in data.model_dump(exclude_unset=True).items():
-            if field == "unidad_medida":
-                continue
             setattr(kpi, field, val)
 
         await db.commit()
@@ -537,7 +766,7 @@ class RecomendacionService:
             res_c = await db.execute(
                 select(Cliente).options(
                     selectinload(Cliente.usuario),
-                    selectinload(Cliente.ordenes).selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto).selectinload(VarianteProducto.producto),
+                    selectinload(Cliente.ordenes).selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto).selectinload(VarianteProducto.producto).selectinload(Producto.categoria),
                     selectinload(Cliente.ordenes).selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto).selectinload(VarianteProducto.talla),
                     selectinload(Cliente.ordenes).selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto).selectinload(VarianteProducto.color),
                 ).where(Cliente.id == cliente_id)
@@ -551,6 +780,8 @@ class RecomendacionService:
                         if var and var.producto:
                             historial_compras.append({
                                 "producto": var.producto.nombre,
+                                "categoria": var.producto.categoria.nombre if var.producto.categoria else "General",
+                                "genero": var.producto.genero.value if hasattr(var.producto.genero, 'value') else str(var.producto.genero) if var.producto.genero else None,
                                 "talla": var.talla.valor if var.talla else None,
                                 "color": var.color.nombre if var.color else None
                             })
@@ -560,14 +791,20 @@ class RecomendacionService:
             select(Producto).options(
                 selectinload(Producto.categoria),
                 selectinload(Producto.variantes)
-            ).where(Producto.estado == EstadoProducto.ACTIVO).limit(30)
+            ).where(Producto.estado == EstadoProducto.ACTIVO).limit(40)
         )
-        productos = res_p.scalars().all()
+        productos = list(res_p.scalars().all())
+
+        # Filtro duro por género: si el historial es claramente de hombre (o de
+        # mujer), la IA y el relleno solo ven ese género + UNISEX. En mixto,
+        # empate o vacío se dejan los 3 géneros como hasta ahora.
+        productos = _filtrar_productos_por_genero(productos, _genero_dominante(historial_compras))
         catalogo_resumido = [
             {
                 "id": p.id,
                 "nombre": p.nombre,
                 "categoria": p.categoria.nombre if p.categoria else "General",
+                "genero": p.genero.value if hasattr(p.genero, 'value') else str(p.genero) if p.genero else "UNISEX",
                 "precio": float(p.precio or 0)
             }
             for p in productos
@@ -589,26 +826,41 @@ class RecomendacionService:
             pid = rec.get("producto_id")
             prod = prods_map.get(pid)
             if prod:
+                img_list = _lista_imagenes(prod.imagenes)
                 items_recomendados.append(RecomendacionItem(
                     producto_id=prod.id,
                     nombre=prod.nombre,
+                    sku=prod.sku,
                     razon=rec.get("razon", "Recomendado para ti"),
                     imagen_url=_imagen_principal(prod),
+                    imagenes=img_list,
                     precio=float(prod.precio or 0),
-                    categoria=prod.categoria.nombre if prod.categoria else None
+                    categoria=prod.categoria.nombre if prod.categoria else None,
+                    categoria_id=prod.categoria_id,
+                    genero=prod.genero.value if hasattr(prod.genero, 'value') else str(prod.genero) if prod.genero else None
                 ))
 
         # Si el LLM devolvió pocos o ninguno que coincida con DB, rellenar con destacados
-        if not items_recomendados and productos:
-            for p in productos[:limite]:
-                items_recomendados.append(RecomendacionItem(
-                    producto_id=p.id,
-                    nombre=p.nombre,
-                    razon="Selección destacada de nuestra colección de temporada",
-                    imagen_url=_imagen_principal(p),
-                    precio=float(p.precio or 0),
-                    categoria=p.categoria.nombre if p.categoria else None
-                ))
+        if len(items_recomendados) < limite and productos:
+            used_ids = {item.producto_id for item in items_recomendados}
+            for p in productos:
+                if p.id not in used_ids:
+                    img_list = _lista_imagenes(p.imagenes)
+                    items_recomendados.append(RecomendacionItem(
+                        producto_id=p.id,
+                        nombre=p.nombre,
+                        sku=p.sku,
+                        razon="Selección destacada de nuestra colección de temporada",
+                        imagen_url=_imagen_principal(p),
+                        imagenes=img_list,
+                        precio=float(p.precio or 0),
+                        categoria=p.categoria.nombre if p.categoria else None,
+                        categoria_id=p.categoria_id,
+                        genero=p.genero.value if hasattr(p.genero, 'value') else str(p.genero) if p.genero else None
+                    ))
+                    used_ids.add(p.id)
+                    if len(items_recomendados) >= limite:
+                        break
 
         return RecomendacionResponse(
             cliente_id=cliente_id,
@@ -616,6 +868,162 @@ class RecomendacionService:
             mensaje_personalizado=ai_res.get("mensaje_personalizado", f"¡Hola {cliente_nombre}! Descubre lo que seleccionamos para ti."),
             recomendaciones=items_recomendados[:limite]
         )
+
+
+# ==============================================================================
+# REPORTE CLIENTE SERVICE (CU23 / CU14 / CU15)
+# ==============================================================================
+class ReporteClienteService:
+    """Servicio para recopilar y generar reportes de compras y reservas de clientes individuales."""
+
+    @staticmethod
+    async def obtener_datos_compras(db: AsyncSession, cliente_id: int) -> Dict[str, Any]:
+        # Obtener datos del cliente
+        res_c = await db.execute(
+            select(Cliente).options(selectinload(Cliente.usuario)).where(Cliente.id == cliente_id)
+        )
+        cliente = res_c.scalar_one_or_none()
+        cliente_nombre = f"{cliente.usuario.nombre} {cliente.usuario.apellido}".strip() if cliente and cliente.usuario else "Cliente"
+        cliente_email = cliente.usuario.correo if cliente and cliente.usuario else ""
+
+        # Obtener órdenes del cliente
+        res_ord = await db.execute(
+            select(Orden)
+            .options(
+                selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto).selectinload(VarianteProducto.producto),
+                selectinload(Orden.transacciones),
+                selectinload(Orden.sucursal)
+            )
+            .where(Orden.cliente_id == cliente_id)
+            .order_by(desc(Orden.fecha))
+        )
+        ordenes = res_ord.scalars().all()
+
+        total_gastado = sum(float(o.total or 0) for o in ordenes if o.estado not in (EstadoOrden.CANCELADO,))
+        total_items_comprados = sum(
+            sum(d.cantidad for d in o.detalles) for o in ordenes if o.estado not in (EstadoOrden.CANCELADO,)
+        )
+
+        compras_list = []
+        for o in ordenes:
+            metodo = "-"
+            if o.transacciones:
+                metodo = str(o.transacciones[0].metodo_pago.value if hasattr(o.transacciones[0].metodo_pago, 'value') else o.transacciones[0].metodo_pago)
+            elif o.tipo == TipoOrden.PRESENCIAL:
+                metodo = "Presencial / Tienda"
+
+            detalles_prod = []
+            for d in o.detalles:
+                prod_nombre = d.variante_producto.producto.nombre if (d.variante_producto and d.variante_producto.producto) else f"Variante #{d.variante_producto_id}"
+                detalles_prod.append({
+                    "producto_nombre": prod_nombre,
+                    "cantidad": d.cantidad,
+                    "precio_unitario": float(d.precio_unitario or 0),
+                    "subtotal": float(d.subtotal or 0)
+                })
+
+            compras_list.append({
+                "id": o.id,
+                "codigo": o.numero_orden,
+                "fecha": o.fecha.strftime("%d/%m/%Y %H:%M") if o.fecha else "",
+                "tipo": "Digital / En línea" if o.tipo == TipoOrden.DIGITAL else ("Presencial" if o.tipo == TipoOrden.PRESENCIAL else "Reserva"),
+                "sucursal": o.sucursal.nombre if o.sucursal else "Tienda Online",
+                "total": float(o.total or 0),
+                "estado": str(o.estado.value if hasattr(o.estado, 'value') else o.estado),
+                "metodo_pago": metodo,
+                "detalles": detalles_prod,
+                "total_items": len(detalles_prod)
+            })
+
+        return {
+            "cliente_id": cliente_id,
+            "cliente_nombre": cliente_nombre,
+            "cliente_email": cliente_email,
+            "total_compras": len(ordenes),
+            "total_gastado": round(total_gastado, 2),
+            "total_items_comprados": total_items_comprados,
+            "compras": compras_list
+        }
+
+    @staticmethod
+    async def obtener_datos_reservas(db: AsyncSession, cliente_id: int) -> Dict[str, Any]:
+        # Obtener datos del cliente
+        res_c = await db.execute(
+            select(Cliente).options(selectinload(Cliente.usuario)).where(Cliente.id == cliente_id)
+        )
+        cliente = res_c.scalar_one_or_none()
+        cliente_nombre = f"{cliente.usuario.nombre} {cliente.usuario.apellido}".strip() if cliente and cliente.usuario else "Cliente"
+        cliente_email = cliente.usuario.correo if cliente and cliente.usuario else ""
+
+        # Obtener reservas del cliente
+        res_res = await db.execute(
+            select(Reserva)
+            .options(
+                selectinload(Reserva.detalles).selectinload(DetalleReserva.variante_producto).selectinload(VarianteProducto.producto),
+                selectinload(Reserva.sucursal)
+            )
+            .where(Reserva.cliente_id == cliente_id)
+            .order_by(desc(Reserva.fecha_creacion))
+        )
+        reservas = res_res.scalars().all()
+
+        activas = [r for r in reservas if r.estado in (EstadoReserva.PENDIENTE, EstadoReserva.PREPARADA, EstadoReserva.EN_PRUEBA)]
+        completadas = [r for r in reservas if r.estado == EstadoReserva.COMPLETADA]
+        canceladas = [r for r in reservas if r.estado in (EstadoReserva.CANCELADA, EstadoReserva.CADUCADA)]
+
+        reservas_list = []
+        for r in reservas:
+            detalles_prod = []
+            total_estimado = 0.0
+            for d in r.detalles:
+                var = d.variante_producto
+                prod_nombre = var.producto.nombre if (var and var.producto) else f"Variante #{d.variante_producto_id}"
+                precio = float(var.precio_variante or (var.producto.precio if var and var.producto else 0.0) or 0.0)
+                subtot = precio * d.cantidad
+                total_estimado += subtot
+                detalles_prod.append({
+                    "producto_nombre": prod_nombre,
+                    "cantidad": d.cantidad,
+                    "precio_unitario": precio,
+                    "subtotal": subtot,
+                    "estado": str(d.estado.value if hasattr(d.estado, 'value') else d.estado)
+                })
+
+            reservas_list.append({
+                "id": r.id,
+                "codigo_reserva": r.numero_reserva,
+                "sucursal": r.sucursal.nombre if r.sucursal else "Sucursal General",
+                "fecha_reserva": r.fecha_reserva.strftime("%d/%m/%Y") if r.fecha_reserva else "",
+                "fecha_creacion": r.fecha_creacion.strftime("%d/%m/%Y %H:%M") if r.fecha_creacion else "",
+                "fecha_limite": (r.fecha_reserva + timedelta(days=2)).strftime("%d/%m/%Y") if r.fecha_reserva else "",
+                "estado": str(r.estado.value if hasattr(r.estado, 'value') else r.estado),
+                "total_estimado": round(total_estimado, 2),
+                "detalles": detalles_prod,
+                "total_items": len(detalles_prod)
+            })
+
+        return {
+            "cliente_id": cliente_id,
+            "cliente_nombre": cliente_nombre,
+            "cliente_email": cliente_email,
+            "total_reservas": len(reservas),
+            "reservas_activas": len(activas),
+            "reservas_completadas": len(completadas),
+            "reservas_canceladas_o_vencidas": len(canceladas),
+            "reservas": reservas_list
+        }
+
+    @staticmethod
+    async def obtener_resumen_completo(db: AsyncSession, cliente_id: int) -> Dict[str, Any]:
+        compras = await ReporteClienteService.obtener_datos_compras(db, cliente_id)
+        reservas = await ReporteClienteService.obtener_datos_reservas(db, cliente_id)
+        return {
+            "cliente_id": cliente_id,
+            "cliente_nombre": compras.get("cliente_nombre"),
+            "cliente_email": compras.get("cliente_email"),
+            "compras": compras,
+            "reservas": reservas
+        }
 
 
 # ==============================================================================
@@ -633,7 +1041,10 @@ class AsistenteService:
     ) -> AsistenteChatResponse:
         # Obtener contexto del catálogo (más amplio para cubrir categorías específicas)
         res_p = await db.execute(
-            select(Producto).options(selectinload(Producto.categoria))
+            select(Producto).options(
+                selectinload(Producto.categoria),
+                selectinload(Producto.variantes)
+            )
             .where(Producto.estado == EstadoProducto.ACTIVO).limit(40)
         )
         prods = res_p.scalars().all()
@@ -664,13 +1075,53 @@ class AsistenteService:
                 catalogo_resumen = catalogo_filtrado
 
         contexto_cliente = None
+        compras_cliente_data = None
+        reservas_cliente_data = None
+
         if cliente_id:
             res_c = await db.execute(
                 select(Cliente).options(selectinload(Cliente.usuario)).where(Cliente.id == cliente_id)
             )
             c = res_c.scalar_one_or_none()
             if c and c.usuario:
-                contexto_cliente = {"nombre": c.usuario.nombre, "nit_ci": c.nit_ci}
+                compras_cliente_data = await ReporteClienteService.obtener_datos_compras(db, cliente_id)
+                reservas_cliente_data = await ReporteClienteService.obtener_datos_reservas(db, cliente_id)
+                contexto_cliente = {
+                    "nombre": c.usuario.nombre,
+                    "nit_ci": c.nit_ci,
+                    "resumen_compras": {
+                        "total_pedidos": compras_cliente_data["total_compras"],
+                        "total_gastado_bs": compras_cliente_data["total_gastado"],
+                        "total_prendas_compradas": compras_cliente_data["total_items_comprados"],
+                        "ultimos_pedidos": [
+                            {
+                                "codigo": cp["codigo"],
+                                "fecha": cp["fecha"],
+                                "total_bs": cp["total"],
+                                "estado": cp["estado"],
+                                "metodo_pago": cp["metodo_pago"],
+                                "prendas": [d["producto_nombre"] for d in cp.get("detalles", [])]
+                            }
+                            for cp in compras_cliente_data.get("compras", [])[:5]
+                        ]
+                    },
+                    "resumen_reservas": {
+                        "total_reservas": reservas_cliente_data["total_reservas"],
+                        "reservas_activas_pendientes": reservas_cliente_data["reservas_activas"],
+                        "reservas_completadas": reservas_cliente_data["reservas_completadas"],
+                        "ultimas_reservas": [
+                            {
+                                "codigo": rs["codigo_reserva"],
+                                "sucursal": rs["sucursal"],
+                                "fecha_reserva": rs["fecha_reserva"],
+                                "estado": rs["estado"],
+                                "total_estimado_bs": rs["total_estimado"],
+                                "prendas": [d["producto_nombre"] for d in rs.get("detalles", [])]
+                            }
+                            for rs in reservas_cliente_data.get("reservas", [])[:5]
+                        ]
+                    }
+                }
 
         ai_res = await groq_service.chat_asistente(
             mensaje=mensaje,
@@ -680,9 +1131,8 @@ class AsistenteService:
         )
 
         def _build_producto_info(p: Producto) -> Dict[str, Any]:
-            imgs = p.imagenes
-            if isinstance(imgs, str):
-                imgs = [imgs]
+            imgs = _lista_imagenes(p.imagenes)
+            var_id = p.variantes[0].id if (p.variantes and len(p.variantes) > 0) else None
             return {
                 "id": p.id,
                 "nombre": p.nombre,
@@ -691,6 +1141,7 @@ class AsistenteService:
                 "categoria": p.categoria.nombre if p.categoria else None,
                 "imagen_principal": _imagen_principal(p),
                 "imagenes": imgs if isinstance(imgs, list) else [],
+                "variante_id": var_id
             }
 
         # Enriquecer productos mencionados con detalles visuales (sin SKU ni códigos internos)
@@ -707,7 +1158,6 @@ class AsistenteService:
                 productos_info.append(_build_producto_info(p))
 
         # Fallback: el cliente pidió una categoría y el modelo no devolvió IDs válidos.
-        # Mostramos igualmente los productos de esa categoría como tarjetas visuales.
         ids_filtrados = {item["id"] for item in catalogo_filtrado}
         if not productos_info and ids_filtrados:
             for p in prods:
@@ -717,16 +1167,81 @@ class AsistenteService:
                     break
 
         tipo_respuesta = str(_normalizar_texto(ai_res.get("tipo_respuesta") or "texto"))
-        if tipo_respuesta not in {"texto", "catalogo", "producto", "outfit"}:
+        if tipo_respuesta not in {"texto", "catalogo", "producto", "outfit", "reporte"}:
             tipo_respuesta = "texto"
         if productos_info and tipo_respuesta == "texto":
             tipo_respuesta = "catalogo" if len(productos_info) > 1 else "producto"
 
+        accion = ai_res.get("accion")
+        datos_reporte = None
+        formato_reporte = (ai_res.get("formato_reporte") or "pdf").lower()
+
+        # Si el usuario solicitó reporte de compras o reservas, adjuntar datos estructurados
+        if accion == "reporte_compras" and compras_cliente_data:
+            datos_reporte = {
+                "tipo": "compras",
+                "titulo": "Reporte de Compras y Pedidos",
+                "cliente_nombre": compras_cliente_data["cliente_nombre"],
+                "total_compras": compras_cliente_data["total_compras"],
+                "total_gastado": compras_cliente_data["total_gastado"],
+                "total_items": compras_cliente_data["total_items_comprados"],
+                "items": compras_cliente_data["compras"][:10],
+                "formato_sugerido": formato_reporte
+            }
+            tipo_respuesta = "reporte"
+        elif accion == "reporte_reservas" and reservas_cliente_data:
+            datos_reporte = {
+                "tipo": "reservas",
+                "titulo": "Reporte de Reservas en Tienda",
+                "cliente_nombre": reservas_cliente_data["cliente_nombre"],
+                "total_reservas": reservas_cliente_data["total_reservas"],
+                "reservas_activas": reservas_cliente_data["reservas_activas"],
+                "items": reservas_cliente_data["reservas"][:10],
+                "formato_sugerido": formato_reporte
+            }
+            tipo_respuesta = "reporte"
+
+        # Detección heurística de respaldo en caso de que el LLM no haya seteado la acción explícita
+        msg_norm = _normalizar_texto(mensaje)
+        if not accion and ("reporte" in msg_norm or "descargar" in msg_norm or "historial" in msg_norm):
+            if ("compra" in msg_norm or "pedido" in msg_norm or "gasto" in msg_norm) and compras_cliente_data:
+                accion = "reporte_compras"
+                tipo_respuesta = "reporte"
+                datos_reporte = {
+                    "tipo": "compras",
+                    "titulo": "Reporte de Compras y Pedidos",
+                    "cliente_nombre": compras_cliente_data["cliente_nombre"],
+                    "total_compras": compras_cliente_data["total_compras"],
+                    "total_gastado": compras_cliente_data["total_gastado"],
+                    "total_items": compras_cliente_data["total_items_comprados"],
+                    "items": compras_cliente_data["compras"][:10],
+                    "formato_sugerido": formato_reporte
+                }
+            elif ("reserva" in msg_norm or "apartado" in msg_norm) and reservas_cliente_data:
+                accion = "reporte_reservas"
+                tipo_respuesta = "reporte"
+                datos_reporte = {
+                    "tipo": "reservas",
+                    "titulo": "Reporte de Reservas en Tienda",
+                    "cliente_nombre": reservas_cliente_data["cliente_nombre"],
+                    "total_reservas": reservas_cliente_data["total_reservas"],
+                    "reservas_activas": reservas_cliente_data["reservas_activas"],
+                    "items": reservas_cliente_data["reservas"][:10],
+                    "formato_sugerido": formato_reporte
+                }
+
+        sugerencias_base = ai_res.get("sugerencias", [])
+        if not sugerencias_base:
+            sugerencias_base = ["Ver novedades", "Reporte de mis compras", "Reporte de mis reservas"]
+
         return AsistenteChatResponse(
-            respuesta=ai_res.get("respuesta", "Con gusto te asisto en lo que necesites de moda y estilo."),
-            sugerencias=ai_res.get("sugerencias", ["Ver novedades", "¿Tienen vestidos de noche?", "Recomiéndame un outfit casual"]),
+            respuesta=ai_res.get("respuesta", "Con gusto te asisto en lo que necesites."),
+            sugerencias=sugerencias_base,
             productos_mencionados=productos_info,
-            tipo_respuesta=tipo_respuesta
+            tipo_respuesta=tipo_respuesta,
+            accion=accion,
+            datos_reporte=datos_reporte,
+            formato_reporte=formato_reporte
         )
 
 
@@ -786,6 +1301,56 @@ class VestidorVirtualService:
         )
 
 
+def _extraer_rango_fechas(transcripcion: str, filtros: Dict[str, Any]):
+    """Extrae rango de fechas desde texto en español (ayer, semana pasada, este mes, últimos N días)."""
+    from datetime import date
+    t = _normalizar_texto(transcripcion or "")
+    hoy = datetime.now(timezone.utc)
+    fi = filtros.get("fecha_inicio")
+    ff = filtros.get("fecha_fin")
+    try:
+        fi = datetime.fromisoformat(fi) if isinstance(fi, str) and fi else None
+        ff = datetime.fromisoformat(ff) if isinstance(ff, str) and ff else None
+    except Exception:
+        fi, ff = None, None
+    if fi or ff:
+        return fi, ff
+    if "ayer" in t:
+        d = (hoy - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return d, d.replace(hour=23, minute=59, second=59)
+    if "semana pasada" in t or "ultima semana" in t:
+        return hoy - timedelta(days=13), hoy - timedelta(days=7)
+    if "esta semana" in t:
+        return hoy - timedelta(days=6), hoy
+    if "este mes" in t or "del mes" in t:
+        return hoy.replace(day=1, hour=0, minute=0, second=0, microsecond=0), hoy
+    if "mes pasado" in t or "mes anterior" in t:
+        primero = hoy.replace(day=1)
+        fin_prev = primero - timedelta(days=1)
+        return fin_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0), fin_prev
+    if "ultimos 7 dias" in t or "ultima semana" in t:
+        return hoy - timedelta(days=6), hoy
+    if "ultimos 30 dias" in t or "ultimo mes" in t:
+        return hoy - timedelta(days=29), hoy
+    if "hoy" in t:
+        d = hoy.replace(hour=0, minute=0, second=0, microsecond=0)
+        return d, hoy
+    return None, None
+
+
+def _extraer_formato(transcripcion: str, filtros: Dict[str, Any], default) -> str:
+    t = _normalizar_texto(transcripcion or "")
+    if isinstance(filtros.get("formato"), str) and filtros.get("formato"):
+        return str(filtros.get("formato")).upper()
+    for fmt in ("EXCEL", "PDF", "HTML", "CSV"):
+        if _normalizar_texto(fmt) in t or fmt.lower() in (transcripcion or "").lower():
+            return fmt
+    try:
+        return default.value if hasattr(default, "value") else str(default)
+    except Exception:
+        return "JSON"
+
+
 # ==============================================================================
 # REPORTE VOZ SERVICE (CU22)
 # ==============================================================================
@@ -807,17 +1372,25 @@ class ReporteVozService:
         except ValueError:
             tipo_enum = TipoReporte.VENTAS
 
-        # Generar el reporte solicitado
+        # Extraer filtros sugeridos por la IA o por reglas locales (fechas relativas, formato, sucursal, etc.)
+        filtros = dict(ai_res.get("parametros", {}) or {})
+        fecha_inicio, fecha_fin = _extraer_rango_fechas(transcripcion, filtros)
+        formato_txt = _extraer_formato(transcripcion, filtros, formato)
+        sucursal_id = filtros.get("sucursal_id")
+        categoria_id = filtros.get("categoria_id")
+        bajo_stock = bool("bajo stock" in _normalizar_texto(transcripcion) or filtros.get("bajo_stock"))
+
+        # Generar el reporte solicitado con los parámetros identificados
         if tipo_enum == TipoReporte.VENTAS:
-            datos = await ReporteService.generar_reporte_ventas(db)
+            datos = await ReporteService.generar_reporte_ventas(db, fecha_inicio, fecha_fin, sucursal_id)
         elif tipo_enum == TipoReporte.INVENTARIO:
-            datos = await ReporteService.generar_reporte_inventario(db)
+            datos = await ReporteService.generar_reporte_inventario(db, categoria_id=categoria_id, solo_bajo_stock=bajo_stock)
         elif tipo_enum == TipoReporte.RESERVAS:
-            datos = await ReporteService.generar_reporte_reservas(db)
+            datos = await ReporteService.generar_reporte_reservas(db, fecha_inicio, fecha_fin)
         elif tipo_enum == TipoReporte.CLIENTES:
             datos = await ReporteService.generar_reporte_clientes(db)
         else:
-            datos = await ReporteService.generar_reporte_financiero(db)
+            datos = await ReporteService.generar_reporte_financiero(db, fecha_inicio, fecha_fin)
 
         # Guardar en base de datos
         reporte_db = await ReporteService.guardar_reporte(
@@ -825,7 +1398,9 @@ class ReporteVozService:
             admin_id=admin_id,
             tipo=tipo_enum,
             titulo=f"Reporte por voz: {transcripcion[:80]}",
-            parametros={"comando_voz": transcripcion, **ai_res.get("parametros", {})},
+            parametros={"comando_voz": transcripcion, **filtros,
+                        "fecha_inicio": fecha_inicio.isoformat() if fecha_inicio else None,
+                        "fecha_fin": fecha_fin.isoformat() if fecha_fin else None},
             formato=formato,
             datos=datos
         )
@@ -835,8 +1410,18 @@ class ReporteVozService:
             tipo_reporte=tipo_enum,
             interpretacion=ai_res.get("resumen_interpretacion", f"Reporte de {tipo_enum.value} generado."),
             datos=datos,
-            reporte_guardado_id=reporte_db.id
+            reporte_guardado_id=reporte_db.id,
+            fecha_inicio=fecha_inicio.isoformat() if fecha_inicio else None,
+            fecha_fin=fecha_fin.isoformat() if fecha_fin else None,
+            sucursal_id=sucursal_id,
+            formato_sugerido=formato_txt,
         )
+
+
+    @staticmethod
+    async def transcribir_audio(audio_bytes: bytes, filename: str = "audio.webm") -> str:
+        """Transcribe audio a texto usando Whisper de Groq (reemplazo de webkitSpeechRecognition)."""
+        return await groq_service.transcribir_audio(audio_bytes, filename)
 
 
 # ==============================================================================

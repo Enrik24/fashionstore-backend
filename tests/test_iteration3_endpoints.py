@@ -109,7 +109,8 @@ async def test_03_servicios_inteligentes_ia(client: AsyncClient, admin_auth_toke
     # 1. Recomendaciones IA (CU13)
     res_rec = await client.post(
         "/api/v1/inteligencia/recomendaciones",
-        json={"preferencias": "Prendas elegantes para clima cálido", "limite": 4}
+        json={"preferencias": "Prendas elegantes para clima cálido", "limite": 4},
+        headers=headers
     )
     assert res_rec.status_code == 200, f"Error: {res_rec.text}"
     data_rec = res_rec.json()
@@ -122,7 +123,8 @@ async def test_03_servicios_inteligentes_ia(client: AsyncClient, admin_auth_toke
         json={
             "mensaje": "¿Qué vestido me recomiendas para una fiesta de noche?",
             "historial": []
-        }
+        },
+        headers=headers
     )
     assert res_chat.status_code == 200
     data_chat = res_chat.json()
@@ -130,7 +132,7 @@ async def test_03_servicios_inteligentes_ia(client: AsyncClient, admin_auth_toke
     assert "sugerencias" in data_chat
 
     # 3. Tendencias de Moda (CU20)
-    res_tend = await client.get("/api/v1/inteligencia/tendencias")
+    res_tend = await client.get("/api/v1/inteligencia/tendencias", headers=headers)
     assert res_tend.status_code == 200
     data_tend = res_tend.json()
     assert "tendencias_destacadas" in data_tend

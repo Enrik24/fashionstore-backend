@@ -3,7 +3,7 @@ Modelos SQLAlchemy para la Gestión de Catálogo, Productos e Inventario.
 Contiene: Ciudad, Sucursal, Categoria, Talla, Color, Temporada, Coleccion, Proveedor, 
 Producto, VarianteProducto, Inventario, MovimientoInventario.
 """
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Text, Float, JSON, Numeric, Date, Time
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Text, Float, JSON, Numeric, Date, Time, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
@@ -22,6 +22,12 @@ class EstadoProducto(str, enum.Enum):
     INACTIVO = "INACTIVO"
     AGOTADO = "AGOTADO"
     PROXIMO_INGRESO = "PROXIMO_INGRESO"
+
+
+class GeneroProducto(str, enum.Enum):
+    HOMBRE = "HOMBRE"
+    MUJER = "MUJER"
+    UNISEX = "UNISEX"
 
 
 class EstadoStock(str, enum.Enum):
@@ -186,6 +192,7 @@ class Proveedor(Base):
     
     # Relaciones
     productos = relationship("Producto", back_populates="proveedor")
+    recepciones = relationship("Recepcion", back_populates="proveedor")
     
     def __repr__(self):
         return f"<Proveedor {self.nombre}>"
@@ -201,8 +208,12 @@ class Producto(Base):
     nombre = Column(String(200), nullable=False)
     descripcion = Column(Text, nullable=True)
     precio = Column(Numeric(10, 2), nullable=False)
+    costo_compra = Column(Numeric(10, 2), nullable=False, server_default="0")
     imagenes = Column(JSON, default=list)  # Lista de URLs de imágenes
     estado = Column(Enum(EstadoProducto), default=EstadoProducto.ACTIVO)
+    genero = Column(Enum(GeneroProducto), default=GeneroProducto.UNISEX, nullable=True)
+    promedio_valoracion = Column(Numeric(3, 2), default=0.00, server_default="0.00")
+    total_valoraciones = Column(Integer, default=0, server_default="0")
     fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
     categoria_id = Column(Integer, ForeignKey("categorias.id", ondelete="SET NULL"), nullable=True)
     temporada_id = Column(Integer, ForeignKey("temporadas.id", ondelete="SET NULL"), nullable=True)
@@ -214,6 +225,8 @@ class Producto(Base):
     proveedor = relationship("Proveedor", back_populates="productos")
     variantes = relationship("VarianteProducto", back_populates="producto")
     colecciones = relationship("Coleccion", secondary="productos_colecciones", back_populates="productos")
+    favoritos = relationship("ProductoFavorito", back_populates="producto", cascade="all, delete-orphan")
+    valoraciones = relationship("ValoracionProducto", back_populates="producto", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Producto {self.sku}: {self.nombre}>"
@@ -243,6 +256,7 @@ class VarianteProducto(Base):
     color_id = Column(Integer, ForeignKey("colores.id", ondelete="CASCADE"), nullable=False)
     sku_variante = Column(String(50), unique=True, nullable=False)
     precio_variante = Column(Numeric(10, 2), nullable=True)
+    costo_variante = Column(Numeric(10, 2), nullable=True)
     
     # Relaciones
     producto = relationship("Producto", back_populates="variantes")
@@ -303,5 +317,105 @@ class MovimientoInventario(Base):
         return f"<MovimientoInventario {self.tipo}: {self.cantidad}>"
 
 
+# Modelo: Recepcion de mercadería por proveedor (Opción A - Recepción Directa)
+class Recepcion(Base):
+    """Cabecera de recepción de mercadería proveniente de un proveedor."""
+    __tablename__ = "recepciones"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    numero = Column(String(30), unique=True, nullable=False, index=True)
+    proveedor_id = Column(Integer, ForeignKey("proveedores.id", ondelete="RESTRICT"), nullable=False)
+    sucursal_id = Column(Integer, ForeignKey("sucursales.id", ondelete="RESTRICT"), nullable=False)
+    fecha_hora = Column(DateTime(timezone=True), server_default=func.now())
+    nro_factura = Column(String(50), nullable=True)
+    observaciones = Column(String(500), nullable=True)
+    total_unidades = Column(Integer, default=0, server_default="0")
+    total_costo = Column(Numeric(12, 2), default=0, server_default="0")
+    creado_por = Column(Integer, ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True)
+
+    # Relaciones
+    proveedor = relationship("Proveedor", back_populates="recepciones")
+    sucursal = relationship("Sucursal")
+    detalles = relationship("DetalleRecepcion", back_populates="recepcion", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<Recepcion {self.numero} prov={self.proveedor_id} suc={self.sucursal_id}>"
+
+
+class DetalleRecepcion(Base):
+    """Detalle de recepción: variante + cantidad + costo."""
+    __tablename__ = "detalles_recepcion"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    recepcion_id = Column(Integer, ForeignKey("recepciones.id", ondelete="CASCADE"), nullable=False)
+    variante_producto_id = Column(Integer, ForeignKey("variantes_producto.id", ondelete="RESTRICT"), nullable=False)
+    cantidad = Column(Integer, nullable=False)
+    costo_unitario = Column(Numeric(10, 2), nullable=True)
+
+    # Relaciones
+    recepcion = relationship("Recepcion", back_populates="detalles")
+    variante_producto = relationship("VarianteProducto")
+
+    def __repr__(self):
+        return f"<DetalleRecepcion rec={self.recepcion_id} var={self.variante_producto_id} cant={self.cantidad}>"
+
+
+# Enumeraciones adicionales para CU26
+class EstadoValoracion(str, enum.Enum):
+    PUBLICADA = "PUBLICADA"
+    PENDIENTE_MODERACION = "PENDIENTE_MODERACION"
+    RECHAZADA = "RECHAZADA"
+
+
+# Modelo: ProductoFavorito (CU25)
+class ProductoFavorito(Base):
+    """Tabla de productos favoritos de los clientes."""
+    __tablename__ = "productos_favoritos"
+    __table_args__ = (
+        UniqueConstraint("cliente_id", "producto_id", name="uq_cliente_producto_favorito"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    cliente_id = Column(Integer, ForeignKey("clientes.id", ondelete="CASCADE"), nullable=False)
+    producto_id = Column(Integer, ForeignKey("productos.id", ondelete="CASCADE"), nullable=False)
+    fecha_agregado = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relaciones
+    cliente = relationship("Cliente", back_populates="favoritos")
+    producto = relationship("Producto", back_populates="favoritos")
+
+    def __repr__(self):
+        return f"<ProductoFavorito cliente={self.cliente_id} producto={self.producto_id}>"
+
+
+# Modelo: ValoracionProducto (CU26)
+class ValoracionProducto(Base):
+    """Tabla de valoraciones y reseñas de productos."""
+    __tablename__ = "valoraciones_producto"
+    __table_args__ = (
+        UniqueConstraint("cliente_id", "producto_id", name="uq_cliente_producto_valoracion"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    cliente_id = Column(Integer, ForeignKey("clientes.id", ondelete="CASCADE"), nullable=False)
+    producto_id = Column(Integer, ForeignKey("productos.id", ondelete="CASCADE"), nullable=False)
+    puntuacion = Column(Integer, nullable=False)
+    comentario = Column(Text, nullable=True)
+    estado = Column(Enum(EstadoValoracion), default=EstadoValoracion.PUBLICADA, nullable=False)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_actualizacion = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # Relaciones
+    cliente = relationship("Cliente", back_populates="valoraciones")
+    producto = relationship("Producto", back_populates="valoraciones")
+
+    def __repr__(self):
+        return f"<ValoracionProducto cliente={self.cliente_id} producto={self.producto_id}: {self.puntuacion}★>"
+
+
 # Importación de modelos relacionados para registrar relaciones
-from app.apps.gestion_usuarios.models import Usuario, EncargadoSucursal, Cajero
+from app.apps.gestion_usuarios.models import Usuario, EncargadoSucursal, Cajero, Cliente
+
+# Inyectar relaciones en Cliente
+Cliente.favoritos = relationship("ProductoFavorito", back_populates="cliente", cascade="all, delete-orphan")
+Cliente.valoraciones = relationship("ValoracionProducto", back_populates="cliente", cascade="all, delete-orphan")

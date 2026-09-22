@@ -1,7 +1,7 @@
 """
 Servicios de negocio para Gestión de Usuarios y Autenticación.
 """
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, and_, delete, func
@@ -212,6 +212,22 @@ class UsuarioService:
         if rol:
             usuario_rol = UsuarioRol(usuario_id=usuario.id, rol_id=rol.id)
             db.add(usuario_rol)
+            
+            # Si se proporcionó sucursal_id, crear el registro de personal correspondiente
+            if getattr(datos, "sucursal_id", None):
+                rol_lower = rol_nombre.lower()
+                if "encargado" in rol_lower:
+                    encargado = EncargadoSucursal(
+                        usuario_id=usuario.id,
+                        sucursal_id=datos.sucursal_id
+                    )
+                    db.add(encargado)
+                elif "cajero" in rol_lower:
+                    cajero = Cajero(
+                        usuario_id=usuario.id,
+                        sucursal_id=datos.sucursal_id
+                    )
+                    db.add(cajero)
         
         await db.commit()
         await db.refresh(usuario)
@@ -754,6 +770,49 @@ class ClienteService:
 class BitacoraService:
     """Servicio de bitácora del sistema."""
     
+    # Campos que jamás se registran en la bitácora (secretos).
+    CAMPOS_SENSIBLES = {"contrasena_hash", "contrasena", "password", "token"}
+
+    @staticmethod
+    def foto(obj: Any, excluir: Optional[set] = None) -> Optional[dict]:
+        """Foto JSON de una entidad SQLAlchemy (solo columnas, sin secretos).
+
+        Convierte Decimal/fecha/enum a tipos serializables. Devuelve None si
+        el objeto es None.
+        """
+        if obj is None:
+            return None
+        from datetime import date as _date, datetime as _dt
+        from decimal import Decimal as _Dec
+        from enum import Enum as _Enum
+        excluidas = set(BitacoraService.CAMPOS_SENSIBLES)
+        if excluir:
+            excluidas |= set(excluir)
+        datos: Dict[str, Any] = {}
+        tabla = getattr(obj, "__table__", None)
+        columnas = [c.key for c in tabla.columns] if tabla is not None else [
+            k for k in vars(obj) if not k.startswith("_")
+        ]
+        for key in columnas:
+            if key in excluidas:
+                continue
+            try:
+                v = getattr(obj, key, None)
+            except Exception:
+                continue
+            if isinstance(v, _Dec):
+                v = float(v)
+            elif isinstance(v, (_dt, _date)):
+                v = v.isoformat()
+            elif isinstance(v, _Enum):
+                v = v.value if hasattr(v, "value") else str(v)
+            elif isinstance(v, (dict, list)):
+                pass
+            elif v is not None and not isinstance(v, (str, int, float, bool)):
+                v = str(v)
+            datos[key] = v
+        return datos
+
     @staticmethod
     async def registrar_evento(
         db: AsyncSession,
@@ -761,15 +820,21 @@ class BitacoraService:
         usuario_id: Optional[int] = None,
         ip_address: Optional[str] = None,
         modulo: Optional[str] = None,
-        detalles: Optional[str] = None
+        detalles: Optional[str] = None,
+        registro_id: Optional[int] = None,
+        valores_anteriores: Optional[dict] = None,
+        valores_nuevos: Optional[dict] = None
     ) -> Bitacora:
-        """Registra un evento en la bitácora."""
+        """Registra un evento en la bitácora, con diff opcional antes/después."""
         bitacora = Bitacora(
             usuario_id=usuario_id,
             accion=accion,
             modulo=modulo,
             detalles=detalles,
-            ip_address=ip_address
+            ip_address=ip_address,
+            registro_id=registro_id,
+            valores_anteriores=valores_anteriores,
+            valores_nuevos=valores_nuevos
         )
         db.add(bitacora)
         await db.commit()
@@ -830,10 +895,14 @@ class BitacoraService:
         """Exporta la bitácora a formato CSV."""
         bitacoras, _ = await BitacoraService.get_bitacora(db, limit=10000)
         
-        csv_lines = ["ID,Fecha,Hora,Usuario_ID,IP,Accion,Modulo,Detalles"]
-        
+        csv_lines = ["ID,Fecha,Hora,Usuario_ID,IP,Accion,Modulo,Registro_ID,Detalles,Valores_Anteriores,Valores_Nuevos"]
+
         for b in bitacoras:
-            linea = f"{b.id},{b.fecha_hora},{b.usuario_id or ''},{b.ip_address or ''},{b.accion},{b.modulo or ''},{b.detalles or ''}"
+            import json as _json
+            ant = _json.dumps(b.valores_anteriores, ensure_ascii=False, default=str) if b.valores_anteriores else ""
+            nue = _json.dumps(b.valores_nuevos, ensure_ascii=False, default=str) if b.valores_nuevos else ""
+            det = (b.detalles or "").replace('"', '""')
+            linea = f'{b.id},{b.fecha_hora},{b.usuario_id or ""},{b.ip_address or ""},{b.accion},{b.modulo or ""},{b.registro_id or ""},"{det}","{ant}","{nue}"'
             csv_lines.append(linea)
         
         return "\n".join(csv_lines)

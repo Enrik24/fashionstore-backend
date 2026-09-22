@@ -2,10 +2,11 @@
 Modelos SQLAlchemy para la Gestión de Usuarios y Autenticación.
 Contiene: Usuario, Rol, Permiso, Cliente, Administrador, EncargadoSucursal, Cajero, Bitacora.
 """
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Text, Float
+from sqlalchemy import Column, Integer, String, DateTime, Date, ForeignKey, Enum, Text, Float, Boolean, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
+from typing import Optional
 
 from app.database import Base
 
@@ -27,6 +28,7 @@ class Usuario(Base):
     apellido = Column(String(100), nullable=False)
     correo = Column(String(255), unique=True, nullable=False, index=True)
     telefono = Column(String(20), nullable=True)
+    fecha_nacimiento = Column(Date, nullable=True)
     contrasena_hash = Column(String(255), nullable=False)
     estado = Column(Enum(EstadoUsuario), default=EstadoUsuario.ACTIVO, nullable=False)
     fecha_registro = Column(DateTime(timezone=True), server_default=func.now())
@@ -39,6 +41,7 @@ class Usuario(Base):
     encargado_sucursal = relationship("EncargadoSucursal", back_populates="usuario", uselist=False)
     cajero = relationship("Cajero", back_populates="usuario", uselist=False)
     bitacoras = relationship("Bitacora", back_populates="usuario")
+    dispositivos_fcm = relationship("DispositivoFCM", back_populates="usuario", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Usuario {self.correo}>"
@@ -112,7 +115,7 @@ class Cliente(Base):
     usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False, unique=True)
     nit_ci = Column(String(20), unique=True, nullable=False)
     direccion_envio = Column(String(500), nullable=True)
-    preferencias = Column(Text, nullable=True)  # JSON serializado como texto
+    preferencias = Column(JSON, nullable=True)  # JSON nativo (Postgres JSON, SQLite TEXT)
     
     # Relaciones
     usuario = relationship("Usuario", back_populates="cliente")
@@ -188,6 +191,9 @@ class Bitacora(Base):
     accion = Column(String(255), nullable=False)
     modulo = Column(String(100), nullable=True)
     detalles = Column(Text, nullable=True)
+    registro_id = Column(Integer, nullable=True)  # ID del registro afectado
+    valores_anteriores = Column(JSON, nullable=True)  # Foto del antes (dict)
+    valores_nuevos = Column(JSON, nullable=True)  # Foto del después (dict)
     
     # Relaciones
     usuario = relationship("Usuario", back_populates="bitacoras")
@@ -212,6 +218,26 @@ class Bitacora(Base):
 
     def __repr__(self):
         return f"<Bitacora {self.fecha_hora} - {self.accion}>"
+
+
+# Modelo: DispositivoFCM (Notificaciones Push)
+class DispositivoFCM(Base):
+    """Tabla de tokens de registro FCM por usuario y dispositivo/navegador."""
+    __tablename__ = "dispositivos_fcm"
+    
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False, index=True)
+    token = Column(String(500), unique=True, nullable=False, index=True)
+    tipo_dispositivo = Column(String(50), default="web", nullable=False) # web, android, ios
+    activo = Column(Boolean, default=True, nullable=False)
+    fecha_registro = Column(DateTime(timezone=True), server_default=func.now())
+    ultimo_uso = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    
+    # Relaciones
+    usuario = relationship("Usuario", back_populates="dispositivos_fcm")
+    
+    def __repr__(self):
+        return f"<DispositivoFCM usuario_id={self.usuario_id} tipo={self.tipo_dispositivo}>"
 
 
 # Las relaciones inversas con otras apps se configuran automáticamente

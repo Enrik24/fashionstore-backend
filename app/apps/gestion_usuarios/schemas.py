@@ -3,7 +3,7 @@ Schemas Pydantic para validación y serialización - Gestión de Usuarios y Aute
 """
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, date
 from enum import Enum
 
 
@@ -25,12 +25,14 @@ class UsuarioBase(BaseModel):
     apellido: str = Field(..., min_length=1, max_length=100)
     correo: EmailStr
     telefono: Optional[str] = Field(None, max_length=20)
+    fecha_nacimiento: Optional[date] = None
 
 
 class UsuarioCreate(UsuarioBase):
     """Schema para crear un usuario."""
     contrasena: str = Field(..., min_length=8, max_length=100)
     estado: EstadoUsuarioEnum = EstadoUsuarioEnum.ACTIVO
+    sucursal_id: Optional[int] = None
 
 
 class UsuarioUpdate(BaseModel):
@@ -39,7 +41,9 @@ class UsuarioUpdate(BaseModel):
     apellido: Optional[str] = Field(None, min_length=1, max_length=100)
     correo: Optional[EmailStr] = None
     telefono: Optional[str] = Field(None, max_length=20)
+    fecha_nacimiento: Optional[date] = None
     estado: Optional[EstadoUsuarioEnum] = None
+    sucursal_id: Optional[int] = None
 
 
 class UsuarioResponse(UsuarioBase):
@@ -48,7 +52,6 @@ class UsuarioResponse(UsuarioBase):
     estado: EstadoUsuarioEnum
     fecha_registro: datetime
     ultimo_acceso: Optional[datetime] = None
-    
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -191,7 +194,10 @@ class BitacoraResponse(BaseModel):
     accion: str
     modulo: Optional[str] = None
     tabla_afectada: Optional[str] = None
+    registro_id: Optional[int] = None
     detalles: Optional[str] = None
+    valores_anteriores: Optional[dict] = None
+    valores_nuevos: Optional[dict] = None
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -208,6 +214,7 @@ class PerfilClienteResponse(BaseModel):
     apellido: str
     correo: str
     telefono: Optional[str] = None
+    fecha_nacimiento: Optional[date] = None
     fecha_registro: datetime
     preferencias: Optional[dict] = None  # Preferencias del cliente
     
@@ -219,6 +226,10 @@ class ActualizarPerfilRequest(BaseModel):
     nombre: Optional[str] = Field(None, min_length=1, max_length=100)
     apellido: Optional[str] = Field(None, min_length=1, max_length=100)
     telefono: Optional[str] = Field(None, max_length=20)
+    fecha_nacimiento: Optional[date] = None
+    nit_ci: Optional[str] = Field(None, min_length=1, max_length=20)
+    # Alias para compatibilidad con el frontend actual que envía ci_nit
+    ci_nit: Optional[str] = Field(None, min_length=1, max_length=20)
     direccion_envio: Optional[str] = Field(None, max_length=500)
 
 
@@ -226,8 +237,10 @@ class ActualizarPerfilRequest(BaseModel):
 # Schemas adicionales para listados
 # ============================================
 class UsuarioConRolesResponse(UsuarioResponse):
-    """Schema para usuario con sus roles."""
+    """Schema para usuario con sus roles y sucursal asignada."""
     roles: List[RolResponse] = []
+    sucursal_id: Optional[int] = None
+    sucursal_nombre: Optional[str] = None
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -247,3 +260,24 @@ class AsignarPermisosRequest(BaseModel):
 class AsignarRolRequest(BaseModel):
     """Schema para asignar un rol a un usuario."""
     rol_id: int
+
+
+# ============================================
+# Schemas para Notificaciones Push (FCM)
+# ============================================
+class RegistrarDispositivoRequest(BaseModel):
+    """Schema para registrar o actualizar el token FCM de un dispositivo."""
+    token: str = Field(..., min_length=10, max_length=500, description="Token de registro provisto por Firebase")
+    tipo_dispositivo: str = Field(default="web", max_length=50, description="Tipo de cliente: web, android, ios")
+
+
+class DispositivoFCMResponse(BaseModel):
+    """Schema de respuesta tras registrar un dispositivo FCM."""
+    id: int
+    usuario_id: int
+    token: str
+    tipo_dispositivo: str
+    activo: bool
+    fecha_registro: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)

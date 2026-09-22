@@ -25,6 +25,7 @@ class FormatoReporte(str, enum.Enum):
     EXCEL = "EXCEL"
     CSV = "CSV"
     JSON = "JSON"
+    HTML = "HTML"
 
 
 # Modelo: Reporte
@@ -58,6 +59,7 @@ class IndicadorKPI(Base):
     descripcion = Column(Text, nullable=True)
     valor_actual = Column(Float, default=0)
     valor_objetivo = Column(Float, default=0)
+    unidad_medida = Column(String(20), nullable=True, server_default="%")
     tendencia = Column(String(20), nullable=True)  # subir, bajar, estable
     periodo = Column(String(50), nullable=True)  # mensual, semanal, anual
     ultimo_actualizado = Column(DateTime(timezone=True), server_default=func.now())

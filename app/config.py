@@ -48,12 +48,21 @@ class Settings(BaseSettings):
     PAYPAL_CLIENT_SECRET: str = ""
     PAYPAL_MODE: str = "sandbox"
     
+    # Firebase Cloud Messaging
+    FIREBASE_CREDENTIALS_PATH: str = "firebase-credentials.json"
+    FIREBASE_CREDENTIALS_JSON: str = ""
+    FIREBASE_PROJECT_ID: str = ""
+    
     # App
     APP_NAME: str = "FashionStore API"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
     CORS_ORIGINS: str = "http://localhost:4200,http://localhost:3000"
     
+    # CU26 y CU28 Config
+    PLAZO_DEVOLUCION_DIAS: int = 30
+    PALABRAS_PROHIBIDAS: str = "estafa,fraude,falso,pesimo,basura,mierda,idiota,ladron,robado,horrible"
+
     class Config:
         env_file = ".env"
         case_sensitive = True

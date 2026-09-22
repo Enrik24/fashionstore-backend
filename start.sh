@@ -34,6 +34,7 @@ echo -e "${GREEN}[✓] Dependencias instaladas correctamente${NC}"
 # ============================================================
 echo -e "\n${GREEN}[2/4] Ejecutando migraciones de base de datos...${NC}"
 alembic upgrade head
+alembic current
 echo -e "${GREEN}[✓] Migraciones aplicadas correctamente${NC}"
 
 # ============================================================

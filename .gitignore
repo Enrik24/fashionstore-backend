@@ -34,10 +34,12 @@ env/
 *.swo
 *~
 
-# Archivos de entorno
+# Archivos de entorno y credenciales
 .env
 .env.local
 .env.*.local
+firebase-credentials.json
+*firebase*.json
 
 # Base de datos
 *.db

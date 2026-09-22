@@ -83,8 +83,12 @@ class RecomendacionItem(BaseModel):
     nombre: str
     razon: str
     imagen_url: Optional[str] = None
+    imagenes: Optional[List[str]] = None
     precio: Optional[float] = None
     categoria: Optional[str] = None
+    categoria_id: Optional[int] = None
+    genero: Optional[str] = None
+    sku: Optional[str] = None
 
 
 class RecomendacionRequest(BaseModel):
@@ -121,7 +125,19 @@ class AsistenteChatResponse(BaseModel):
     productos_mencionados: List[Dict[str, Any]] = []
     tipo_respuesta: str = Field(
         default="texto",
-        description="Cómo presentar la respuesta en el frontend: 'texto', 'catalogo', 'producto' u 'outfit'"
+        description="Cómo presentar la respuesta en el frontend: 'texto', 'catalogo', 'producto', 'outfit' o 'reporte'"
+    )
+    accion: Optional[str] = Field(
+        default=None,
+        description="Acción a ejecutar en frontend: 'agregar_carrito', 'reporte_compras', 'reporte_reservas'"
+    )
+    datos_reporte: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Resumen estructurado de compras o reservas para visualización y descarga en frontend"
+    )
+    formato_reporte: Optional[str] = Field(
+        default=None,
+        description="Formato sugerido por el usuario o la IA: 'pdf', 'excel', 'csv'"
     )
 
 
@@ -159,6 +175,14 @@ class ReporteVozResponse(BaseModel):
     interpretacion: str
     datos: Dict[str, Any]
     reporte_guardado_id: Optional[int] = None
+    fecha_inicio: Optional[str] = None
+    fecha_fin: Optional[str] = None
+    sucursal_id: Optional[int] = None
+    formato_sugerido: Optional[str] = None
+
+
+class AudioTranscripcionResponse(BaseModel):
+    transcripcion: str
 
 
 # ==========================================
