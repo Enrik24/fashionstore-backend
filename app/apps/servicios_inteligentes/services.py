@@ -249,6 +249,90 @@ def _filtrar_productos_por_genero(productos, genero_dominante):
     return [p for p in productos if _genero_producto(p) in (genero_dominante, "UNISEX")]
 
 
+# Mapa de categorías complementarias para armar outfits (claves normalizadas).
+# Si el cliente compró X, se prioriza recomendar estas categorías en orden.
+_CATEGORIAS_COMPLEMENTO = {
+    "camisa": ["pantalones", "chaquetas", "calzado", "accesorios", "canguros", "abrigos"],
+    "camisas": ["pantalones", "chaquetas", "calzado", "accesorios", "canguros", "abrigos"],
+    "polera": ["pantalones", "shorts", "calzado", "chaquetas", "accesorios"],
+    "poleras": ["pantalones", "shorts", "calzado", "chaquetas", "accesorios"],
+    "pantalon": ["camisas", "poleras", "calzado", "chaquetas", "canguros", "accesorios"],
+    "pantalones": ["camisas", "poleras", "calzado", "chaquetas", "canguros", "accesorios"],
+    "chaqueta": ["pantalones", "camisas", "calzado", "canguros", "accesorios"],
+    "chaquetas": ["pantalones", "camisas", "calzado", "canguros", "accesorios"],
+    "abrigo": ["pantalones", "camisas", "calzado", "accesorios"],
+    "abrigos": ["pantalones", "camisas", "calzado", "accesorios"],
+    "canguro": ["pantalones", "shorts", "calzado", "chaquetas", "accesorios"],
+    "canguros": ["pantalones", "shorts", "calzado", "chaquetas", "accesorios"],
+    "calzado": ["pantalones", "camisas", "chaquetas", "accesorios"],
+    "short": ["poleras", "calzado", "canguros", "accesorios"],
+    "shorts": ["poleras", "calzado", "canguros", "accesorios"],
+    "vestido": ["calzado", "chaquetas", "accesorios", "abrigos"],
+    "vestidos": ["calzado", "chaquetas", "accesorios", "abrigos"],
+    "accesorio": ["camisas", "pantalones", "chaquetas", "calzado"],
+    "accesorios": ["camisas", "pantalones", "chaquetas", "calzado"],
+    "polo": ["pantalones", "shorts", "calzado", "accesorios"],
+    "polos": ["pantalones", "shorts", "calzado", "accesorios"],
+}
+
+
+def _nombre_categoria(p) -> str:
+    cat = getattr(p, "categoria", None)
+    nombre = getattr(cat, "nombre", None) if cat else None
+    return _normalizar_texto(nombre or "general")
+
+
+def _ordenar_por_complemento(productos, categorias_compradas):
+    """Ordena productos priorizando categorías que complementan la compra.
+
+    1) Categorías complementarias según el mapa outfit (sin repetir la comprada).
+    2) Luego el resto en su orden original.
+    """
+    if not categorias_compradas:
+        return list(productos)
+    prioridad = []
+    vistas = set()
+    for comprada in categorias_compradas:
+        for comp in _CATEGORIAS_COMPLEMENTO.get(comprada, []):
+            if comp not in vistas and comp not in categorias_compradas:
+                vistas.add(comp)
+                prioridad.append(comp)
+    orden = {c: i for i, c in enumerate(prioridad)}
+
+    complementarios = sorted(
+        [p for p in productos if _nombre_categoria(p) in orden],
+        key=lambda p: orden[_nombre_categoria(p)],
+    )
+    resto = [p for p in productos if _nombre_categoria(p) not in orden]
+    return complementarios + resto
+
+
+def _diversificar_por_categoria(productos, limite: int, max_por_categoria: int = 1):
+    """Devuelve hasta `limite` productos con máximo `max_por_categoria` por categoría.
+
+    Garantiza variedad: nunca devuelve todo de una sola categoría si hay más
+    categorías disponibles.
+    """
+    elegidos = []
+    conteo: Dict[str, int] = {}
+    for p in productos:
+        if len(elegidos) >= limite:
+            break
+        cat = _nombre_categoria(p)
+        if conteo.get(cat, 0) >= max_por_categoria:
+            continue
+        conteo[cat] = conteo.get(cat, 0) + 1
+        elegidos.append(p)
+    if len(elegidos) < limite:
+        ids = {id(p) for p in elegidos}
+        for p in productos:
+            if len(elegidos) >= limite:
+                break
+            if id(p) not in ids:
+                elegidos.append(p)
+    return elegidos
+
+
 # ==============================================================================
 # REPORTE SERVICE
 # ==============================================================================
@@ -779,6 +863,7 @@ class RecomendacionService:
                         var = d.variante_producto
                         if var and var.producto:
                             historial_compras.append({
+                                "producto_id": var.producto.id,
                                 "producto": var.producto.nombre,
                                 "categoria": var.producto.categoria.nombre if var.producto.categoria else "General",
                                 "genero": var.producto.genero.value if hasattr(var.producto.genero, 'value') else str(var.producto.genero) if var.producto.genero else None,
@@ -818,49 +903,70 @@ class RecomendacionService:
             preferencias=preferencias
         )
 
-        # Mapear productos con detalles completos
-        prods_map = {p.id: p for p in productos}
-        items_recomendados: List[RecomendacionItem] = []
+        # IDs ya comprados: nunca se recomiendan de vuelta
+        ids_comprados = {h.get("producto_id") for h in historial_compras if h.get("producto_id")}
+        categorias_compradas = {_normalizar_texto(h.get("categoria") or "") for h in historial_compras if h.get("categoria")}
+        categorias_compradas.discard("")
 
+        # Mapear productos con detalles completos (excluyendo lo ya comprado)
+        prods_map = {p.id: p for p in productos}
+        candidatos_ia = []
         for rec in ai_res.get("recomendaciones", []):
             pid = rec.get("producto_id")
+            if pid in ids_comprados:
+                continue
             prod = prods_map.get(pid)
             if prod:
-                img_list = _lista_imagenes(prod.imagenes)
-                items_recomendados.append(RecomendacionItem(
-                    producto_id=prod.id,
-                    nombre=prod.nombre,
-                    sku=prod.sku,
-                    razon=rec.get("razon", "Recomendado para ti"),
-                    imagen_url=_imagen_principal(prod),
-                    imagenes=img_list,
-                    precio=float(prod.precio or 0),
-                    categoria=prod.categoria.nombre if prod.categoria else None,
-                    categoria_id=prod.categoria_id,
-                    genero=prod.genero.value if hasattr(prod.genero, 'value') else str(prod.genero) if prod.genero else None
-                ))
+                candidatos_ia.append((prod, rec.get("razon", "Recomendado para ti")))
+        # Diversificar lo que devolvió la IA: prioriza categorías que
+        # complementan la compra y limita 1 por categoría
+        candidatos_ia = _diversificar_por_categoria(
+            _ordenar_por_complemento([p for p, _ in candidatos_ia], categorias_compradas),
+            limite,
+        )
+        razones = {rec.get("producto_id"): rec.get("razon", "Recomendado para ti") for rec in ai_res.get("recomendaciones", [])}
+        items_recomendados: List[RecomendacionItem] = []
+        for prod in candidatos_ia:
+            img_list = _lista_imagenes(prod.imagenes)
+            items_recomendados.append(RecomendacionItem(
+                producto_id=prod.id,
+                nombre=prod.nombre,
+                sku=prod.sku,
+                razon=razones.get(prod.id, "Recomendado para ti"),
+                imagen_url=_imagen_principal(prod),
+                imagenes=img_list,
+                precio=float(prod.precio or 0),
+                categoria=prod.categoria.nombre if prod.categoria else None,
+                categoria_id=prod.categoria_id,
+                genero=prod.genero.value if hasattr(prod.genero, 'value') else str(prod.genero) if prod.genero else None
+            ))
 
-        # Si el LLM devolvió pocos o ninguno que coincida con DB, rellenar con destacados
+        # Si el LLM devolvió pocos o ninguno que coincida con DB, rellenar con
+        # destacados DIVERSIFICADOS (complemento de outfit, 1 por categoría,
+        # excluyendo lo ya comprado)
         if len(items_recomendados) < limite and productos:
-            used_ids = {item.producto_id for item in items_recomendados}
-            for p in productos:
-                if p.id not in used_ids:
-                    img_list = _lista_imagenes(p.imagenes)
-                    items_recomendados.append(RecomendacionItem(
-                        producto_id=p.id,
-                        nombre=p.nombre,
-                        sku=p.sku,
-                        razon="Selección destacada de nuestra colección de temporada",
-                        imagen_url=_imagen_principal(p),
-                        imagenes=img_list,
-                        precio=float(p.precio or 0),
-                        categoria=p.categoria.nombre if p.categoria else None,
-                        categoria_id=p.categoria_id,
-                        genero=p.genero.value if hasattr(p.genero, 'value') else str(p.genero) if p.genero else None
-                    ))
-                    used_ids.add(p.id)
-                    if len(items_recomendados) >= limite:
-                        break
+            used_ids = {item.producto_id for item in items_recomendados} | ids_comprados
+            candidatos = _diversificar_por_categoria(
+                _ordenar_por_complemento(
+                    [p for p in productos if p.id not in used_ids],
+                    categorias_compradas,
+                ),
+                limite - len(items_recomendados),
+            )
+            for p in candidatos:
+                img_list = _lista_imagenes(p.imagenes)
+                items_recomendados.append(RecomendacionItem(
+                    producto_id=p.id,
+                    nombre=p.nombre,
+                    sku=p.sku,
+                    razon="Completa tu outfit con esta prenda complementaria",
+                    imagen_url=_imagen_principal(p),
+                    imagenes=img_list,
+                    precio=float(p.precio or 0),
+                    categoria=p.categoria.nombre if p.categoria else None,
+                    categoria_id=p.categoria_id,
+                    genero=p.genero.value if hasattr(p.genero, 'value') else str(p.genero) if p.genero else None
+                ))
 
         return RecomendacionResponse(
             cliente_id=cliente_id,

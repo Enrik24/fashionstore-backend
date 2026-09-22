@@ -18,6 +18,41 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _diversificar_catalogo(productos_catalogo, historial_compras, limite: int = 4):
+    """Fallback sin IA: 1 producto por categoría, excluyendo lo ya comprado.
+
+    Evita el bug de devolver N productos seguidos de la misma categoría
+    (el catálogo viene ordenado por inserción y las poleras están en bloque).
+    """
+    comprados = set()
+    for h in historial_compras or []:
+        pid = (h or {}).get("producto_id")
+        if pid is not None:
+            comprados.add(pid)
+        nombre = str((h or {}).get("producto") or "").strip().lower()
+        if nombre:
+            comprados.add(nombre)
+    elegidos = []
+    vistas = set()
+    for p in productos_catalogo or []:
+        if len(elegidos) >= limite:
+            break
+        if p.get("id") in comprados or str(p.get("nombre") or "").strip().lower() in comprados:
+            continue
+        cat = str(p.get("categoria") or "general").strip().lower()
+        if cat in vistas:
+            continue
+        vistas.add(cat)
+        elegidos.append(p)
+    if len(elegidos) < limite:
+        for p in productos_catalogo or []:
+            if len(elegidos) >= limite:
+                break
+            if p not in elegidos and p.get("id") not in comprados:
+                elegidos.append(p)
+    return elegidos
+
+
 class GroqService:
     """Servicio para interacción con modelos LLM a través de Groq Cloud."""
     
@@ -55,18 +90,19 @@ class GroqService:
         """
         self._verificar_cliente()
         if not self.client:
-            # Fallback inteligente si no hay API Key
-            top_prods = productos_catalogo[:4] if productos_catalogo else []
+            # Fallback diversificado si no hay API Key: 1 producto por
+            # categoría (evita devolver 4 poleras seguidas) y nunca lo comprado
+            top_prods = _diversificar_catalogo(productos_catalogo, historial_compras, 4)
             return {
                 "recomendaciones": [
                     {
                         "producto_id": p.get("id"),
                         "nombre": p.get("nombre"),
-                        "razon": f"Popular en nuestra colección {p.get('categoria', 'general')}"
+                        "razon": f"Completa tu look con este(a) {p.get('categoria', 'prenda')} que combina con tu compra"
                     }
                     for p in top_prods
                 ],
-                "mensaje_personalizado": f"¡Hola {cliente_nombre}! Te sugerimos estas prendas destacadas seleccionadas para ti.",
+                "mensaje_personalizado": f"¡Hola {cliente_nombre}! Te sugerimos estas prendas complementarias para completar tu outfit.",
                 "estilo_detectado": "Casual Contemporáneo"
             }
 
@@ -74,10 +110,12 @@ class GroqService:
 Tu objetivo es analizar el historial de compras previas o gustos del cliente y seleccionar las mejores prendas complementarias del catálogo disponible.
 
 REGLAS DE RECOMENDACIÓN DE MODA:
-1. Combinación y Cross-selling: Si el cliente compró una prenda específica (ej. un pantalón o jean), prioriza recomendar prendas que completen el outfit o hagan match (ej. calzado, poleras, camisas, chaquetas, cinturones o accesorios).
+1. Combinación y Cross-selling: Si el cliente compró una prenda específica (ej. una camisa), prioriza recomendar prendas de OTRAS categorías que completen el outfit (ej. pantalón + chaqueta + calzado + accesorio). PROHIBIDO recomendar más prendas de la misma categoría ya comprada.
 2. Coherencia de género y estilo: Si el cliente suele comprar prendas de hombre o mujer, sugiere prendas afines a su estilo detectado.
 3. Catálogo Real: Utiliza ÚNICAMENTE los IDs y nombres de los productos que aparecen en la lista "Catálogo disponible actualmente". NO inventes productos ni IDs.
-4. Razón persuasiva y elegante: En el campo "razon", redacta una breve frase que explique por qué combina perfectamente (ej. "Combina idealmente con tu pantalón para un estilo urbano y fresco").
+4. Razón persuasiva y elegante: En el campo "razon", redacta una breve frase que explique por qué combina perfectamente (ej. "Combina idealmente con tu camisa para un estilo urbano y fresco").
+5. DIVERSIDAD OBLIGATORIA: máximo 1 producto por categoría. Si recomiendas 4-5 productos, deben ser de 4-5 categorías distintas (ej. 1 pantalón + 1 chaqueta + 1 calzado + 1 accesorio). NUNCA devuelvas todo de una sola categoría.
+6. NUNCA recomiendes un producto que el cliente ya compró (ver Historial de compras recientes): cada producto_id recomendado debe ser distinto a los del historial.
 
 Debes responder ESTRICTAMENTE en formato JSON con la siguiente estructura:
 {
@@ -115,17 +153,17 @@ Por favor, selecciona hasta 5 productos recomendados y genera la respuesta JSON.
             return json.loads(raw_content)
         except Exception as e:
             logger.error(f"Error al llamar a Groq en get_recomendaciones: {e}")
-            top_prods = productos_catalogo[:3] if productos_catalogo else []
+            top_prods = _diversificar_catalogo(productos_catalogo, historial_compras, 4)
             return {
                 "recomendaciones": [
                     {
                         "producto_id": p.get("id"),
                         "nombre": p.get("nombre"),
-                        "razon": "Recomendación destacada de temporada"
+                        "razon": "Prenda complementaria destacada de temporada"
                     }
                     for p in top_prods
                 ],
-                "mensaje_personalizado": f"¡Hola {cliente_nombre}! Descubre estas tendencias exclusivas.",
+                "mensaje_personalizado": f"¡Hola {cliente_nombre}! Descubre estas prendas complementarias.",
                 "estilo_detectado": "Tendencia Actual"
             }
 
