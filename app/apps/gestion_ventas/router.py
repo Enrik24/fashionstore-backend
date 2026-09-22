@@ -405,6 +405,39 @@ async def obtener_orden(
     return orden
 
 
+@router.post("/ordenes/{orden_id}/restaurar-carrito", response_model=CarritoResponse, name="restaurar_carrito_orden")
+async def restaurar_carrito_orden(
+    orden_id: int,
+    request: Request,
+    current_user: Usuario = Depends(require_role("Cliente")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Devuelve los ítems de una orden pendiente al carrito y la cancela (pago cancelado)."""
+    cliente = await _obtener_cliente_actual(db, current_user)
+    carrito = await ventas_services.OrdenService.restaurar_carrito_desde_orden(db, orden_id, cliente.id)
+    calc = await ventas_services.CarritoService.recalcular_carrito(db, carrito)
+    await BitacoraService.registrar_evento(
+        db=db,
+        accion="RESTAURAR_CARRITO_ORDEN",
+        usuario_id=current_user.id,
+        ip_address=get_client_ip(request),
+        modulo="Ventas",
+        detalles=f"Orden ID {orden_id} cancelada y sus ítems devueltos al carrito"
+    )
+    return {
+        "id": carrito.id,
+        "cliente_id": carrito.cliente_id,
+        "fecha_creacion": carrito.fecha_creacion,
+        "estado": carrito.estado,
+        "cupon_id": carrito.cupon_id,
+        "descuento_aplicado": calc["descuento"],
+        "items": carrito.items,
+        "subtotal": calc["subtotal"],
+        "total": calc["total"],
+        "cupon": carrito.cupon
+    }
+
+
 @router.patch("/ordenes/{orden_id}/estado", response_model=OrdenResponse, name="actualizar_estado_orden")
 async def actualizar_estado_orden(
     orden_id: int,

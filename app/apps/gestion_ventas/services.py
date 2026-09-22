@@ -804,6 +804,38 @@ class OrdenService:
         await db.commit()
         return await cls.obtener_orden(db, orden.id)
 
+    @classmethod
+    async def restaurar_carrito_desde_orden(
+        cls, db: AsyncSession, orden_id: int, cliente_id: int
+    ) -> Carrito:
+        """Devuelve los ítems de una orden PENDIENTE_PAGO al carrito y la cancela.
+
+        Corrige el flujo de pago cancelado: el carrito se vacía al crear la
+        orden, así que sin esto las prendas quedaban "atrapadas" en la orden
+        pendiente aunque la UI prometa que siguen en el carrito.
+        """
+        orden = await cls.obtener_orden(db, orden_id)
+        if orden.cliente_id != cliente_id:
+            raise ForbiddenException("No tienes permiso sobre esta orden")
+        if orden.estado == EstadoOrden.PAGADO:
+            raise BadRequestException("La orden ya fue pagada, no se puede devolver al carrito")
+        if orden.estado == EstadoOrden.CANCELADO:
+            raise BadRequestException("La orden ya está cancelada")
+
+        for det in orden.detalles:
+            if det.variante_producto_id and (det.cantidad or 0) > 0:
+                await CarritoService.agregar_item(
+                    db, cliente_id,
+                    ItemCarritoCreate(
+                        variante_producto_id=det.variante_producto_id,
+                        cantidad=det.cantidad,
+                    ),
+                )
+
+        orden.estado = EstadoOrden.CANCELADO
+        await db.commit()
+        return await CarritoService.obtener_o_crear_carrito(db, cliente_id)
+
     @staticmethod
     async def generar_comprobante(
         db: AsyncSession, orden_id: int, tipo: TipoComprobante = TipoComprobante.FACTURA
