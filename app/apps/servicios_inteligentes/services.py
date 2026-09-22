@@ -161,6 +161,21 @@ def _costo_total(ordenes, ventas_presenciales) -> Dict[str, Any]:
     return {"total": round(total, 2), "tiene_costos_reales": tiene_reales}
 
 
+def _normalizar_fecha_fin(fecha_fin: Optional[datetime]) -> Optional[datetime]:
+    """Si `fecha_fin` viene en medianoche (el frontend envía solo fecha,
+    ej. "2026-09-22"), extenderla al fin de ese día.
+
+    Sin esto, `Orden.fecha <= fecha_fin` excluye todo lo vendido ese día y
+    el dashboard muestra ventas/pedidos en cero aunque haya compras.
+    """
+    if fecha_fin is None:
+        return None
+    t = fecha_fin.time() if hasattr(fecha_fin, "time") else None
+    if t is not None and t.hour == 0 and t.minute == 0 and t.second == 0 and getattr(t, "microsecond", 0) == 0:
+        return fecha_fin + timedelta(days=1) - timedelta(microseconds=1)
+    return fecha_fin
+
+
 def _serie_diaria_ventas(ordenes, ventas_presenciales, fecha_inicio, fecha_fin):
     """Agrega totales por día (retrocompatible: solo se incluye con incluir_serie=true)."""
     from collections import defaultdict
@@ -348,6 +363,7 @@ class ReporteService:
         incluir_serie: bool = False
     ) -> Dict[str, Any]:
         """Genera datos agregados del reporte de ventas."""
+        fecha_fin = _normalizar_fecha_fin(fecha_fin)
         condiciones_orden = [Orden.tipo == TipoOrden.DIGITAL]  # Órdenes en línea (excluye POS y reservas)
         condiciones_presencial = []
 
@@ -512,6 +528,7 @@ class ReporteService:
         sucursal_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """Genera métricas de efectividad y conversión de reservas en tienda."""
+        fecha_fin = _normalizar_fecha_fin(fecha_fin)
         q = select(Reserva).options(
             selectinload(Reserva.detalles).selectinload(DetalleReserva.variante_producto).selectinload(VarianteProducto.producto)
         )
@@ -621,6 +638,7 @@ class ReporteService:
         (TransaccionPago) con ventas presenciales (VentaPresencial), que antes
         no aparecían y dejaban el bloque vacío.
         """
+        fecha_fin = _normalizar_fecha_fin(fecha_fin)
         ventas_data = await ReporteService.generar_reporte_ventas(db, fecha_inicio, fecha_fin, sucursal_id)
 
         q_pagos = select(TransaccionPago).join(Orden, TransaccionPago.orden_id == Orden.id).where(
