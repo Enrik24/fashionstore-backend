@@ -722,16 +722,22 @@ async def confirmar_retorno_stripe(
     db: AsyncSession = Depends(get_db)
 ):
     """Verifica y procesa el retorno exitoso del checkout de Stripe."""
-    await ventas_services.PagoService.procesar_pago_stripe_completado(db, session_id, orden_id)
+    status = await ventas_services.PagoService.procesar_pago_stripe_completado(db, session_id, orden_id)
     await BitacoraService.registrar_evento(
         db=db,
         accion="PAGO_STRIPE_CONFIRMADO",
         usuario_id=current_user.id if current_user else None,
         ip_address=get_client_ip(request),
         modulo="Pagos",
-        detalles=f"Pago Stripe confirmado para orden ID {orden_id} (Sesión: {session_id})"
+        detalles=f"Pago Stripe confirmado para orden ID {orden_id} (Sesión: {session_id}, estado Stripe: {status})"
     )
-    return {"mensaje": "Pago de Stripe procesado exitosamente"}
+    if status != "paid":
+        raise BadRequestException(
+            f"Stripe aún no registra el pago (estado: {status}). "
+            "Si ya pagaste, espera unos segundos y reintenta; "
+            "si usaste tarjeta real en modo prueba, el cobro no se completa."
+        )
+    return {"mensaje": "Pago de Stripe procesado exitosamente", "payment_status": status}
 
 
 @router.post("/pagos/stripe/webhook", name="stripe_webhook")

@@ -1427,10 +1427,16 @@ class PagoService:
         return session_data
 
     @staticmethod
-    async def procesar_pago_stripe_completado(db: AsyncSession, session_id: str, orden_id: int):
-        """Procesa la confirmación de pago de Stripe (vía Webhook o confirmación de retorno)."""
+    async def procesar_pago_stripe_completado(db: AsyncSession, session_id: str, orden_id: int) -> str:
+        """Procesa la confirmación de pago de Stripe (vía Webhook o confirmación de retorno).
+
+        Devuelve el `payment_status` de la sesión. Si Stripe aún no registra el
+        pago, NO cambia nada (antes fallaba en silencio y el cliente móvil no
+        sabía por qué seguía en PENDIENTE_PAGO).
+        """
         session_stripe = StripeService.retrieve_session(session_id)
-        if session_stripe.payment_status == "paid":
+        status = getattr(session_stripe, "payment_status", None) or "unknown"
+        if status == "paid":
             # Actualizar transacción
             q_tx = select(TransaccionPago).where(TransaccionPago.referencia_externa == session_id)
             res_tx = await db.execute(q_tx)
@@ -1438,10 +1444,11 @@ class PagoService:
             if tx:
                 tx.estado = EstadoTransaccion.CONFIRMADO
                 tx.datos_respuesta = {"payment_intent": session_stripe.payment_intent}
-                
+
             # Actualizar orden
             await OrdenService.actualizar_estado(db, orden_id, EstadoOrden.PAGADO)
             await db.commit()
+        return status
 
     @staticmethod
     @staticmethod
