@@ -79,12 +79,14 @@ def _resolver_costo_unitario(variante: Optional["VarianteProducto"]) -> Optional
 class InventarioVentasService:
     @staticmethod
     async def obtener_o_crear_inventario(
-        db: AsyncSession, variante_id: int, sucursal_id: int
+        db: AsyncSession, variante_id: int, sucursal_id: int, for_update: bool = False
     ) -> Inventario:
         query = select(Inventario).where(
             Inventario.variante_producto_id == variante_id,
             Inventario.sucursal_id == sucursal_id
         )
+        if for_update:
+            query = query.with_for_update()
         res = await db.execute(query)
         inv = res.scalar_one_or_none()
         if not inv:
@@ -97,7 +99,21 @@ class InventarioVentasService:
                 estado=EstadoStock.AGOTADO
             )
             db.add(inv)
-            await db.flush()
+            try:
+                # Savepoint: si otro request concurrente inserta la misma fila,
+                # solo se revierte este INSERT y se re-lee con lock.
+                async with db.begin_nested():
+                    await db.flush()
+            except Exception:
+                res = await db.execute(
+                    select(Inventario).where(
+                        Inventario.variante_producto_id == variante_id,
+                        Inventario.sucursal_id == sucursal_id
+                    ).with_for_update()
+                )
+                inv = res.scalar_one_or_none()
+                if not inv:
+                    raise
         return inv
 
     @classmethod
@@ -118,13 +134,25 @@ class InventarioVentasService:
     async def descontar_stock_venta(
         cls, db: AsyncSession, variante_id: int, sucursal_id: int, cantidad: int, usuario_id: Optional[int] = None, motivo: str = "Venta realizada"
     ) -> Inventario:
-        inv = await cls.obtener_o_crear_inventario(db, variante_id, sucursal_id)
-        if inv.cantidad_disponible < cantidad:
+        # UPDATE atómico: solo descuenta si hay disponible suficiente.
+        # Evita que 2 ventas concurrentes lean el mismo disponible.
+        result = await db.execute(
+            update(Inventario)
+            .where(
+                Inventario.variante_producto_id == variante_id,
+                Inventario.sucursal_id == sucursal_id,
+                (Inventario.cantidad - Inventario.cantidad_reservada) >= cantidad
+            )
+            .values(
+                cantidad=Inventario.cantidad - cantidad,
+                cantidad_vendida=Inventario.cantidad_vendida + cantidad
+            )
+        )
+        if result.rowcount == 0:
+            inv = await cls.obtener_o_crear_inventario(db, variante_id, sucursal_id, for_update=True)
             raise BadRequestException(f"Stock insuficiente en la sucursal para la variante ID {variante_id}. Disponible: {inv.cantidad_disponible}, Solicitado: {cantidad}")
-        
-        inv.cantidad -= cantidad
-        inv.cantidad_vendida += cantidad
-        
+
+        inv = await cls.obtener_o_crear_inventario(db, variante_id, sucursal_id, for_update=True)
         if inv.cantidad == 0:
             inv.estado = EstadoStock.AGOTADO
             
@@ -169,11 +197,22 @@ class InventarioVentasService:
     async def reservar_stock(
         cls, db: AsyncSession, variante_id: int, sucursal_id: int, cantidad: int, usuario_id: Optional[int] = None
     ) -> Inventario:
-        inv = await cls.obtener_o_crear_inventario(db, variante_id, sucursal_id)
-        if inv.cantidad_disponible < cantidad:
+        # UPDATE atómico + lock: si 2 clientes reservan lo último a la vez,
+        # solo uno cumple el WHERE y el otro recibe Stock insuficiente.
+        result = await db.execute(
+            update(Inventario)
+            .where(
+                Inventario.variante_producto_id == variante_id,
+                Inventario.sucursal_id == sucursal_id,
+                (Inventario.cantidad - Inventario.cantidad_reservada) >= cantidad
+            )
+            .values(cantidad_reservada=Inventario.cantidad_reservada + cantidad)
+        )
+        if result.rowcount == 0:
+            inv = await cls.obtener_o_crear_inventario(db, variante_id, sucursal_id, for_update=True)
             raise BadRequestException(f"Stock insuficiente para reservar la variante ID {variante_id}. Disponible: {inv.cantidad_disponible}")
-        
-        inv.cantidad_reservada += cantidad
+
+        inv = await cls.obtener_o_crear_inventario(db, variante_id, sucursal_id, for_update=True)
         movimiento = MovimientoInventario(
             inventario_id=inv.id,
             tipo=TipoMovimiento.RESERVA,
@@ -189,7 +228,7 @@ class InventarioVentasService:
     async def liberar_stock_reserva(
         cls, db: AsyncSession, variante_id: int, sucursal_id: int, cantidad: int, usuario_id: Optional[int] = None, comprar: bool = False
     ) -> Inventario:
-        inv = await cls.obtener_o_crear_inventario(db, variante_id, sucursal_id)
+        inv = await cls.obtener_o_crear_inventario(db, variante_id, sucursal_id, for_update=True)
         inv.cantidad_reservada = max(0, inv.cantidad_reservada - cantidad)
         
         if comprar:
@@ -720,7 +759,30 @@ class OrdenService:
         await CarritoService.vaciar_carrito(db, cliente_id)
         
         await db.commit()
-        return await cls.obtener_orden(db, orden.id)
+        orden_creada = await cls.obtener_orden(db, orden.id)
+
+        # Push: pedido creado pendiente de pago (cliente + sucursal si es retiro).
+        try:
+            if orden_creada.cliente:
+                await FirebaseService.enviar_notificacion_usuario(
+                    db=db,
+                    usuario_id=orden_creada.cliente.usuario_id,
+                    titulo=f"Pedido {orden_creada.numero_orden} creado",
+                    cuerpo="Tu pedido quedó pendiente de pago. Complétalo con Stripe para confirmarlo.",
+                    data={"orden_id": str(orden_creada.id), "tipo": "ORDEN_CREADA", "url": "/profile/orders"}
+                )
+            if sucursal_id:
+                await FirebaseService.enviar_notificacion_sucursal(
+                    db=db,
+                    sucursal_id=sucursal_id,
+                    titulo=f"Nuevo pedido {orden_creada.numero_orden} (retiro)",
+                    cuerpo="Un cliente creó un pedido digital para retiro en tu sucursal.",
+                    data={"orden_id": str(orden_creada.id), "tipo": "ORDEN_CREADA", "url": "/branch/orders"}
+                )
+        except Exception as e:
+            logger.warning(f"Error al enviar push de orden creada: {e}")
+
+        return orden_creada
 
     @staticmethod
     async def obtener_orden(db: AsyncSession, orden_id: int) -> Orden:
@@ -1132,10 +1194,18 @@ class ReservaService:
     async def crear_reserva(
         cls, db: AsyncSession, cliente_id: int, reserva_in: ReservaCreate, usuario_id: Optional[int] = None
     ) -> Reserva:
-        # 1. Validar y reservar stock en la sucursal elegida
+        # 1. Validar y reservar stock en la sucursal elegida.
+        # Se consolidan cantidades por variante para que el mismo request no
+        # se auto-compita, y cada variante usa UPDATE atómico (ver reservar_stock):
+        # si 2 clientes piden lo último a la vez, solo uno pasa el WHERE.
+        totales_por_variante: Dict[int, int] = {}
         for det in reserva_in.detalles:
+            totales_por_variante[det.variante_producto_id] = (
+                totales_por_variante.get(det.variante_producto_id, 0) + det.cantidad
+            )
+        for variante_id, cantidad_total in totales_por_variante.items():
             await InventarioVentasService.reservar_stock(
-                db, det.variante_producto_id, reserva_in.sucursal_id, det.cantidad, usuario_id=usuario_id
+                db, variante_id, reserva_in.sucursal_id, cantidad_total, usuario_id=usuario_id
             )
             
         # 2. Crear cabecera de reserva
@@ -1282,6 +1352,16 @@ class ReservaService:
                     data={"reserva_id": str(reserva_id), "tipo": "RESERVA_PREPARADA", "url": "/profile/reservations"}
                 )
 
+            # 1b. Notificar al cliente cuando pasa a probador
+            if nuevo_estado == EstadoReserva.EN_PRUEBA and reserva_actualizada.cliente:
+                await FirebaseService.enviar_notificacion_usuario(
+                    db=db,
+                    usuario_id=reserva_actualizada.cliente.usuario_id,
+                    titulo=f"¡A probarte! Reserva {num_res}",
+                    cuerpo=f"Tu reserva {num_res} está en probador en {nombre_suc}. Avísanos qué te llevas.",
+                    data={"reserva_id": str(reserva_id), "tipo": "RESERVA_EN_PRUEBA", "url": "/profile/reservations"}
+                )
+
             # 2. Notificar cancelación a cliente y sucursal
             elif nuevo_estado == EstadoReserva.CANCELADA:
                 # Notificar a la sucursal para devolver prendas
@@ -1311,6 +1391,24 @@ class ReservaService:
                     cuerpo=f"Tu atención de reserva en {nombre_suc} ha finalizado con éxito.",
                     data={"reserva_id": str(reserva_id), "tipo": "RESERVA_COMPLETADA", "url": "/profile/reservations"}
                 )
+
+            # 4. Notificar caducidad (reserva vencida, stock liberado)
+            elif nuevo_estado == EstadoReserva.CADUCADA:
+                await FirebaseService.enviar_notificacion_sucursal(
+                    db=db,
+                    sucursal_id=reserva_actualizada.sucursal_id,
+                    titulo=f"Reserva caducada: {num_res}",
+                    cuerpo=f"La reserva {num_res} venció. Las prendas fueron liberadas a inventario.",
+                    data={"reserva_id": str(reserva_id), "tipo": "RESERVA_CADUCADA", "url": "/branch/reservations"}
+                )
+                if reserva_actualizada.cliente:
+                    await FirebaseService.enviar_notificacion_usuario(
+                        db=db,
+                        usuario_id=reserva_actualizada.cliente.usuario_id,
+                        titulo=f"Reserva vencida: {num_res}",
+                        cuerpo="Tu reserva venció y las prendas volvieron a stock. Puedes crear una nueva.",
+                        data={"reserva_id": str(reserva_id), "tipo": "RESERVA_CADUCADA", "url": "/profile/reservations"}
+                    )
         except Exception as e:
             logger.warning(f"Error al enviar notificación FCM por cambio de estado de reserva: {e}")
 
@@ -1480,6 +1578,34 @@ class PagoService:
             # Actualizar orden
             await OrdenService.actualizar_estado(db, orden_id, EstadoOrden.PAGADO)
             await db.commit()
+
+            # Push: pago Stripe aprobado -> cliente.
+            try:
+                orden = await OrdenService.obtener_orden(db, orden_id)
+                if orden.cliente:
+                    await FirebaseService.enviar_notificacion_usuario(
+                        db=db,
+                        usuario_id=orden.cliente.usuario_id,
+                        titulo=f"¡Pago confirmado! {orden.numero_orden}",
+                        cuerpo="Tu pago con Stripe fue aprobado y tu pedido ya está pagado.",
+                        data={"orden_id": str(orden_id), "tipo": "PAGO_CONFIRMADO", "url": "/profile/orders"}
+                    )
+            except Exception as e:
+                logger.warning(f"Error al enviar push de pago Stripe confirmado: {e}")
+        else:
+            # Push: Stripe aún no registra el pago -> avisar al cliente.
+            try:
+                orden = await OrdenService.obtener_orden(db, orden_id)
+                if orden.cliente:
+                    await FirebaseService.enviar_notificacion_usuario(
+                        db=db,
+                        usuario_id=orden.cliente.usuario_id,
+                        titulo=f"Pago pendiente {orden.numero_orden}",
+                        cuerpo="Stripe aún no registra tu pago. Si ya pagaste, usa 'Verificar pago'.",
+                        data={"orden_id": str(orden_id), "tipo": "PAGO_PENDIENTE", "url": "/profile/orders"}
+                    )
+            except Exception as e:
+                logger.warning(f"Error al enviar push de pago Stripe pendiente: {e}")
         return status
 
     @staticmethod
@@ -1701,18 +1827,13 @@ class DevolucionService:
 
         try:
             if sucursal_id:
-                q_enc = select(EncargadoSucursal.usuario_id).where(EncargadoSucursal.sucursal_id == sucursal_id)
-                res_enc = await db.execute(q_enc)
-                u_ids = res_enc.scalars().all()
-                for uid in u_ids:
-                    await FirebaseService.enviar_notificacion(
-                        db=db,
-                        usuario_id=uid,
-                        titulo="Nueva solicitud de devolución/cambio",
-                        mensaje=f"Se ha recibido la solicitud {solicitud.numero_solicitud} de tipo {solicitud.tipo.value}.",
-                        tipo="DEVOLUCION_NUEVA",
-                        datos_adicionales={"solicitud_id": str(solicitud.id)}
-                    )
+                await FirebaseService.enviar_notificacion_sucursal(
+                    db=db,
+                    sucursal_id=sucursal_id,
+                    titulo="Nueva solicitud de devolución/cambio",
+                    cuerpo=f"Se ha recibido la solicitud {solicitud.numero_solicitud} de tipo {solicitud.tipo.value}.",
+                    data={"solicitud_id": str(solicitud.id), "tipo": "DEVOLUCION_NUEVA", "url": "/profile/returns"}
+                )
         except Exception as e:
             logger.warning(f"Error al enviar notificación push de devolución: {e}")
 
@@ -1821,13 +1942,12 @@ class DevolucionService:
                 u_cli_id = res_cli.scalar_one_or_none()
                 if u_cli_id:
                     try:
-                        await FirebaseService.enviar_notificacion(
+                        await FirebaseService.enviar_notificacion_usuario(
                             db=db,
                             usuario_id=u_cli_id,
                             titulo="Solicitud de devolución rechazada",
-                            mensaje=f"Tu solicitud {solicitud.numero_solicitud} ha sido rechazada: {datos.observaciones}",
-                            tipo="DEVOLUCION_RECHAZADA",
-                            datos_adicionales={"solicitud_id": str(solicitud.id)}
+                            cuerpo=f"Tu solicitud {solicitud.numero_solicitud} ha sido rechazada: {datos.observaciones}",
+                            data={"solicitud_id": str(solicitud.id), "tipo": "DEVOLUCION_RECHAZADA", "url": "/profile/returns"}
                         )
                     except Exception:
                         pass
@@ -1934,13 +2054,12 @@ class DevolucionService:
             u_cli_id = res_cli.scalar_one_or_none()
             if u_cli_id:
                 try:
-                    await FirebaseService.enviar_notificacion(
+                    await FirebaseService.enviar_notificacion_usuario(
                         db=db,
                         usuario_id=u_cli_id,
                         titulo="Solicitud de devolución procesada",
-                        mensaje=f"Tu solicitud {solicitud.numero_solicitud} ha sido {solicitud.estado.value.lower()}.",
-                        tipo="DEVOLUCION_RESUELTA",
-                        datos_adicionales={"solicitud_id": str(solicitud.id), "estado": solicitud.estado.value}
+                        cuerpo=f"Tu solicitud {solicitud.numero_solicitud} ha sido {solicitud.estado.value.lower()}.",
+                        data={"solicitud_id": str(solicitud.id), "estado": solicitud.estado.value, "tipo": "DEVOLUCION_RESUELTA", "url": "/profile/returns"}
                     )
                 except Exception:
                     pass

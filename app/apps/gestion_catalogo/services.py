@@ -1244,8 +1244,10 @@ class DisponibilidadService:
                     sucursal_map[inventario.sucursal_id] = {
                         "sucursal_id": inventario.sucursal_id,
                         "sucursal_nombre": inventario.sucursal.nombre,
+                        "cantidad": int(inventario.cantidad),
                         "cantidad_disponible": int(inventario.cantidad_disponible),
                         "cantidad_reservada": int(inventario.cantidad_reservada),
+                        "cantidad_vendida": int(inventario.cantidad_vendida or 0),
                         "estado": EstadoStock.DISPONIBLE,
                         "latitud": getattr(inventario.sucursal, "latitud", None),
                         "longitud": getattr(inventario.sucursal, "longitud", None),
@@ -1254,8 +1256,10 @@ class DisponibilidadService:
                     }
                 else:
                     entry = sucursal_map[inventario.sucursal_id]
+                    entry["cantidad"] += int(inventario.cantidad)
                     entry["cantidad_disponible"] += int(inventario.cantidad_disponible)
                     entry["cantidad_reservada"] += int(inventario.cantidad_reservada)
+                    entry["cantidad_vendida"] += int(inventario.cantidad_vendida or 0)
         
         # Derivar estado agregado por sucursal
         for entry in sucursal_map.values():
@@ -1334,8 +1338,10 @@ class DisponibilidadService:
             sucursales_info.append({
                 "sucursal_id": inv.sucursal_id,
                 "sucursal_nombre": inv.sucursal.nombre if inv.sucursal else "Sucursal",
+                "cantidad": int(inv.cantidad),
                 "cantidad_disponible": inv.cantidad_disponible,
                 "cantidad_reservada": inv.cantidad_reservada,
+                "cantidad_vendida": int(inv.cantidad_vendida or 0),
                 "estado": inv.estado,
                 "latitud": getattr(inv.sucursal, "latitud", None) if inv.sucursal else None,
                 "longitud": getattr(inv.sucursal, "longitud", None) if inv.sucursal else None,
@@ -1381,8 +1387,10 @@ class DisponibilidadService:
                 "sku_variante": inv.variante_producto.sku_variante if inv.variante_producto else "",
                 "talla": inv.variante_producto.talla.valor if inv.variante_producto and inv.variante_producto.talla else None,
                 "color": inv.variante_producto.color.nombre if inv.variante_producto and inv.variante_producto.color else None,
+                "cantidad": int(inv.cantidad),
                 "cantidad_disponible": inv.cantidad_disponible,
                 "cantidad_reservada": inv.cantidad_reservada,
+                "cantidad_vendida": int(inv.cantidad_vendida or 0),
                 "estado": inv.estado
             })
         return items

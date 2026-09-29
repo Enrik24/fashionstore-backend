@@ -869,6 +869,7 @@ class RecomendacionService:
                 select(Cliente).options(
                     selectinload(Cliente.usuario),
                     selectinload(Cliente.ordenes).selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto).selectinload(VarianteProducto.producto).selectinload(Producto.categoria),
+                    selectinload(Cliente.ordenes).selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto).selectinload(VarianteProducto.producto).selectinload(Producto.temporada),
                     selectinload(Cliente.ordenes).selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto).selectinload(VarianteProducto.talla),
                     selectinload(Cliente.ordenes).selectinload(Orden.detalles).selectinload(DetalleOrden.variante_producto).selectinload(VarianteProducto.color),
                 ).where(Cliente.id == cliente_id)
@@ -886,15 +887,25 @@ class RecomendacionService:
                                 "categoria": var.producto.categoria.nombre if var.producto.categoria else "General",
                                 "genero": var.producto.genero.value if hasattr(var.producto.genero, 'value') else str(var.producto.genero) if var.producto.genero else None,
                                 "talla": var.talla.valor if var.talla else None,
-                                "color": var.color.nombre if var.color else None
+                                "color": var.color.nombre if var.color else None,
+                                "temporada": var.producto.temporada.nombre if getattr(var.producto, "temporada", None) else None,
                             })
 
-        # Obtener productos activos del catálogo
+        # Datos derivados del cliente: talla habitual y temporada habitual.
+        from collections import Counter as _Counter
+        tallas_hist = [h.get("talla") for h in historial_compras if h.get("talla")]
+        talla_habitual = _Counter(tallas_hist).most_common(1)[0][0] if tallas_hist else None
+        temps_hist = [h.get("temporada") for h in historial_compras if h.get("temporada")]
+        temporada_habitual = _Counter(temps_hist).most_common(1)[0][0] if temps_hist else None
+
+        # Obtener productos activos del catálogo con stock y temporada
         res_p = await db.execute(
             select(Producto).options(
                 selectinload(Producto.categoria),
-                selectinload(Producto.variantes)
-            ).where(Producto.estado == EstadoProducto.ACTIVO).limit(40)
+                selectinload(Producto.temporada),
+                selectinload(Producto.variantes).selectinload(VarianteProducto.inventarios),
+                selectinload(Producto.variantes).selectinload(VarianteProducto.talla),
+            ).where(Producto.estado == EstadoProducto.ACTIVO).limit(60)
         )
         productos = list(res_p.scalars().all())
 
@@ -902,23 +913,62 @@ class RecomendacionService:
         # mujer), la IA y el relleno solo ven ese género + UNISEX. En mixto,
         # empate o vacío se dejan los 3 géneros como hasta ahora.
         productos = _filtrar_productos_por_genero(productos, _genero_dominante(historial_compras))
+
+        # Disponibilidad real por producto: suma (cantidad - reservada) de sus inventarios.
+        # Solo se recomienda lo que tiene stock disponible en alguna sucursal.
+        def _stock_disponible(p) -> int:
+            total = 0
+            for v in (p.variantes or []):
+                for inv in (getattr(v, "inventarios", None) or []):
+                    total += max(0, (inv.cantidad or 0) - (inv.cantidad_reservada or 0))
+            return total
+
+        def _tiene_talla(p, talla: Optional[str]) -> bool:
+            if not talla:
+                return True
+            for v in (p.variantes or []):
+                tv = getattr(getattr(v, "talla", None), "valor", None)
+                if tv and str(tv).strip().upper() == str(talla).strip().upper():
+                    return True
+            return False
+
+        stock_por_producto = {p.id: _stock_disponible(p) for p in productos}
+        con_stock = [p for p in productos if stock_por_producto.get(p.id, 0) > 0]
+        # Si todo el catálogo filtrado quedó sin stock, no dejar vacío: usar original.
+        if con_stock:
+            productos = con_stock
+        # Priorizar: misma temporada habitual + talla habitual disponible + con stock.
+        def _score_prioridad(p) -> tuple:
+            temp = getattr(getattr(p, "temporada", None), "nombre", None)
+            return (
+                0 if (temporada_habitual and temp == temporada_habitual) else 1,
+                0 if _tiene_talla(p, talla_habitual) else 1,
+                -stock_por_producto.get(p.id, 0),
+            )
+        productos = sorted(productos, key=_score_prioridad)[:40]
+
         catalogo_resumido = [
             {
                 "id": p.id,
                 "nombre": p.nombre,
                 "categoria": p.categoria.nombre if p.categoria else "General",
                 "genero": p.genero.value if hasattr(p.genero, 'value') else str(p.genero) if p.genero else "UNISEX",
-                "precio": float(p.precio or 0)
+                "precio": float(p.precio or 0),
+                "temporada": getattr(getattr(p, "temporada", None), "nombre", None),
+                "stock_disponible": stock_por_producto.get(p.id, 0),
+                "talla_habitual_disponible": _tiene_talla(p, talla_habitual),
             }
             for p in productos
         ]
 
-        # Llamar a Groq
+        # Llamar a Groq con contexto del cliente (talla/temporada/disponibilidad)
         ai_res = await groq_service.get_recomendaciones(
             cliente_nombre=cliente_nombre,
             historial_compras=historial_compras,
             productos_catalogo=catalogo_resumido,
-            preferencias=preferencias
+            preferencias=preferencias,
+            talla_habitual=talla_habitual,
+            temporada_habitual=temporada_habitual,
         )
 
         # IDs ya comprados: nunca se recomiendan de vuelta
@@ -926,12 +976,14 @@ class RecomendacionService:
         categorias_compradas = {_normalizar_texto(h.get("categoria") or "") for h in historial_compras if h.get("categoria")}
         categorias_compradas.discard("")
 
-        # Mapear productos con detalles completos (excluyendo lo ya comprado)
+        # Mapear productos con detalles completos (excluyendo lo ya comprado y sin stock)
         prods_map = {p.id: p for p in productos}
         candidatos_ia = []
         for rec in ai_res.get("recomendaciones", []):
             pid = rec.get("producto_id")
             if pid in ids_comprados:
+                continue
+            if stock_por_producto.get(pid, 1) <= 0:
                 continue
             prod = prods_map.get(pid)
             if prod:

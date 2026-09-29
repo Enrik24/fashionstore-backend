@@ -75,7 +75,7 @@ class FirebaseService:
         token: str,
         tipo_dispositivo: str = "web"
     ) -> DispositivoFCM:
-        """Registra o actualiza un token FCM para un usuario."""
+        """Registra o actualiza un token FCM para un usuario (idempotente por token)."""
         if not token:
             raise ValueError("El token FCM no puede estar vacío")
 
@@ -88,14 +88,33 @@ class FirebaseService:
             disp.usuario_id = usuario_id
             disp.tipo_dispositivo = tipo_dispositivo
             disp.activo = True
-        else:
-            disp = DispositivoFCM(
-                usuario_id=usuario_id,
-                token=token,
-                tipo_dispositivo=tipo_dispositivo,
-                activo=True
+            await db.commit()
+            await db.refresh(disp)
+            return disp
+
+        disp = DispositivoFCM(
+            usuario_id=usuario_id,
+            token=token,
+            tipo_dispositivo=tipo_dispositivo,
+            activo=True
+        )
+        db.add(disp)
+        try:
+            # Savepoint: si 2 logins concurrentes registran el mismo token,
+            # solo uno inserta (uq_dispositivos_fcm_token) y el otro lo re-lee.
+            async with db.begin_nested():
+                await db.flush()
+        except Exception:
+            res = await db.execute(
+                select(DispositivoFCM).where(DispositivoFCM.token == token)
             )
-            db.add(disp)
+            disp = res.scalar_one_or_none()
+            if disp:
+                disp.usuario_id = usuario_id
+                disp.tipo_dispositivo = tipo_dispositivo
+                disp.activo = True
+            else:
+                raise
 
         await db.commit()
         await db.refresh(disp)

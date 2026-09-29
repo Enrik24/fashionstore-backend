@@ -83,7 +83,9 @@ class GroqService:
         cliente_nombre: str,
         historial_compras: List[Dict[str, Any]],
         productos_catalogo: List[Dict[str, Any]],
-        preferencias: Optional[str] = None
+        preferencias: Optional[str] = None,
+        talla_habitual: Optional[str] = None,
+        temporada_habitual: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Genera recomendaciones personalizadas basadas en el historial del cliente y el catálogo disponible.
@@ -116,6 +118,8 @@ REGLAS DE RECOMENDACIÓN DE MODA:
 4. Razón persuasiva y elegante: En el campo "razon", redacta una breve frase que explique por qué combina perfectamente (ej. "Combina idealmente con tu camisa para un estilo urbano y fresco").
 5. DIVERSIDAD OBLIGATORIA: máximo 1 producto por categoría. Si recomiendas 4-5 productos, deben ser de 4-5 categorías distintas (ej. 1 pantalón + 1 chaqueta + 1 calzado + 1 accesorio). NUNCA devuelvas todo de una sola categoría.
 6. NUNCA recomiendes un producto que el cliente ya compró (ver Historial de compras recientes): cada producto_id recomendado debe ser distinto a los del historial.
+7. DISPONIBILIDAD: el catálogo ya viene filtrado con stock_disponible > 0. NUNCA recomiendes un producto con stock_disponible 0 o ausente.
+8. TALLA Y TEMPORADA: prioriza productos donde talla_habitual_disponible sea true y cuya temporada coincida con la temporada habitual del cliente; si informas la razón y aplica, menciona la talla/temporada.
 
 Debes responder ESTRICTAMENTE en formato JSON con la siguiente estructura:
 {
@@ -132,6 +136,8 @@ Debes responder ESTRICTAMENTE en formato JSON con la siguiente estructura:
 
         prompt_usuario = f"""Cliente: {cliente_nombre}
 Preferencias expresadas: {preferencias or 'Ninguna'}
+Talla habitual del cliente: {talla_habitual or 'No detectada'}
+Temporada habitual del cliente: {temporada_habitual or 'Actual'}
 Historial de compras recientes: {json.dumps(historial_compras, ensure_ascii=False)}
 
 Catálogo disponible actualmente:

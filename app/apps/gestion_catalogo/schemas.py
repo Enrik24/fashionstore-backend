@@ -504,8 +504,10 @@ class DisponibilidadResponse(BaseModel):
     """Respuesta de disponibilidad por sucursal."""
     sucursal_id: int
     sucursal_nombre: str
+    cantidad: int = 0
     cantidad_disponible: int
     cantidad_reservada: int
+    cantidad_vendida: int = 0
     estado: EstadoStockEnum
     latitud: Optional[float] = None
     longitud: Optional[float] = None

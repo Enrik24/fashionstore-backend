@@ -3,7 +3,7 @@ Modelos SQLAlchemy para la Gestión de Catálogo, Productos e Inventario.
 Contiene: Ciudad, Sucursal, Categoria, Talla, Color, Temporada, Coleccion, Proveedor, 
 Producto, VarianteProducto, Inventario, MovimientoInventario.
 """
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Text, Float, JSON, Numeric, Date, Time, UniqueConstraint
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Text, Float, JSON, Numeric, Date, Time, UniqueConstraint, CheckConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
@@ -272,6 +272,13 @@ class VarianteProducto(Base):
 class Inventario(Base):
     """Tabla de inventario por sucursal y variante de producto."""
     __tablename__ = "inventario"
+    __table_args__ = (
+        UniqueConstraint("variante_producto_id", "sucursal_id", name="uq_inventario_variante_sucursal"),
+        CheckConstraint("cantidad >= 0", name="ck_inventario_cantidad_no_negativa"),
+        CheckConstraint("cantidad_reservada >= 0", name="ck_inventario_reservada_no_negativa"),
+        CheckConstraint("cantidad_vendida >= 0", name="ck_inventario_vendida_no_negativa"),
+        CheckConstraint("cantidad_reservada <= cantidad", name="ck_inventario_reservada_lte_cantidad"),
+    )
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     variante_producto_id = Column(Integer, ForeignKey("variantes_producto.id", ondelete="CASCADE"), nullable=False)
