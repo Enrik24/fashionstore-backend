@@ -3,7 +3,7 @@ Modelos SQLAlchemy para la Gestión de Catálogo, Productos e Inventario.
 Contiene: Ciudad, Sucursal, Categoria, Talla, Color, Temporada, Coleccion, Proveedor, 
 Producto, VarianteProducto, Inventario, MovimientoInventario.
 """
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Text, Float, JSON, Numeric, Date, Time, UniqueConstraint, CheckConstraint
+from sqlalchemy import Column, Integer, BigInteger, String, DateTime, ForeignKey, Enum, Text, Float, JSON, Numeric, Date, Time, UniqueConstraint, CheckConstraint, Uuid, Index, text, Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
@@ -45,6 +45,11 @@ class TipoMovimiento(str, enum.Enum):
     DEVOLUCION = "DEVOLUCION"
     AJUSTE = "AJUSTE"
     CANCELACION_RESERVA = "CANCELACION_RESERVA"
+    # [EXAMEN-2] CU14 traspasos entre sucursales y CU13 cambios/mermas
+    TRASPASO_SALIDA = "TRASPASO_SALIDA"
+    TRASPASO_ENTRADA = "TRASPASO_ENTRADA"
+    MERMA = "MERMA"
+    CAMBIO = "CAMBIO"
 
 
 # Modelo: Ciudad
@@ -66,8 +71,23 @@ class Ciudad(Base):
 
 # Modelo: Sucursal
 class Sucursal(Base):
-    """Tabla de sucursales."""
+    """Tabla de sucursales.
+
+    Modificado en Examen 2 (SaaS multitenant): `tenant_id`, `updated_at` y
+    `deleted_at`; unicidad lógica `(tenant_id, nombre)`.
+    """
     __tablename__ = "sucursales"
+    __table_args__ = (
+        # [EXAMEN-2] Fase 2.5: el nombre solo es único entre sucursales activas;
+        # una baja lógica lo libera sin romper el historial (ex2_015).
+        Index(
+            "uq_sucursales_tenant_nombre_activas",
+            "tenant_id",
+            "nombre",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+    )
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     nombre = Column(String(100), nullable=False)
@@ -78,8 +98,14 @@ class Sucursal(Base):
     latitud = Column(Float, nullable=True)
     longitud = Column(Float, nullable=True)
     ciudad_id = Column(Integer, ForeignKey("ciudades.id", ondelete="CASCADE"), nullable=False)
+    # [EXAMEN-2] Aislamiento multitenant
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    # [EXAMEN-2] Descarga incremental y baja lógica (RNF-14)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
     
     # Relaciones
+    tenant = relationship("Tenant", back_populates="sucursales")  # [EXAMEN-2]
     ciudad = relationship("Ciudad", back_populates="sucursales")
     encargado = relationship("EncargadoSucursal", back_populates="sucursal", uselist=False)
     cajeros = relationship("Cajero", back_populates="sucursal")
@@ -91,13 +117,24 @@ class Sucursal(Base):
 
 # Modelo: Categoría
 class Categoria(Base):
-    """Tabla de categorías de productos."""
+    """Tabla de categorías de productos.
+
+    Modificado en Examen 2 (SaaS multitenant): unicidad compuesta
+    `(tenant_id, nombre)` en lugar de `nombre` único global.
+    """
     __tablename__ = "categorias"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "nombre", name="uq_categorias_tenant_nombre"),
+    )
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    nombre = Column(String(100), unique=True, nullable=False)
+    nombre = Column(String(100), nullable=False)
     descripcion = Column(Text, nullable=True)
     imagen = Column(String(500), nullable=True)
+    # [EXAMEN-2] Aislamiento multitenant
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())  # [EXAMEN-2] RNF-14
+    deleted_at = Column(DateTime(timezone=True), nullable=True)  # [EXAMEN-2] baja lógica
     
     # Relaciones
     productos = relationship("Producto", back_populates="categoria")
@@ -108,13 +145,24 @@ class Categoria(Base):
 
 # Modelo: Talla
 class Talla(Base):
-    """Tabla de tallas."""
+    """Tabla de tallas.
+
+    Modificado en Examen 2 (SaaS multitenant): unicidad compuesta
+    `(tenant_id, tipo, valor)`.
+    """
     __tablename__ = "tallas"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "tipo", "valor", name="uq_tallas_tenant_tipo_valor"),
+    )
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     valor = Column(String(10), nullable=False)
     tipo = Column(String(50), nullable=True)  # ropa, calzado, accesorios
     descripcion = Column(String(100), nullable=True)
+    # [EXAMEN-2] Aislamiento multitenant
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())  # [EXAMEN-2] RNF-14
+    deleted_at = Column(DateTime(timezone=True), nullable=True)  # [EXAMEN-2] baja lógica
     
     # Relaciones
     variantes = relationship("VarianteProducto", back_populates="talla")
@@ -125,13 +173,24 @@ class Talla(Base):
 
 # Modelo: Color
 class Color(Base):
-    """Tabla de colores."""
+    """Tabla de colores.
+
+    Modificado en Examen 2 (SaaS multitenant): unicidad compuesta
+    `(tenant_id, nombre)`.
+    """
     __tablename__ = "colores"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "nombre", name="uq_colores_tenant_nombre"),
+    )
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     nombre = Column(String(50), nullable=False)
     codigo_hex = Column(String(7), nullable=True)
     imagen_muestra = Column(String(500), nullable=True)
+    # [EXAMEN-2] Aislamiento multitenant
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())  # [EXAMEN-2] RNF-14
+    deleted_at = Column(DateTime(timezone=True), nullable=True)  # [EXAMEN-2] baja lógica
     
     # Relaciones
     variantes = relationship("VarianteProducto", back_populates="color")
@@ -142,7 +201,11 @@ class Color(Base):
 
 # Modelo: Temporada
 class Temporada(Base):
-    """Tabla de temporadas comerciales."""
+    """Tabla de temporadas comerciales.
+
+    Modificado en Examen 2 (SaaS multitenant): se agrega `tenant_id`,
+    `updated_at` y `deleted_at`.
+    """
     __tablename__ = "temporadas"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -150,6 +213,10 @@ class Temporada(Base):
     fecha_inicio = Column(Date, nullable=False)
     fecha_fin = Column(Date, nullable=False)
     descripcion = Column(Text, nullable=True)
+    # [EXAMEN-2] Aislamiento multitenant
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())  # [EXAMEN-2] RNF-14
+    deleted_at = Column(DateTime(timezone=True), nullable=True)  # [EXAMEN-2] baja lógica
     
     # Relaciones
     productos = relationship("Producto", back_populates="temporada")
@@ -161,13 +228,20 @@ class Temporada(Base):
 
 # Modelo: Colección
 class Coleccion(Base):
-    """Tabla de colecciones."""
+    """Tabla de colecciones.
+
+    Modificado en Examen 2 (SaaS multitenant): se agrega `tenant_id` y
+    `deleted_at` para evitar filtraciones entre tenants.
+    """
     __tablename__ = "colecciones"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     nombre = Column(String(100), nullable=False)
     descripcion = Column(Text, nullable=True)
     temporada_id = Column(Integer, ForeignKey("temporadas.id", ondelete="SET NULL"), nullable=True)
+    # [EXAMEN-2] Aislamiento multitenant
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)  # [EXAMEN-2] baja lógica
     
     # Relaciones
     temporada = relationship("Temporada", back_populates="colecciones")
@@ -179,16 +253,27 @@ class Coleccion(Base):
 
 # Modelo: Proveedor
 class Proveedor(Base):
-    """Tabla de proveedores."""
+    """Tabla de proveedores.
+
+    Modificado en Examen 2 (SaaS multitenant): unicidad compuesta
+    `(tenant_id, nit)` en lugar de `nit` único global.
+    """
     __tablename__ = "proveedores"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "nit", name="uq_proveedores_tenant_nit"),
+    )
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     nombre = Column(String(200), nullable=False)
-    nit = Column(String(20), unique=True, nullable=False)
+    nit = Column(String(20), nullable=False)
     contacto = Column(String(100), nullable=True)
     telefono = Column(String(20), nullable=True)
     correo = Column(String(255), nullable=True)
     direccion = Column(String(500), nullable=True)
+    # [EXAMEN-2] Aislamiento multitenant
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())  # [EXAMEN-2] RNF-14
+    deleted_at = Column(DateTime(timezone=True), nullable=True)  # [EXAMEN-2] baja lógica
     
     # Relaciones
     productos = relationship("Producto", back_populates="proveedor")
@@ -200,11 +285,23 @@ class Proveedor(Base):
 
 # Modelo: Producto
 class Producto(Base):
-    """Tabla de productos (prendas de vestir)."""
+    """Tabla de productos (prendas de vestir).
+
+    Modificado en Examen 2 (SaaS multitenant): `tenant_id`, `version`,
+    `updated_at` y `deleted_at`; la unicidad del SKU pasa a ser compuesta
+    `(tenant_id, sku)` y `version`/`updated_at` habilitan la descarga
+    incremental (CU05 / RNF-14).
+    """
     __tablename__ = "productos"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "sku", name="uq_productos_tenant_sku"),
+        # [EXAMEN-2] Índices obligatorios del plan, 16.1
+        Index("ix_productos_tenant_estado", "tenant_id", "estado"),
+        Index("ix_productos_tenant_categoria", "tenant_id", "categoria_id"),
+    )
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    sku = Column(String(50), unique=True, nullable=False, index=True)
+    sku = Column(String(50), nullable=False, index=True)
     nombre = Column(String(200), nullable=False)
     descripcion = Column(Text, nullable=True)
     precio = Column(Numeric(10, 2), nullable=False)
@@ -218,8 +315,15 @@ class Producto(Base):
     categoria_id = Column(Integer, ForeignKey("categorias.id", ondelete="SET NULL"), nullable=True)
     temporada_id = Column(Integer, ForeignKey("temporadas.id", ondelete="SET NULL"), nullable=True)
     proveedor_id = Column(Integer, ForeignKey("proveedores.id", ondelete="SET NULL"), nullable=True)
+    # [EXAMEN-2] Aislamiento multitenant
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    # [EXAMEN-2] Base de la descarga incremental CU05
+    version = Column(BigInteger, nullable=False, default=1, server_default="1")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    deleted_at = Column(DateTime(timezone=True), nullable=True)  # [EXAMEN-2] baja lógica
     
     # Relaciones
+    tenant = relationship("Tenant", back_populates="productos")  # [EXAMEN-2]
     categoria = relationship("Categoria", back_populates="productos")
     temporada = relationship("Temporada", back_populates="productos")
     proveedor = relationship("Proveedor", back_populates="productos")
@@ -247,16 +351,30 @@ class ProductoColeccion(Base):
 
 # Modelo: VarianteProducto
 class VarianteProducto(Base):
-    """Tabla de variantes de producto (combinación de talla y color)."""
+    """Tabla de variantes de producto (combinación de talla y color).
+
+    Modificado en Examen 2 (SaaS multitenant): `tenant_id`, `version`,
+    `updated_at`, `deleted_at`; unicidad compuesta `(tenant_id, sku_variante)`.
+    """
     __tablename__ = "variantes_producto"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "sku_variante", name="uq_variantes_tenant_sku"),
+        # [EXAMEN-2] Índice obligatorio del plan, 16.1
+        Index("ix_variantes_tenant_producto", "tenant_id", "producto_id"),
+    )
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     producto_id = Column(Integer, ForeignKey("productos.id", ondelete="CASCADE"), nullable=False)
     talla_id = Column(Integer, ForeignKey("tallas.id", ondelete="SET NULL"), nullable=True)
     color_id = Column(Integer, ForeignKey("colores.id", ondelete="CASCADE"), nullable=False)
-    sku_variante = Column(String(50), unique=True, nullable=False)
+    sku_variante = Column(String(50), nullable=False)
     precio_variante = Column(Numeric(10, 2), nullable=True)
     costo_variante = Column(Numeric(10, 2), nullable=True)
+    # [EXAMEN-2] Aislamiento multitenant
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    version = Column(BigInteger, nullable=False, default=1, server_default="1")  # [EXAMEN-2] CU05
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())  # [EXAMEN-2]
+    deleted_at = Column(DateTime(timezone=True), nullable=True)  # [EXAMEN-2] baja lógica
     
     # Relaciones
     producto = relationship("Producto", back_populates="variantes")
@@ -270,10 +388,14 @@ class VarianteProducto(Base):
 
 # Modelo: Inventario
 class Inventario(Base):
-    """Tabla de inventario por sucursal y variante de producto."""
+    """Tabla de inventario por sucursal y variante de producto.
+
+    Modificado en Examen 2 (SaaS multitenant): `tenant_id`, `version` y
+    `updated_at`; unicidad compuesta por tenant (plan, 3.6).
+    """
     __tablename__ = "inventario"
     __table_args__ = (
-        UniqueConstraint("variante_producto_id", "sucursal_id", name="uq_inventario_variante_sucursal"),
+        UniqueConstraint("tenant_id", "variante_producto_id", "sucursal_id", name="uq_inventario_tenant_variante_sucursal"),
         CheckConstraint("cantidad >= 0", name="ck_inventario_cantidad_no_negativa"),
         CheckConstraint("cantidad_reservada >= 0", name="ck_inventario_reservada_no_negativa"),
         CheckConstraint("cantidad_vendida >= 0", name="ck_inventario_vendida_no_negativa"),
@@ -288,6 +410,10 @@ class Inventario(Base):
     cantidad_vendida = Column(Integer, default=0)
     stock_minimo = Column(Integer, default=5)
     estado = Column(Enum(EstadoStock), default=EstadoStock.DISPONIBLE)
+    # [EXAMEN-2] Aislamiento multitenant y descarga incremental
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    version = Column(BigInteger, nullable=False, default=1, server_default="1")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
     # Relaciones
     variante_producto = relationship("VarianteProducto", back_populates="inventarios")
@@ -305,7 +431,11 @@ class Inventario(Base):
 
 # Modelo: MovimientoInventario
 class MovimientoInventario(Base):
-    """Tabla de movimientos de inventario."""
+    """Tabla de movimientos de inventario.
+
+    Modificado en Examen 2 (SaaS multitenant): `tenant_id`, `referencia_uuid`
+    y nuevos valores de `TipoMovimiento` (traspaso, merma y cambio).
+    """
     __tablename__ = "movimientos_inventario"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -315,6 +445,11 @@ class MovimientoInventario(Base):
     motivo = Column(String(500), nullable=True)
     fecha_hora = Column(DateTime(timezone=True), server_default=func.now())
     usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True)
+    # [EXAMEN-2] Aislamiento multitenant y trazabilidad de la operación
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    referencia_uuid = Column(Uuid(as_uuid=True), nullable=True, index=True)  # [EXAMEN-2] offline/traspaso/cambio
+    # [EXAMEN-2] Fase 3: movimientos creados por el generador de datos sintéticos (RF-023)
+    es_sintetico = Column(Boolean, nullable=False, default=False, server_default="false", index=True)
     
     # Relaciones
     inventario = relationship("Inventario", back_populates="movimientos")
@@ -326,7 +461,10 @@ class MovimientoInventario(Base):
 
 # Modelo: Recepcion de mercadería por proveedor (Opción A - Recepción Directa)
 class Recepcion(Base):
-    """Cabecera de recepción de mercadería proveniente de un proveedor."""
+    """Cabecera de recepción de mercadería proveniente de un proveedor.
+
+    Modificado en Examen 2 (SaaS multitenant): se agrega `tenant_id` NOT NULL.
+    """
     __tablename__ = "recepciones"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -339,6 +477,8 @@ class Recepcion(Base):
     total_unidades = Column(Integer, default=0, server_default="0")
     total_costo = Column(Numeric(12, 2), default=0, server_default="0")
     creado_por = Column(Integer, ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True)
+    # [EXAMEN-2] Aislamiento multitenant
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
 
     # Relaciones
     proveedor = relationship("Proveedor", back_populates="recepciones")

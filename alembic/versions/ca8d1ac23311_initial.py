@@ -499,3 +499,29 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_categorias_id'), table_name='categorias')
     op.drop_table('categorias')
     # ### end Alembic commands ###
+
+    # [EXAMEN-2] Los tipos ENUM creados implícitamente por create_table no se
+    # eliminan con drop_table; se limpian aquí para que `downgrade base`
+    # seguido de `upgrade head` funcione sobre la misma base de datos.
+    for _tipo in (
+        "estadopasarela",
+        "estadoproducto",
+        "estadostock",
+        "estadousuario",
+        "metodopagodigital",
+        "metodopagopresencial",
+        "tipocomprobante",
+        "tipoorden",
+        "estadoorden",
+        "estadotransaccion",
+        "estadocarrito",
+        "estadoreserva",
+        "estadodetallereserva",
+        "tipomovimiento",
+        "formatoreporte",
+        "tiporeporte",
+        "estadocupon",
+        "tipocupon",
+        "estadosucursal",
+    ):
+        op.execute(f"DROP TYPE IF EXISTS {_tipo}")

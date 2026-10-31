@@ -10,8 +10,10 @@ import secrets
 
 from app.security import (
     get_password_hash, verify_password, 
-    create_access_token, create_refresh_token, decode_token
+    create_access_token, create_refresh_token, decode_token,
+    construir_claims_usuario,
 )
+from app.config import settings
 from app.apps.gestion_usuarios.models import (
     Usuario, Rol, Permiso, UsuarioRol, RolPermiso,
     Cliente, Administrador, EncargadoSucursal, Cajero, Bitacora, EstadoUsuario
@@ -48,9 +50,11 @@ class AuthService:
         Raises:
             AuthenticationException: Si las credenciales son inválidas
         """
-        # Buscar usuario por correo
+        # Buscar usuario por correo (con roles para los claims del token)
         result = await db.execute(
-            select(Usuario).where(Usuario.correo == datos.correo)
+            select(Usuario)
+            .options(selectinload(Usuario.roles), selectinload(Usuario.tenant))
+            .where(Usuario.correo == datos.correo)
         )
         usuario = result.scalar_one_or_none()
         
@@ -70,25 +74,53 @@ class AuthService:
         if usuario.estado == EstadoUsuario.INACTIVO:
             raise AuthenticationException("Usuario inactivo. Contacte al administrador.")
         
+        # [EXAMEN-2] RN-004: validar tenant y suscripción (salvo Super Admin)
+        tenant_info = None
+        suscripcion_info = None
+        if usuario.tenant_id is not None:
+            from app.apps.gestion_saas.models import Suscripcion
+            from app.tenant import get_suscripcion_activa
+
+            suscripcion = await get_suscripcion_activa(db, usuario.tenant_id)
+            tenant_info = {
+                "id": usuario.tenant.id,
+                "slug": usuario.tenant.slug,
+                "razon_social": usuario.tenant.razon_social,
+                "estado": usuario.tenant.estado.value if hasattr(usuario.tenant.estado, "value") else str(usuario.tenant.estado),
+            } if usuario.tenant else None
+            suscripcion_info = {
+                "id": suscripcion.id,
+                "plan_id": suscripcion.plan_id,
+                "estado": suscripcion.estado.value if hasattr(suscripcion.estado, "value") else str(suscripcion.estado),
+                "estado_pago": suscripcion.estado_pago,
+                "fecha_vencimiento": suscripcion.fecha_vencimiento.isoformat(),
+            }
+
         # Actualizar último acceso
         usuario.ultimo_acceso = datetime.utcnow()
         await db.commit()
         
-        # Generar tokens
-        token_data = {"sub": str(usuario.id), "correo": usuario.correo}
+        # Generar tokens con tenant, super admin y roles
+        token_data = construir_claims_usuario(usuario)
         access_token = create_access_token(token_data)
         refresh_token = create_refresh_token(token_data)
         
         # Registrar login exitoso
         await AuthService._registrar_bitacora(
             db, usuario.id, "LOGIN_EXITOSO", 
-            "Usuario inició sesión", ip_address=ip_address
+            "Usuario inició sesión", ip_address=ip_address, tenant_id=usuario.tenant_id
         )
         
         return {
             "access_token": access_token,
             "refresh_token": refresh_token,
-            "token_type": "bearer"
+            "token_type": "bearer",
+            "tenant_id": usuario.tenant_id,
+            "es_super_admin": token_data["es_super_admin"],
+            "roles": token_data["roles"],
+            "debe_cambiar_contrasena": usuario.debe_cambiar_contrasena,
+            "tenant": tenant_info,
+            "suscripcion": suscripcion_info,
         }, usuario
     
     @staticmethod
@@ -117,30 +149,84 @@ class AuthService:
         except (ValueError, TypeError):
             raise AuthenticationException("Token de refresco inválido")
         
-        # Buscar usuario
-        result = await db.execute(select(Usuario).where(Usuario.id == user_id))
+        # Buscar usuario con roles para reconstruir los claims
+        result = await db.execute(
+            select(Usuario)
+            .options(selectinload(Usuario.roles), selectinload(Usuario.tenant))
+            .where(Usuario.id == user_id)
+        )
         usuario = result.scalar_one_or_none()
         
         if not usuario or (usuario.estado != EstadoUsuario.ACTIVO and usuario.estado != "ACTIVO"):
             raise AuthenticationException("Usuario no encontrado o inactivo")
+
+        # [EXAMEN-2] El refresco no puede cambiar de tenant (plan, 4.2)
+        claim_tenant = payload.get("tenant_id")
+        if claim_tenant is not None and int(claim_tenant) != usuario.tenant_id:
+            raise AuthenticationException("El token pertenece a otro tenant")
+
+        # [EXAMEN-2] RN-004: revalidar tenant y suscripción antes de emitir
+        tenant_info = None
+        suscripcion_info = None
+        if usuario.tenant_id is not None:
+            from app.tenant import get_suscripcion_activa
+
+            if usuario.tenant is None:
+                from app.apps.gestion_saas.models import Tenant
+
+                res_tenant = await db.execute(select(Tenant).where(Tenant.id == usuario.tenant_id))
+                tenant_obj = res_tenant.scalar_one_or_none()
+            else:
+                tenant_obj = usuario.tenant
+            if tenant_obj is None or getattr(tenant_obj.estado, "value", tenant_obj.estado) in ("SUSPENDIDO", "CANCELADO"):
+                raise AuthenticationException("La empresa está suspendida o cancelada")
+
+            suscripcion = await get_suscripcion_activa(db, usuario.tenant_id)
+            tenant_info = {
+                "id": tenant_obj.id,
+                "slug": tenant_obj.slug,
+                "razon_social": tenant_obj.razon_social,
+                "estado": getattr(tenant_obj.estado, "value", str(tenant_obj.estado)),
+            }
+            suscripcion_info = {
+                "id": suscripcion.id,
+                "plan_id": suscripcion.plan_id,
+                "estado": getattr(suscripcion.estado, "value", str(suscripcion.estado)),
+                "estado_pago": suscripcion.estado_pago,
+                "fecha_vencimiento": suscripcion.fecha_vencimiento.isoformat(),
+            }
         
-        # Generar nuevos tokens
-        token_data = {"sub": str(usuario.id), "correo": usuario.correo}
+        # Generar nuevos tokens con tenant, super admin y roles
+        token_data = construir_claims_usuario(usuario)
         access_token = create_access_token(token_data)
         new_refresh_token = create_refresh_token(token_data)
         
         return {
             "access_token": access_token,
             "refresh_token": new_refresh_token,
-            "token_type": "bearer"
+            "token_type": "bearer",
+            "tenant_id": usuario.tenant_id,
+            "es_super_admin": token_data["es_super_admin"],
+            "roles": token_data["roles"],
+            "debe_cambiar_contrasena": usuario.debe_cambiar_contrasena,
+            "tenant": tenant_info,
+            "suscripcion": suscripcion_info,
         }
     
     @staticmethod
-    async def logout(db: AsyncSession, usuario_id: int, ip_address: Optional[str] = None):
-        """Registra el cierre de sesión."""
+    async def logout(
+        db: AsyncSession,
+        usuario_id: int,
+        ip_address: Optional[str] = None,
+        tenant_id: Optional[int] = None,
+    ):
+        """Registra el cierre de sesión con el tenant del usuario."""
+        if tenant_id is None:
+            result = await db.execute(select(Usuario.tenant_id).where(Usuario.id == usuario_id))
+            tenant_id = result.scalar_one_or_none()
         await AuthService._registrar_bitacora(
             db, usuario_id, "LOGOUT", 
-            "Usuario cerró sesión", ip_address=ip_address
+            "Usuario cerró sesión", ip_address=ip_address, tenant_id=tenant_id
         )
     
     @staticmethod
@@ -150,11 +236,13 @@ class AuthService:
         accion: str, 
         detalles: str,
         modulo: str = "Autenticacion",
-        ip_address: Optional[str] = None
+        ip_address: Optional[str] = None,
+        tenant_id: Optional[int] = None,
     ):
         """Registra un evento en la bitácora."""
         bitacora = Bitacora(
             usuario_id=usuario_id,
+            tenant_id=tenant_id,
             accion=accion,
             modulo=modulo,
             detalles=detalles,
@@ -172,7 +260,12 @@ class UsuarioService:
     """Servicio de gestión de usuarios."""
     
     @staticmethod
-    async def create_usuario(db: AsyncSession, datos: UsuarioCreate, rol_nombre: str = "Cliente") -> Usuario:
+    async def create_usuario(
+        db: AsyncSession,
+        datos: UsuarioCreate,
+        rol_nombre: str = "Cliente",
+        tenant_id: Optional[int] = None,
+    ) -> Usuario:
         """
         Crea un nuevo usuario en el sistema.
         
@@ -180,11 +273,22 @@ class UsuarioService:
             db: Sesión de base de datos
             datos: Datos del usuario a crear
             rol_nombre: Nombre del rol a asignar
+            tenant_id: Tenant destino (por defecto, el del contexto)
         
         Returns:
             Usuario creado
         """
-        # Verificar correo duplicado
+        from app.tenant import tenant_actual
+
+        tenant_id = tenant_id if tenant_id is not None else tenant_actual()
+        if tenant_id is None:
+            raise ConflictException("No se pudo determinar el tenant del usuario")
+
+        # [EXAMEN-2] Un tenant no puede crear Super Administradores de plataforma
+        if rol_nombre == "Super Administrador":
+            raise ValidationException("No se puede crear un Super Administrador desde un tenant")
+
+        # Verificar correo duplicado (global, decisión 3.7.1)
         result = await db.execute(
             select(Usuario).where(Usuario.correo == datos.correo)
         )
@@ -198,19 +302,22 @@ class UsuarioService:
             correo=datos.correo,
             telefono=datos.telefono,
             contrasena_hash=get_password_hash(datos.contrasena),
-            estado=datos.estado
+            estado=datos.estado,
+            tenant_id=tenant_id,
         )
         db.add(usuario)
         await db.flush()
         
-        # Asignar rol
+        # Asignar rol del tenant
         result = await db.execute(
             select(Rol).where(Rol.nombre == rol_nombre)
         )
         rol = result.scalar_one_or_none()
         
         if rol:
-            usuario_rol = UsuarioRol(usuario_id=usuario.id, rol_id=rol.id)
+            usuario_rol = UsuarioRol(
+                usuario_id=usuario.id, rol_id=rol.id, tenant_id=tenant_id
+            )
             db.add(usuario_rol)
             
             # Si se proporcionó sucursal_id, crear el registro de personal correspondiente
@@ -219,13 +326,15 @@ class UsuarioService:
                 if "encargado" in rol_lower:
                     encargado = EncargadoSucursal(
                         usuario_id=usuario.id,
-                        sucursal_id=datos.sucursal_id
+                        sucursal_id=datos.sucursal_id,
+                        tenant_id=tenant_id,
                     )
                     db.add(encargado)
                 elif "cajero" in rol_lower:
                     cajero = Cajero(
                         usuario_id=usuario.id,
-                        sucursal_id=datos.sucursal_id
+                        sucursal_id=datos.sucursal_id,
+                        tenant_id=tenant_id,
                     )
                     db.add(cajero)
         
@@ -235,13 +344,21 @@ class UsuarioService:
         return usuario
     
     @staticmethod
-    async def get_usuario(db: AsyncSession, usuario_id: int) -> Usuario:
-        """Obtiene un usuario por su ID."""
-        result = await db.execute(
+    async def get_usuario(
+        db: AsyncSession, usuario_id: int, tenant_id: Optional[int] = None
+    ) -> Usuario:
+        """Obtiene un usuario por su ID dentro del tenant activo."""
+        from app.tenant import tenant_actual
+
+        tenant_id = tenant_id if tenant_id is not None else tenant_actual()
+        query = (
             select(Usuario)
             .options(selectinload(Usuario.roles))
             .where(Usuario.id == usuario_id)
         )
+        if tenant_id is not None:
+            query = query.where(Usuario.tenant_id == tenant_id)
+        result = await db.execute(query)
         usuario = result.scalar_one_or_none()
         
         if not usuario:
@@ -255,16 +372,22 @@ class UsuarioService:
         skip: int = 0, 
         limit: int = 100,
         estado: Optional[str] = None,
-        rol: Optional[str] = None
+        rol: Optional[str] = None,
+        tenant_id: Optional[int] = None,
     ) -> Tuple[List[Usuario], int]:
         """
-        Lista usuarios con paginación y filtros.
+        Lista usuarios con paginación y filtros dentro del tenant.
         
         Returns:
             Tupla con (lista de usuarios, total)
         """
+        from app.tenant import tenant_actual
+
+        tenant_id = tenant_id if tenant_id is not None else tenant_actual()
         query = select(Usuario).options(selectinload(Usuario.roles))
         
+        if tenant_id is not None:
+            query = query.where(Usuario.tenant_id == tenant_id)
         if estado:
             query = query.where(Usuario.estado == estado)
         
@@ -272,12 +395,21 @@ class UsuarioService:
             query = query.join(UsuarioRol).join(Rol).where(Rol.nombre == rol)
         
         # Contar total
-        count_query = select(Usuario)
+        count_query = select(func.count(Usuario.id))
+        if tenant_id is not None:
+            count_query = count_query.where(Usuario.tenant_id == tenant_id)
         if estado:
             count_query = count_query.where(Usuario.estado == estado)
+        if rol:
+            count_query = (
+                count_query.select_from(Usuario)
+                .join(UsuarioRol, UsuarioRol.usuario_id == Usuario.id)
+                .join(Rol, Rol.id == UsuarioRol.rol_id)
+                .where(Rol.nombre == rol)
+            )
         
         total_result = await db.execute(count_query)
-        total = len(total_result.scalars().all())
+        total = total_result.scalar_one() or 0
         
         # Aplicar paginación
         query = query.offset(skip).limit(limit)
@@ -341,16 +473,25 @@ class UsuarioService:
         await db.commit()
     
     @staticmethod
-    async def assign_role(db: AsyncSession, usuario_id: int, rol_id: int) -> Usuario:
-        """Asigna un rol a un usuario."""
+    async def assign_role(
+        db: AsyncSession, usuario_id: int, rol_id: int, tenant_id: Optional[int] = None
+    ) -> Usuario:
+        """Asigna un rol a un usuario dentro de su tenant."""
+        from app.tenant import tenant_actual
+
         usuario = await UsuarioService.get_usuario(db, usuario_id)
+        tenant_id = tenant_id if tenant_id is not None else (usuario.tenant_id or tenant_actual())
+        if tenant_id is None:
+            raise ValidationException("El usuario no tiene tenant asignado")
         
-        # Verificar que el rol existe
+        # Verificar que el rol existe (global o del tenant)
         result = await db.execute(select(Rol).where(Rol.id == rol_id))
         rol = result.scalar_one_or_none()
         
         if not rol:
             raise NotFoundException(f"Rol con ID {rol_id} no encontrado")
+        if rol.nombre == "Super Administrador":
+            raise ValidationException("No se puede asignar el rol de plataforma desde un tenant")
         
         # Verificar si ya tiene el rol
         result = await db.execute(
@@ -364,8 +505,10 @@ class UsuarioService:
         if result.scalar_one_or_none():
             raise ConflictException("El usuario ya tiene este rol asignado")
         
-        # Asignar rol
-        usuario_rol = UsuarioRol(usuario_id=usuario_id, rol_id=rol_id)
+        # Asignar rol copiando el tenant del usuario
+        usuario_rol = UsuarioRol(
+            usuario_id=usuario_id, rol_id=rol_id, tenant_id=tenant_id
+        )
         db.add(usuario_rol)
         await db.commit()
         
@@ -573,16 +716,24 @@ class ClienteService:
         Returns:
             Tupla con (cliente, tokens)
         """
-        # Verificar correo duplicado
+        # [EXAMEN-2] El registro público se crea dentro del tenant resuelto
+        from app.tenant import resolver_tenant_publico, tenant_actual
+
+        tenant_id = tenant_actual() or await resolver_tenant_publico(db)
+
+        # Verificar correo duplicado (global)
         result = await db.execute(
             select(Usuario).where(Usuario.correo == datos.correo)
         )
         if result.scalar_one_or_none():
             raise ConflictException("El correo electrónico ya está registrado")
         
-        # Verificar NIT/CI duplicado
+        # Verificar NIT/CI duplicado dentro del tenant
         result = await db.execute(
-            select(Cliente).where(Cliente.nit_ci == datos.nit_ci)
+            select(Cliente).where(
+                Cliente.nit_ci == datos.nit_ci,
+                Cliente.tenant_id == tenant_id,
+            )
         )
         if result.scalar_one_or_none():
             raise ConflictException("El NIT/CI ya está registrado")
@@ -594,7 +745,8 @@ class ClienteService:
             correo=datos.correo,
             telefono=datos.telefono,
             contrasena_hash=get_password_hash(datos.contrasena),
-            estado=EstadoUsuario.ACTIVO
+            estado=EstadoUsuario.ACTIVO,
+            tenant_id=tenant_id,
         )
         db.add(usuario)
         await db.flush()
@@ -606,27 +758,39 @@ class ClienteService:
         rol_cliente = result.scalar_one_or_none()
         
         if rol_cliente:
-            usuario_rol = UsuarioRol(usuario_id=usuario.id, rol_id=rol_cliente.id)
+            usuario_rol = UsuarioRol(
+                usuario_id=usuario.id, rol_id=rol_cliente.id, tenant_id=tenant_id
+            )
             db.add(usuario_rol)
         
         # Crear cliente
         cliente = Cliente(
             usuario_id=usuario.id,
             nit_ci=datos.nit_ci,
-            direccion_envio=datos.direccion_envio
+            direccion_envio=datos.direccion_envio,
+            telefono=datos.telefono,
+            correo=datos.correo,
+            tenant_id=tenant_id,
         )
         db.add(cliente)
         await db.commit()
         await db.refresh(usuario)
         
-        # Generar tokens
-        token_data = {"sub": str(usuario.id), "correo": usuario.correo}
+        # Generar tokens con tenant y rol
+        token_data = {
+            "sub": str(usuario.id),
+            "correo": usuario.correo,
+            "tenant_id": tenant_id,
+            "es_super_admin": False,
+            "roles": ["Cliente"] if rol_cliente else [],
+        }
         access_token = create_access_token(token_data)
         refresh_token = create_refresh_token(token_data)
         
         # Registrar en bitácora
         bitacora = Bitacora(
             usuario_id=usuario.id,
+            tenant_id=tenant_id,
             accion="REGISTRO_CLIENTE",
             modulo="Autenticacion",
             detalles="Nuevo cliente registrado",
@@ -638,7 +802,13 @@ class ClienteService:
         return cliente, {
             "access_token": access_token,
             "refresh_token": refresh_token,
-            "token_type": "bearer"
+            "token_type": "bearer",
+            "tenant_id": tenant_id,
+            "es_super_admin": False,
+            "roles": token_data["roles"],
+            "debe_cambiar_contrasena": False,
+            "tenant": None,
+            "suscripcion": None,
         }
     
     @staticmethod
@@ -747,13 +917,15 @@ class ClienteService:
         if not verify_password(contrasena_actual, usuario.contrasena_hash):
             raise AuthenticationException("La contraseña actual es incorrecta")
         
-        # Actualizar contraseña
+        # Actualizar contraseña y limpiar la marca de cambio obligatorio
         usuario.contrasena_hash = get_password_hash(contrasena_nueva)
+        usuario.debe_cambiar_contrasena = False
         await db.commit()
         
         # Registrar en bitácora
         bitacora = Bitacora(
             usuario_id=usuario_id,
+            tenant_id=usuario.tenant_id,
             accion="CAMBIO_CONTRASENA",
             modulo="Perfil",
             detalles="Usuario cambió su contraseña",
@@ -823,11 +995,21 @@ class BitacoraService:
         detalles: Optional[str] = None,
         registro_id: Optional[int] = None,
         valores_anteriores: Optional[dict] = None,
-        valores_nuevos: Optional[dict] = None
+        valores_nuevos: Optional[dict] = None,
+        tenant_id: Optional[int] = None,
     ) -> Bitacora:
         """Registra un evento en la bitácora, con diff opcional antes/después."""
+        from app.tenant import tenant_actual
+
+        # [EXAMEN-2] Auditoría por tenant (plan, 4.5)
+        tenant_id = tenant_id if tenant_id is not None else tenant_actual()
+        if tenant_id is None and usuario_id is not None:
+            res = await db.execute(select(Usuario.tenant_id).where(Usuario.id == usuario_id))
+            tenant_id = res.scalar_one_or_none()
+
         bitacora = Bitacora(
             usuario_id=usuario_id,
+            tenant_id=tenant_id,
             accion=accion,
             modulo=modulo,
             detalles=detalles,
@@ -849,20 +1031,27 @@ class BitacoraService:
         accion: Optional[str] = None,
         modulo: Optional[str] = None,
         fecha_inicio: Optional[datetime] = None,
-        fecha_fin: Optional[datetime] = None
+        fecha_fin: Optional[datetime] = None,
+        tenant_id: Optional[int] = None,
     ) -> Tuple[List[Bitacora], int]:
         """
-        Consulta la bitácora con filtros.
+        Consulta la bitácora con filtros dentro del tenant.
         
         Returns:
             Tupla con (registros, total)
         """
+        from app.tenant import tenant_actual
+
+        tenant_id = tenant_id if tenant_id is not None else tenant_actual()
         query = (
             select(Bitacora)
             .options(selectinload(Bitacora.usuario))
             .order_by(Bitacora.fecha_hora.desc())
         )
         count_query = select(func.count(Bitacora.id))
+        if tenant_id is not None:
+            query = query.where(Bitacora.tenant_id == tenant_id)
+            count_query = count_query.where(Bitacora.tenant_id == tenant_id)
         
         if usuario_id:
             query = query.where(Bitacora.usuario_id == usuario_id)
@@ -917,9 +1106,26 @@ class DatosInicialesService:
     
     @staticmethod
     async def crear_datos_iniciales(db: AsyncSession):
-        """Crea los roles y permisos iniciales del sistema."""
-        
-        # Crear permisos
+        """Crea permisos, roles, planes, tenant demo y usuarios iniciales.
+
+        Modificado en Examen 2 (SaaS multitenant): incorpora los permisos de
+        plataforma, el rol y usuario Super Administrador, los planes Básico y
+        Profesional, el tenant demo con suscripción activa y la configuración
+        offline. Es idempotente por clave natural.
+        """
+        from datetime import date, timedelta
+
+        from app.apps.gestion_saas.models import (
+            EstadoPlan, EstadoSuscripcion, EstadoTenant, PagoSuscripcion,
+            Plan, Suscripcion, Tenant,
+        )
+        from app.apps.gestion_ventas.models import EstadoTransaccion
+        from app.apps.operaciones_offline.models import ConfiguracionOffline
+        from app.tenant import TENANT_DEMO_SLUG
+
+        # ------------------------------------------------------------
+        # 1. Permisos (base del Examen 1 + plataforma del Examen 2)
+        # ------------------------------------------------------------
         permisos_data = [
             # Gestión de usuarios
             ("gestionar_usuarios", "Permiso para gestionar usuarios"),
@@ -937,6 +1143,20 @@ class DatosInicialesService:
             # Reportes
             ("generar_reportes", "Permiso para generar reportes"),
             ("ver_kpis", "Permiso para ver indicadores KPIs"),
+            # [EXAMEN-2] Plataforma y operación offline (plan, 9.1.9)
+            ("gestionar_tenants", "Permiso para gestionar empresas tenant"),
+            ("gestionar_planes", "Permiso para gestionar planes"),
+            ("gestionar_suscripciones", "Permiso para gestionar suscripciones"),
+            ("configurar_tenant", "Permiso para configurar el entorno del tenant"),
+            ("sincronizar_offline", "Permiso para sincronizar operaciones offline"),
+            ("resolver_conflictos", "Permiso para resolver conflictos de sincronización"),
+            ("gestionar_traspasos", "Permiso para gestionar traspasos"),
+            ("usar_reportes_ia", "Permiso para usar reportes con IA"),
+            ("entrenar_modelos", "Permiso para entrenar modelos de ML"),
+            ("exportar_reportes", "Permiso para exportar reportes"),
+            ("operar_offline", "Permiso para operar en modo offline"),
+            ("gestionar_pagos", "Permiso para gestionar pagos"),
+            ("revocar_dispositivos", "Permiso para revocar dispositivos"),
         ]
         
         permisos = {}
@@ -954,28 +1174,61 @@ class DatosInicialesService:
             permisos[nombre] = perm
         
         await db.flush()
+
+        # ------------------------------------------------------------
+        # 2. Tenant demo (datos históricos del Examen 1)
+        # ------------------------------------------------------------
+        result = await db.execute(select(Tenant).where(Tenant.slug == TENANT_DEMO_SLUG))
+        tenant = result.scalar_one_or_none()
+        if tenant is None:
+            tenant = Tenant(
+                razon_social="FashionStore Demo",
+                nit="0000000000",
+                direccion_fiscal="Av. Principal #123, La Paz",
+                correo_contacto="contacto@fashionstore.com",
+                telefono="00000000",
+                slug=TENANT_DEMO_SLUG,
+                moneda="BOB",
+                zona_horaria="America/La_Paz",
+                estado=EstadoTenant.OPERATIVO,
+            )
+            db.add(tenant)
+            await db.flush()
         
-        # Crear roles
+        # ------------------------------------------------------------
+        # 3. Roles (nombre global único; el tenant demo es el dueño)
+        # ------------------------------------------------------------
+        permisos_tenant = [
+            p for p in permisos.keys()
+            if p not in {
+                "gestionar_tenants", "gestionar_planes", "gestionar_suscripciones",
+                "entrenar_modelos",
+            }
+        ]
         roles_data = [
-            ("Administrador", "Administrador del sistema con acceso completo", list(permisos.keys())),
-            ("Cliente", "Cliente de la plataforma", []),
+            ("Administrador", "Administrador del tenant con acceso completo", permisos_tenant, tenant.id),
+            ("Cliente", "Cliente de la plataforma", [], tenant.id),
             ("Encargado", "Encargado de sucursal", [
                 "gestionar_sucursales", "gestionar_inventario", 
-                "gestionar_reservas", "gestionar_ventas"
-            ]),
+                "gestionar_reservas", "gestionar_ventas", "sincronizar_offline",
+                "operar_offline",
+            ], tenant.id),
             ("Cajero", "Cajero de sucursal", [
-                "gestionar_ventas", "procesar_pagos"
-            ]),
+                "gestionar_ventas", "procesar_pagos", "sincronizar_offline",
+                "operar_offline",
+            ], tenant.id),
+            # [EXAMEN-2] Rol de plataforma: tenant_id = NULL
+            ("Super Administrador", "Super Administrador de la plataforma SaaS", list(permisos.keys()), None),
         ]
         
-        for nombre, desc, perms in roles_data:
+        for nombre, desc, perms, rol_tenant in roles_data:
             result = await db.execute(
                 select(Rol).where(Rol.nombre == nombre)
             )
             rol = result.scalar_one_or_none()
             
             if not rol:
-                rol = Rol(nombre=nombre, descripcion=desc)
+                rol = Rol(nombre=nombre, descripcion=desc, tenant_id=rol_tenant)
                 db.add(rol)
                 await db.flush()
                 
@@ -985,34 +1238,171 @@ class DatosInicialesService:
                         rol_permiso = RolPermiso(rol_id=rol.id, permiso_id=permisos[perm_nombre].id)
                         db.add(rol_permiso)
         
-        # Crear administrador por defecto
+        await db.flush()
+
+        # ------------------------------------------------------------
+        # 4. Planes Básico y Profesional
+        # ------------------------------------------------------------
+        planes_data = [
+            ("Básico", "Plan inicial para una o dos sucursales", 299.00, 2, False, True, 0, False),
+            ("Profesional", "Plan completo con reportes IA", 799.00, 10, True, True, 1, True),
+        ]
+        planes = {}
+        for nombre, desc, precio, max_suc, ia, diferido, orden, soporte in planes_data:
+            result = await db.execute(select(Plan).where(Plan.nombre == nombre))
+            plan = result.scalar_one_or_none()
+            if plan is None:
+                plan = Plan(
+                    nombre=nombre,
+                    descripcion=desc,
+                    precio_mensual=precio,
+                    max_sucursales=max_suc,
+                    permite_reportes_ia=ia,
+                    permite_pago_diferido=diferido,
+                    orden=orden,
+                    soporte_prioritario=soporte,
+                    estado=EstadoPlan.ACTIVO,
+                )
+                db.add(plan)
+                await db.flush()
+            planes[nombre] = plan
+
+        # ------------------------------------------------------------
+        # 5. Suscripción activa + pago demo + configuración offline
+        # ------------------------------------------------------------
+        result = await db.execute(
+            select(Suscripcion)
+            .where(
+                Suscripcion.tenant_id == tenant.id,
+                Suscripcion.estado == EstadoSuscripcion.ACTIVA,
+            )
+            .order_by(Suscripcion.fecha_vencimiento.desc())
+        )
+        suscripcion = result.scalars().first()
+        if suscripcion is None or suscripcion.fecha_vencimiento < date.today():
+            suscripcion = Suscripcion(
+                tenant_id=tenant.id,
+                plan_id=planes["Profesional"].id,
+                fecha_inicio=date.today(),
+                fecha_vencimiento=date.today() + timedelta(days=365),
+                estado=EstadoSuscripcion.ACTIVA,
+                estado_pago="PAGADO",
+                renovacion_automatica=True,
+            )
+            db.add(suscripcion)
+            await db.flush()
+
+        result = await db.execute(
+            select(PagoSuscripcion).where(
+                PagoSuscripcion.suscripcion_id == suscripcion.id,
+                PagoSuscripcion.estado == EstadoTransaccion.CONFIRMADO,
+            )
+        )
+        if result.scalars().first() is None:
+            db.add(PagoSuscripcion(
+                tenant_id=tenant.id,
+                suscripcion_id=suscripcion.id,
+                monto=planes["Profesional"].precio_mensual,
+                moneda="BOB",
+                estado=EstadoTransaccion.CONFIRMADO,
+                referencia="DEMO-SEED",
+                idempotency_key="seed-demo-profesional",
+            ))
+
+        result = await db.execute(
+            select(ConfiguracionOffline).where(ConfiguracionOffline.tenant_id == tenant.id)
+        )
+        if result.scalar_one_or_none() is None:
+            db.add(ConfiguracionOffline(
+                tenant_id=tenant.id,
+                descarga_automatica=True,
+                incluir_clientes=True,
+                max_clientes=settings.OFFLINE_MAX_CLIENTES_DEFECTO,
+                habilitar_carrito_offline=True,
+                max_horas_sesion_offline=settings.OFFLINE_SESION_HORAS_DEFECTO,
+                max_dias_orden_pendiente=1,
+            ))
+
+        # ------------------------------------------------------------
+        # 6. Super Administrador de plataforma
+        # ------------------------------------------------------------
+        result = await db.execute(
+            select(Usuario).where(Usuario.correo == "superadmin@fashionstore.com")
+        )
+        superadmin = result.scalar_one_or_none()
+        if superadmin is None:
+            superadmin = Usuario(
+                nombre="Super",
+                apellido="Administrador",
+                correo="superadmin@fashionstore.com",
+                telefono="00000000",
+                contrasena_hash=get_password_hash("SuperAdmin123!"),
+                estado=EstadoUsuario.ACTIVO,
+                tenant_id=None,
+            )
+            db.add(superadmin)
+            await db.flush()
+
+        result = await db.execute(select(Rol).where(Rol.nombre == "Super Administrador"))
+        super_rol = result.scalar_one_or_none()
+        if super_rol:
+            result = await db.execute(
+                select(UsuarioRol).where(
+                    UsuarioRol.usuario_id == superadmin.id,
+                    UsuarioRol.rol_id == super_rol.id,
+                )
+            )
+            if result.scalar_one_or_none() is None:
+                # El rol de plataforma no pertenece a un tenant; se usa el demo
+                # para satisfacer la FK NOT NULL de la tabla puente.
+                db.add(UsuarioRol(
+                    usuario_id=superadmin.id,
+                    rol_id=super_rol.id,
+                    tenant_id=tenant.id,
+                ))
+
+        # ------------------------------------------------------------
+        # 7. Administrador del tenant demo
+        # ------------------------------------------------------------
         result = await db.execute(
             select(Usuario).where(Usuario.correo == "admin@fashionstore.com")
         )
-        if not result.scalar_one_or_none():
+        admin_user = result.scalar_one_or_none()
+        if admin_user is None:
             admin_user = Usuario(
                 nombre="Administrador",
                 apellido="Sistema",
                 correo="admin@fashionstore.com",
                 telefono="00000000",
                 contrasena_hash=get_password_hash("Admin123!"),
-                estado=EstadoUsuario.ACTIVO
+                estado=EstadoUsuario.ACTIVO,
+                tenant_id=tenant.id,
             )
             db.add(admin_user)
             await db.flush()
-            
-            # Asignar rol Administrador
+        elif admin_user.tenant_id is None:
+            admin_user.tenant_id = tenant.id
+
+        result = await db.execute(select(Rol).where(Rol.nombre == "Administrador"))
+        admin_rol = result.scalar_one_or_none()
+        if admin_rol:
             result = await db.execute(
-                select(Rol).where(Rol.nombre == "Administrador")
+                select(UsuarioRol).where(
+                    UsuarioRol.usuario_id == admin_user.id,
+                    UsuarioRol.rol_id == admin_rol.id,
+                )
             )
-            admin_rol = result.scalar_one_or_none()
-            
-            if admin_rol:
-                usuario_rol = UsuarioRol(usuario_id=admin_user.id, rol_id=admin_rol.id)
-                db.add(usuario_rol)
-            
-            # Crear registro de administrador
-            admin = Administrador(usuario_id=admin_user.id)
-            db.add(admin)
+            if result.scalar_one_or_none() is None:
+                db.add(UsuarioRol(
+                    usuario_id=admin_user.id,
+                    rol_id=admin_rol.id,
+                    tenant_id=tenant.id,
+                ))
+
+        result = await db.execute(
+            select(Administrador).where(Administrador.usuario_id == admin_user.id)
+        )
+        if result.scalar_one_or_none() is None:
+            db.add(Administrador(usuario_id=admin_user.id, tenant_id=tenant.id))
         
         await db.commit()

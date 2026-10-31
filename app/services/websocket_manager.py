@@ -1,8 +1,11 @@
 """
 Gestor de conexiones WebSocket para actualizaciones en tiempo real.
-Permite conectar clientes por producto_id y emitir cambios de disponibilidad.
+
+Conserva el canal por producto del Examen 1 y agrega canales genéricos usados
+por la sincronización offline y el pago diferido (plan 9.2.1).
 """
 from typing import Dict, List
+
 from fastapi import WebSocket
 import logging
 
@@ -11,38 +14,60 @@ logger = logging.getLogger(__name__)
 
 class ConnectionManager:
     def __init__(self):
-        # Mapea producto_id -> lista de WebSockets conectados
-        self.active_connections: Dict[int, List[WebSocket]] = {}
+        # canal (str) -> lista de WebSockets conectados
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+
+    # --------------------------------------------------------
+    # Canales genéricos (Examen 2)
+    # --------------------------------------------------------
+    async def conectar_canal(self, websocket: WebSocket, canal: str) -> None:
+        await websocket.accept()
+        self.active_connections.setdefault(str(canal), []).append(websocket)
+        logger.info(
+            "WebSocket conectado al canal %s. Total: %s",
+            canal,
+            len(self.active_connections[str(canal)]),
+        )
+
+    def desconectar_canal(self, websocket: WebSocket, canal: str) -> None:
+        clave = str(canal)
+        conexiones = self.active_connections.get(clave)
+        if conexiones and websocket in conexiones:
+            conexiones.remove(websocket)
+        if conexiones is not None and not conexiones:
+            self.active_connections.pop(clave, None)
+        logger.info("WebSocket desconectado del canal %s", canal)
+
+    async def difundir_canal(self, canal: str, mensaje: dict) -> None:
+        conexiones = list(self.active_connections.get(str(canal), []))
+        desconectados: List[WebSocket] = []
+        for conexion in conexiones:
+            try:
+                await conexion.send_json(mensaje)
+            except Exception as exc:  # pragma: no cover - depende del socket
+                logger.warning("Error enviando mensaje WS al canal %s: %s", canal, exc)
+                desconectados.append(conexion)
+        for conexion in desconectados:
+            self.desconectar_canal(conexion, canal)
+
+    # --------------------------------------------------------
+    # Compatibilidad con el canal por producto del Examen 1
+    # --------------------------------------------------------
+    @staticmethod
+    def _canal_producto(producto_id: int) -> str:
+        return f"producto:{producto_id}"
 
     async def connect(self, websocket: WebSocket, producto_id: int):
-        await websocket.accept()
-        if producto_id not in self.active_connections:
-            self.active_connections[producto_id] = []
-        self.active_connections[producto_id].append(websocket)
-        logger.info(f"WebSocket cliente conectado al producto #{producto_id}. Total: {len(self.active_connections[producto_id])}")
+        await self.conectar_canal(websocket, self._canal_producto(producto_id))
 
     def disconnect(self, websocket: WebSocket, producto_id: int):
-        if producto_id in self.active_connections:
-            if websocket in self.active_connections[producto_id]:
-                self.active_connections[producto_id].remove(websocket)
-            if not self.active_connections[producto_id]:
-                del self.active_connections[producto_id]
-        logger.info(f"WebSocket cliente desconectado del producto #{producto_id}")
+        self.desconectar_canal(websocket, self._canal_producto(producto_id))
 
     async def send_personal_message(self, message: dict, websocket: WebSocket):
         await websocket.send_json(message)
 
     async def broadcast_to_product(self, producto_id: int, message: dict):
-        if producto_id in self.active_connections:
-            disconnected = []
-            for connection in self.active_connections[producto_id]:
-                try:
-                    await connection.send_json(message)
-                except Exception as e:
-                    logger.warning(f"Error enviando mensaje WS al cliente: {e}")
-                    disconnected.append(connection)
-            for dead_conn in disconnected:
-                self.disconnect(dead_conn, producto_id)
+        await self.difundir_canal(self._canal_producto(producto_id), message)
 
 
 manager = ConnectionManager()

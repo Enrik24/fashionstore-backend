@@ -3,6 +3,8 @@ Módulos de seguridad: JWT, hashing de contraseñas y verificación de tokens.
 """
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
+import uuid
+
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from fastapi import HTTPException, status, Depends, Request
@@ -96,6 +98,93 @@ def create_refresh_token(data: Dict[str, Any]) -> str:
     return encoded_jwt
 
 
+def construir_claims_usuario(usuario) -> Dict[str, Any]:
+    """[EXAMEN-2] Claims del token con tenant, super admin y roles."""
+    roles = [getattr(r, "nombre", None) for r in (getattr(usuario, "roles", None) or [])]
+    roles = [r for r in roles if r]
+    return {
+        "sub": str(usuario.id),
+        "correo": usuario.correo,
+        "tenant_id": getattr(usuario, "tenant_id", None),
+        "es_super_admin": getattr(usuario, "tenant_id", None) is None and "Super Administrador" in roles,
+        "roles": roles,
+    }
+
+
+def create_offline_token(
+    data: Dict[str, Any],
+    expires_delta: Optional[timedelta] = None,
+) -> str:
+    """[EXAMEN-2] CU17: JWT de propósito `offline` de vigencia corta.
+
+    El backend no persiste tokens offline (plan, 3.7.10); la vigencia se
+    controla con `ConfiguracionOffline.max_horas_sesion_offline`.
+    """
+    to_encode = data.copy()
+    if "sub" in to_encode:
+        to_encode["sub"] = str(to_encode["sub"])
+    if expires_delta is None:
+        expires_delta = timedelta(hours=settings.OFFLINE_SESION_HORAS_DEFECTO)
+    ahora = datetime.utcnow()
+    expire = ahora + expires_delta
+    to_encode.setdefault("sesion_iniciada", ahora.isoformat())
+    to_encode.update({
+        "jti": uuid.uuid4().hex,
+        "iat": ahora,
+        "exp": expire,
+        "type": "offline",
+        "proposito": "offline",
+    })
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+async def verify_offline_token(token: str, db: AsyncSession) -> Dict[str, Any]:
+    """[EXAMEN-2] Valida firma, propósito, usuario, tenant y dispositivo."""
+    from app.apps.operaciones_offline.models import DispositivoSincronizacion
+    from app.apps.gestion_usuarios.models import EstadoUsuario, Usuario
+    from app.apps.gestion_saas.models import EstadoTenant, Tenant
+
+    payload = decode_token(token)
+    if payload.get("proposito") != "offline" or payload.get("type") != "offline":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El token no es de propósito offline",
+        )
+
+    try:
+        usuario_id = int(payload.get("sub"))
+        tenant_id = int(payload.get("tenant_id"))
+        dispositivo_id = payload.get("dispositivo_id")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token offline inválido")
+
+    result = await db.execute(select(Usuario).where(Usuario.id == usuario_id))
+    usuario = result.scalar_one_or_none()
+    if usuario is None or usuario.estado != EstadoUsuario.ACTIVO:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Usuario inactivo")
+    if usuario.tenant_id != tenant_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Token de otro tenant")
+    if not usuario.offline_pin_hash:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="PIN no configurado")
+
+    result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+    tenant = result.scalar_one_or_none()
+    if tenant is None or tenant.estado in (EstadoTenant.SUSPENDIDO, EstadoTenant.CANCELADO):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant suspendido")
+
+    result = await db.execute(
+        select(DispositivoSincronizacion).where(
+            DispositivoSincronizacion.id == dispositivo_id,
+            DispositivoSincronizacion.tenant_id == tenant_id,
+            DispositivoSincronizacion.activo.is_(True),
+        )
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Dispositivo revocado")
+
+    return payload
+
+
 def decode_token(token: str) -> Dict[str, Any]:
     """
     Decodifica y verifica un token JWT.
@@ -141,6 +230,13 @@ async def get_current_user(
     
     token = credentials.credentials
     payload = decode_token(token)
+
+    # [EXAMEN-2] Un token offline no sirve para endpoints que exigen conexión
+    if payload.get("proposito") == "offline" or payload.get("type") == "offline":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Se requiere un token de acceso en línea",
+        )
     
     user_id_raw = payload.get("sub")
     if user_id_raw is None:
@@ -181,6 +277,40 @@ async def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Usuario inactivo o bloqueado"
         )
+
+    # [EXAMEN-2] El token no puede cambiar de tenant y el tenant no puede estar cancelado
+    claim_tenant = payload.get("tenant_id")
+    if claim_tenant is not None and int(claim_tenant) != user.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="El token pertenece a otro tenant",
+        )
+    if user.tenant_id is not None:
+        from app.apps.gestion_saas.models import EstadoTenant, Tenant
+
+        result = await db.execute(select(Tenant).where(Tenant.id == user.tenant_id))
+        tenant = result.scalar_one_or_none()
+        if tenant is None or tenant.estado == EstadoTenant.CANCELADO:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tenant cancelado o inexistente",
+            )
+        # [EXAMEN-2] RN-004: un tenant suspendido no puede operar ni con un token vigente
+        if tenant.estado == EstadoTenant.SUSPENDIDO:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="La empresa está suspendida",
+            )
+
+    # [EXAMEN-2] Contexto para logging/auditoría (plan, 4.5)
+    from app.tenant import es_super_admin, set_tenant_context
+
+    set_tenant_context(
+        tenant_id=user.tenant_id,
+        usuario_id=user.id,
+        es_super_admin=es_super_admin(user),
+        roles=[r.nombre for r in (user.roles or [])],
+    )
     
     return user
 
@@ -201,6 +331,9 @@ async def get_optional_current_user(
 
         token = credentials.credentials
         payload = decode_token(token)
+        # [EXAMEN-2] Ignorar tokens offline en endpoints públicos
+        if payload.get("proposito") == "offline" or payload.get("type") == "offline":
+            return None
         user_id_raw = payload.get("sub")
         if user_id_raw is None:
             return None

@@ -7,6 +7,7 @@ Puebla la base de datos con los datos reales del negocio, de forma idempotente:
 - Categorías, Tallas, Colores
 - Productos con costo, género, imágenes Cloudinary y asociaciones a colecciones
 - Variantes (Talla x Color) e inventario por sucursal
+  (el precio de cada variante se calcula automáticamente según la talla)
 - Promociones con alcances y Cupones
 - Usuarios por tipo (Admin, Encargado, Cajero, Clientes) + tablas heredadas
 
@@ -19,7 +20,7 @@ Uso:
 import asyncio
 import json
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Dict, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -28,6 +29,10 @@ from app.database import engine, Base, AsyncSessionLocal
 from app.security import get_password_hash
 import app.apps.gestion_ventas.models
 import app.apps.servicios_inteligentes.models
+# [EXAMEN-2] Fase 2.5: registrar todos los mappers antes de create_all; el seed
+# debe poder correr sobre una base nueva con las tablas de la Fase 2.
+import app.apps.operaciones_offline.models
+import app.apps.pagos_diferidos.models
 from app.apps.gestion_usuarios.models import (
     Usuario, Rol, Permiso, UsuarioRol, RolPermiso,
     Cliente, Administrador, EncargadoSucursal, Cajero, EstadoUsuario
@@ -104,11 +109,15 @@ async def seed_roles(db: AsyncSession, permisos: dict) -> dict:
         ("Encargado", "Encargado de sucursal", [
             "gestionar_sucursales", "gestionar_inventario",
             "gestionar_reservas", "gestionar_ventas", "ver_kpis", "ver_reportes",
-            "gestionar_devoluciones", "usar_asistente_ia"
+            "gestionar_devoluciones", "usar_asistente_ia", "sincronizar_offline",
+            "operar_offline"
         ]),
         ("Cajero", "Cajero de sucursal", [
-            "gestionar_ventas", "procesar_pagos", "usar_asistente_ia"
+            "gestionar_ventas", "procesar_pagos", "usar_asistente_ia",
+            "sincronizar_offline", "operar_offline"
         ]),
+        # [EXAMEN-2] Rol de plataforma
+        ("Super Administrador", "Super Administrador de la plataforma SaaS", todos),
     ]
     
     roles = {}
@@ -117,7 +126,11 @@ async def seed_roles(db: AsyncSession, permisos: dict) -> dict:
         res = await db.execute(select(Rol).where(Rol.nombre == nombre))
         rol = res.scalar_one_or_none()
         if not rol:
-            rol = Rol(nombre=nombre, descripcion=desc)
+            rol = Rol(
+                nombre=nombre,
+                descripcion=desc,
+                tenant_id=None if nombre == "Super Administrador" else None,
+            )
             db.add(rol)
             await db.flush()
             creados += 1
@@ -160,12 +173,10 @@ async def seed_ciudades_y_sucursales(db: AsyncSession) -> Dict[str, Sucursal]:
             await db.flush()
         ciudades_map[nombre_c] = c_obj
 
+    # [EXAMEN-2] Fase 2.5 (D-5): la demo queda con 2 sucursales operativas.
     sucursales_data = [
         ('Sucursal Central', 'Av. Monseñor Rivero #300, Santa Cruz', '33123456', '09:00 - 21:00', -17.7833, -63.1821, 'Santa Cruz de la Sierra', 'ACTIVO'),
         ('Sucursal Equipetrol', 'Av. San Martín y Calle 5 Este, Santa Cruz', '33987654', '10:00 - 22:00', -17.7654, -63.195, 'Santa Cruz de la Sierra', 'ACTIVO'),
-        ('Sucursal Ventura Mall', '4to Anillo y Av. San Martín, Santa Cruz', '33456789', '10:00 - 22:00', -17.755, -63.198, 'Santa Cruz de la Sierra', 'ACTIVO'),
-        ('Sucursal Calacoto', 'Av. Ballivián #1200, La Paz', '22789012', '09:00 - 20:00', -16.539, -68.089, 'La Paz', 'ACTIVO'),
-        ('Sucursal Cochabamba Plaza', 'Av. Heroínas #450, Cochabamba', '44123456', '09:00 - 20:00', -17.3935, -66.157, 'Cochabamba', 'ACTIVO'),
     ]
 
     sucursales_map = {}
@@ -337,6 +348,43 @@ async def seed_caracteristicas(db: AsyncSession):
 # 5. PRODUCTOS, VARIANTES, INVENTARIO Y COLECCIONES
 # =====================================================================
 
+# Variación de precio por talla: la talla base (M en ropa, 32 en numeración)
+# conserva el precio del producto y cada talla mayor cuesta un poco más.
+# Así un producto de talla M queda más barato que el mismo en talla L.
+FACTORES_PRECIO_TALLA = {
+    'XS': Decimal("0.94"),
+    'S': Decimal("0.97"),
+    'M': Decimal("1.00"),
+    'L': Decimal("1.03"),
+    'XL': Decimal("1.06"),
+    'XXL': Decimal("1.09"),
+}
+
+TALLAS_NUMERICAS = ['28', '29', '30', '31', '32', '33', '34', '35', '36']
+TALLA_NUMERICA_BASE = '32'
+PASO_PRECIO_TALLA_NUMERICA = Decimal("0.015")
+
+
+def calcular_precio_variante(precio_base: Decimal, talla: Optional[str]) -> Decimal:
+    """Calcula el precio de una variante a partir del precio base y su talla.
+
+    - Ropa (XS..XXL): +/-3% por paso, tomando la talla M como referencia.
+    - Numeración (28..36): 1.5% por número, tomando la talla 32 como referencia.
+    - Sin talla (gorras, cinturones, etc.): conserva el precio base.
+    """
+    if not talla:
+        factor = Decimal("1.00")
+    elif talla in FACTORES_PRECIO_TALLA:
+        factor = FACTORES_PRECIO_TALLA[talla]
+    elif talla in TALLAS_NUMERICAS:
+        desplazamiento = TALLAS_NUMERICAS.index(talla) - TALLAS_NUMERICAS.index(TALLA_NUMERICA_BASE)
+        factor = Decimal("1.00") + desplazamiento * PASO_PRECIO_TALLA_NUMERICA
+    else:
+        factor = Decimal("1.00")
+
+    return (precio_base * factor).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+
+
 async def seed_productos_y_stock(db, sucursales, temp_map, col_map):
     """Registra productos, variantes, inventario y asociaciones a colecciones."""
     cats = (await db.execute(select(Categoria))).scalars().all()
@@ -399,7 +447,8 @@ async def seed_productos_y_stock(db, sucursales, temp_map, col_map):
                     "sku": 'PRD-6274-4-6',
                     "talla": 'L',
                     "color": 'Verde',
-                    "precio_variante": Decimal("249.0"),
+                    # Antes tenia 249.0 (menos que la talla M); se deja al calculo por talla
+                    "precio_variante": None,
                     "costo_variante": None,
                     "stock": {'Sucursal Central': {'cantidad': 20, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Equipetrol': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Ventura Mall': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Calacoto': {'cantidad': 8, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Cochabamba Plaza': {'cantidad': 8, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
                 },
@@ -434,6 +483,23 @@ async def seed_productos_y_stock(db, sucursales, temp_map, col_map):
                     "precio_variante": Decimal("249.0"),
                     "costo_variante": None,
                     "stock": {'Sucursal Central': {'cantidad': 18, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Equipetrol': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Ventura Mall': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Calacoto': {'cantidad': 6, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Cochabamba Plaza': {'cantidad': 6, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
+                },
+                # Variantes de color Negro heredadas del producto duplicado PRD-9730
+                {
+                    "sku": 'PRD-9730-3-1',
+                    "talla": 'M',
+                    "color": 'Negro',
+                    "precio_variante": None,
+                    "costo_variante": None,
+                    "stock": {'Sucursal Central': {'cantidad': 25, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Equipetrol': {'cantidad': 12, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Ventura Mall': {'cantidad': 12, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Calacoto': {'cantidad': 8, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Cochabamba Plaza': {'cantidad': 8, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
+                },
+                {
+                    "sku": 'PRD-9730-4-1',
+                    "talla": 'L',
+                    "color": 'Negro',
+                    "precio_variante": Decimal("249.0"),
+                    "costo_variante": None,
+                    "stock": {'Sucursal Central': {'cantidad': 20, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Equipetrol': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Ventura Mall': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Calacoto': {'cantidad': 6, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Cochabamba Plaza': {'cantidad': 6, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
                 },
             ],
         },
@@ -501,38 +567,42 @@ async def seed_productos_y_stock(db, sucursales, temp_map, col_map):
                 },
             ],
         },
-        {
-            "sku": 'PRD-9730',
-            "nombre": 'CAT Polera Heritage Peoria Graphic Hombre',
-            "descripcion": 'La Caterpillar Heritage Peoria Graphic Tee (4010755-13013) es una polera para hombre que rinde homenaje al legado industrial de la marca. Su diseño clásico en color negro profundo combina comodidad y durabilidad, convirtiéndola en una prenda esencial para un estilo casual con carácter auténtico.',
-            "precio": Decimal("249.0"),
-            "costo_compra": Decimal("149.4"),
-            "genero": 'HOMBRE',
-            "estado": 'ACTIVO',
-            "categoria": 'Poleras',
-            "temporada": 'Primavera - Verano 2026',
-            "proveedor": 'CAT S.A.',
-            "imagenes": '["https://res.cloudinary.com/dw9etiykm/image/upload/v1789103405/fashionstore/productos/epy4rmnfuwwct1bximd3.jpg", "https://res.cloudinary.com/dw9etiykm/image/upload/v1789103404/fashionstore/productos/dm2grh2phghazebpaiul.jpg"]',
-            "colecciones": ['Urban Casual & Heritage 2026'],
-            "variantes": [
-                {
-                    "sku": 'PRD-9730-3-1',
-                    "talla": 'M',
-                    "color": 'Negro',
-                    "precio_variante": None,
-                    "costo_variante": None,
-                    "stock": {'Sucursal Central': {'cantidad': 25, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Equipetrol': {'cantidad': 12, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Ventura Mall': {'cantidad': 12, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Calacoto': {'cantidad': 8, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Cochabamba Plaza': {'cantidad': 8, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
-                },
-                {
-                    "sku": 'PRD-9730-4-1',
-                    "talla": 'L',
-                    "color": 'Negro',
-                    "precio_variante": Decimal("249.0"),
-                    "costo_variante": None,
-                    "stock": {'Sucursal Central': {'cantidad': 20, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Equipetrol': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Ventura Mall': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Calacoto': {'cantidad': 6, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Cochabamba Plaza': {'cantidad': 6, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
-                },
-            ],
-        },
+        # ---------------------------------------------------------------------
+        # DUPLICADO DESHABILITADO: mismo nombre que PRD-7989.
+        # Sus variantes de color Negro (M y L) fueron movidas a PRD-7989.
+        # ---------------------------------------------------------------------
+        # {
+        #     "sku": 'PRD-9730',
+        #     "nombre": 'CAT Polera Heritage Peoria Graphic Hombre',
+        #     "descripcion": 'La Caterpillar Heritage Peoria Graphic Tee (4010755-13013) es una polera para hombre que rinde homenaje al legado industrial de la marca. Su diseño clásico en color negro profundo combina comodidad y durabilidad, convirtiéndola en una prenda esencial para un estilo casual con carácter auténtico.',
+        #     "precio": Decimal("249.0"),
+        #     "costo_compra": Decimal("149.4"),
+        #     "genero": 'HOMBRE',
+        #     "estado": 'ACTIVO',
+        #     "categoria": 'Poleras',
+        #     "temporada": 'Primavera - Verano 2026',
+        #     "proveedor": 'CAT S.A.',
+        #     "imagenes": '["https://res.cloudinary.com/dw9etiykm/image/upload/v1789103405/fashionstore/productos/epy4rmnfuwwct1bximd3.jpg", "https://res.cloudinary.com/dw9etiykm/image/upload/v1789103404/fashionstore/productos/dm2grh2phghazebpaiul.jpg"]',
+        #     "colecciones": ['Urban Casual & Heritage 2026'],
+        #     "variantes": [
+        #         {
+        #             "sku": 'PRD-9730-3-1',
+        #             "talla": 'M',
+        #             "color": 'Negro',
+        #             "precio_variante": None,
+        #             "costo_variante": None,
+        #             "stock": {'Sucursal Central': {'cantidad': 25, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Equipetrol': {'cantidad': 12, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Ventura Mall': {'cantidad': 12, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Calacoto': {'cantidad': 8, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Cochabamba Plaza': {'cantidad': 8, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
+        #         },
+        #         {
+        #             "sku": 'PRD-9730-4-1',
+        #             "talla": 'L',
+        #             "color": 'Negro',
+        #             "precio_variante": Decimal("249.0"),
+        #             "costo_variante": None,
+        #             "stock": {'Sucursal Central': {'cantidad': 20, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Equipetrol': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Ventura Mall': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Calacoto': {'cantidad': 6, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Cochabamba Plaza': {'cantidad': 6, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
+        #         },
+        #     ],
+        # },
         {
             "sku": 'PRD-1009',
             "nombre": 'Gorra Cat Logo Hombre Yellow',
@@ -666,6 +736,15 @@ async def seed_productos_y_stock(db, sucursales, temp_map, col_map):
                     "precio_variante": Decimal("990.0"),
                     "costo_variante": None,
                     "stock": {'Sucursal Central': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Equipetrol': {'cantidad': 5, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Ventura Mall': {'cantidad': 5, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Calacoto': {'cantidad': 4, 'reservada': 0, 'vendida': 0, 'minimo': 5}, 'Sucursal Cochabamba Plaza': {'cantidad': 4, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
+                },
+                # Variante talla XS heredada del producto duplicado PRD-3018
+                {
+                    "sku": 'PRD-3018-T1-C1',
+                    "talla": 'XS',
+                    "color": 'Negro',
+                    "precio_variante": None,
+                    "costo_variante": None,
+                    "stock": {'Sucursal Central': {'cantidad': 15, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
                 },
             ],
         },
@@ -1045,46 +1124,51 @@ async def seed_productos_y_stock(db, sucursales, temp_map, col_map):
                 },
             ],
         },
-        {
-            "sku": 'PRD-3018',
-            "nombre": 'CAT Chaqueta Softshell Hombre',
-            "descripcion": 'La CAT Softshell Jacket está diseñada para ofrecer protección, flexibilidad y confort en actividades dinámicas. Su construcción técnica combina resistencia al clima con una excelente movilidad, convirtiéndola en una prenda ideal para el trabajo activo y el uso diario en exteriores.\n\nEquipada con tecnología Storm Blocker™, ayuda a repeler el agua, bloquear el viento y mantener una óptima transpirabilidad. Su tejido FlexShell elástico se adapta naturalmente a cada movimiento, mientras que el interior de microforro polar proporciona una agradable sensación de abrigo ligero en condiciones frescas.\n\nIncorpora detalles funcionales como ventilación mediante cremalleras en las axilas, puños ajustables y cordón regulable en el dobladillo para mejorar el confort durante el uso. Además, los refuerzos de nailon en los codos aumentan la durabilidad en zonas de mayor desgaste, mientras que los detalles reflectantes ayudan a mejorar la visibilidad en condiciones de poca luz.',
-            "precio": Decimal("1000.0"),
-            "costo_compra": Decimal("600.0"),
-            "genero": 'HOMBRE',
-            "estado": 'ACTIVO',
-            "categoria": 'Abrigos',
-            "temporada": 'Otoño - Invierno 2026',
-            "proveedor": 'Confecciones del Valle',
-            "imagenes": '["https://res.cloudinary.com/dw9etiykm/image/upload/v1789705379/fashionstore/productos/swif5yawaylusaacmm98.jpg", "https://res.cloudinary.com/dw9etiykm/image/upload/v1789705376/fashionstore/productos/gch8zr3jfv4sycvxrbkk.jpg"]',
-            "colecciones": [],
-            "variantes": [
-                {
-                    "sku": 'PRD-3018-T1-C1',
-                    "talla": 'XS',
-                    "color": 'Negro',
-                    "precio_variante": None,
-                    "costo_variante": None,
-                    "stock": {'Sucursal Central': {'cantidad': 15, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
-                },
-                {
-                    "sku": 'PRD-3018-T3-C1',
-                    "talla": 'M',
-                    "color": 'Negro',
-                    "precio_variante": None,
-                    "costo_variante": None,
-                    "stock": {'Sucursal Central': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
-                },
-                {
-                    "sku": 'PRD-3018-T4-C1',
-                    "talla": 'L',
-                    "color": 'Negro',
-                    "precio_variante": None,
-                    "costo_variante": None,
-                    "stock": {'Sucursal Central': {'cantidad': 9, 'reservada': 0, 'vendida': 1, 'minimo': 5}},
-                },
-            ],
-        },
+        # ---------------------------------------------------------------------
+        # DUPLICADO DESHABILITADO: mismo nombre y descripcion que PRD-9453.
+        # Su variante talla XS fue movida a PRD-9453; las tallas M y L ya
+        # existen alli con stock en todas las sucursales.
+        # ---------------------------------------------------------------------
+        # {
+        #     "sku": 'PRD-3018',
+        #     "nombre": 'CAT Chaqueta Softshell Hombre',
+        #     "descripcion": 'La CAT Softshell Jacket está diseñada para ofrecer protección, flexibilidad y confort en actividades dinámicas. Su construcción técnica combina resistencia al clima con una excelente movilidad, convirtiéndola en una prenda ideal para el trabajo activo y el uso diario en exteriores.\n\nEquipada con tecnología Storm Blocker™, ayuda a repeler el agua, bloquear el viento y mantener una óptima transpirabilidad. Su tejido FlexShell elástico se adapta naturalmente a cada movimiento, mientras que el interior de microforro polar proporciona una agradable sensación de abrigo ligero en condiciones frescas.\n\nIncorpora detalles funcionales como ventilación mediante cremalleras en las axilas, puños ajustables y cordón regulable en el dobladillo para mejorar el confort durante el uso. Además, los refuerzos de nailon en los codos aumentan la durabilidad en zonas de mayor desgaste, mientras que los detalles reflectantes ayudan a mejorar la visibilidad en condiciones de poca luz.',
+        #     "precio": Decimal("1000.0"),
+        #     "costo_compra": Decimal("600.0"),
+        #     "genero": 'HOMBRE',
+        #     "estado": 'ACTIVO',
+        #     "categoria": 'Abrigos',
+        #     "temporada": 'Otoño - Invierno 2026',
+        #     "proveedor": 'Confecciones del Valle',
+        #     "imagenes": '["https://res.cloudinary.com/dw9etiykm/image/upload/v1789705379/fashionstore/productos/swif5yawaylusaacmm98.jpg", "https://res.cloudinary.com/dw9etiykm/image/upload/v1789705376/fashionstore/productos/gch8zr3jfv4sycvxrbkk.jpg"]',
+        #     "colecciones": [],
+        #     "variantes": [
+        #         {
+        #             "sku": 'PRD-3018-T1-C1',
+        #             "talla": 'XS',
+        #             "color": 'Negro',
+        #             "precio_variante": None,
+        #             "costo_variante": None,
+        #             "stock": {'Sucursal Central': {'cantidad': 15, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
+        #         },
+        #         {
+        #             "sku": 'PRD-3018-T3-C1',
+        #             "talla": 'M',
+        #             "color": 'Negro',
+        #             "precio_variante": None,
+        #             "costo_variante": None,
+        #             "stock": {'Sucursal Central': {'cantidad': 10, 'reservada': 0, 'vendida': 0, 'minimo': 5}},
+        #         },
+        #         {
+        #             "sku": 'PRD-3018-T4-C1',
+        #             "talla": 'L',
+        #             "color": 'Negro',
+        #             "precio_variante": None,
+        #             "costo_variante": None,
+        #             "stock": {'Sucursal Central': {'cantidad': 9, 'reservada': 0, 'vendida': 1, 'minimo': 5}},
+        #         },
+        #     ],
+        # },
         {
             "sku": 'PRD-4928',
             "nombre": 'Pantalon Hombre Ripstop Cargo Khaki',
@@ -1868,6 +1952,11 @@ async def seed_productos_y_stock(db, sucursales, temp_map, col_map):
         for v_item in item["variantes"]:
             t_id = talla_map.get(v_item["talla"])
             c_id = color_map.get(v_item["color"])
+            # Precio por talla: si la variante no define precio o lo dejaron igual
+            # al del producto, se calcula automaticamente según la talla.
+            precio_variante = v_item["precio_variante"]
+            if precio_variante is None or precio_variante == item["precio"]:
+                precio_variante = calcular_precio_variante(item["precio"], v_item["talla"])
             res_v = await db.execute(
                 select(VarianteProducto).where(VarianteProducto.sku_variante == v_item["sku"]))
             var_obj = res_v.scalar_one_or_none()
@@ -1877,12 +1966,16 @@ async def seed_productos_y_stock(db, sucursales, temp_map, col_map):
                     talla_id=t_id,
                     color_id=c_id,
                     sku_variante=v_item["sku"],
-                    precio_variante=v_item["precio_variante"],
+                    precio_variante=precio_variante,
                     costo_variante=v_item["costo_variante"]
                 )
                 db.add(var_obj)
                 await db.flush()
                 total_vars += 1
+            else:
+                # Mantiene sincronizado el precio por talla en variantes ya creadas
+                var_obj.precio_variante = precio_variante
+                await db.flush()
 
             for suc_nombre, st in v_item["stock"].items():
                 if suc_nombre not in sucursales:
@@ -2143,12 +2236,24 @@ async def run_seeders():
     
     async with AsyncSessionLocal() as session:
         try:
+            # [EXAMEN-2] Primero el núcleo SaaS: permisos, roles, planes,
+            # tenant demo, suscripción y configuración offline.
+            from app.apps.gestion_usuarios.services import DatosInicialesService
+            from app.tenant import clear_tenant_context, get_tenant_demo, set_tenant_context
+
+            print("\n0. Verificando núcleo SaaS (planes, tenant demo, superadmin)...")
+            await DatosInicialesService.crear_datos_iniciales(session)
+            tenant_demo = await get_tenant_demo(session)
+            if tenant_demo is None:
+                raise RuntimeError("No se pudo crear el tenant demo")
+            set_tenant_context(tenant_demo.id)
+
             print("\n1. Verificando permisos y roles...")
             permisos = await seed_permisos(session)
             roles = await seed_roles(session, permisos)
             
             print("\n2. Verificando datos básicos del catálogo...")
-            await DatosInicialesCatalogoService.crear_datos_iniciales(session)
+            await DatosInicialesCatalogoService.crear_datos_iniciales(session, tenant_id=tenant_demo.id)
             await seed_caracteristicas(session)
             
             print("\n3. Verificando Ciudades y Sucursales...")
@@ -2178,6 +2283,8 @@ async def run_seeders():
             print(f"\n[ERROR] Ocurrió un error durante el seeding: {e}")
             raise e
         finally:
+            from app.tenant import clear_tenant_context
+            clear_tenant_context()
             await engine.dispose()
 
 

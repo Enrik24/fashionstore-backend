@@ -63,3 +63,8 @@ async def drop_db():
     """Elimina todas las tablas de la base de datos."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+
+
+# [EXAMEN-2] Registra el scoping multitenant de SQLAlchemy (ver app/tenant.py).
+# Se importa al final para evitar el ciclo database -> tenant -> database.
+import app.tenant_events  # noqa: E402,F401

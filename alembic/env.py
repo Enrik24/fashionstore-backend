@@ -16,6 +16,10 @@ from app.apps.gestion_usuarios.models import *
 from app.apps.gestion_catalogo.models import *
 from app.apps.gestion_ventas.models import *
 from app.apps.servicios_inteligentes.models import *
+from app.apps.gestion_marketing.models import *  # [EXAMEN-2] promociones con tenant_id
+from app.apps.gestion_saas.models import *  # [EXAMEN-2] Fase 1 SaaS
+from app.apps.operaciones_offline.models import *  # [EXAMEN-2] Fase 1 offline
+from app.apps.pagos_diferidos.models import *  # [EXAMEN-2] Fase 2 pagos
 
 # this is the Alembic Config object
 config = context.config

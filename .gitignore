@@ -64,3 +64,7 @@ htmlcov/
 tmp/
 temp/
 *.tmp
+
+# [EXAMEN-2] Fase 3: artefactos de machine learning (no se versionan)
+modelos_ml/
+*.joblib

@@ -2,7 +2,7 @@
 Modelos SQLAlchemy para la Gestión de Usuarios y Autenticación.
 Contiene: Usuario, Rol, Permiso, Cliente, Administrador, EncargadoSucursal, Cajero, Bitacora.
 """
-from sqlalchemy import Column, Integer, String, DateTime, Date, ForeignKey, Enum, Text, Float, Boolean, JSON
+from sqlalchemy import Column, Integer, String, DateTime, Date, ForeignKey, Enum, Text, Float, Boolean, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
@@ -20,7 +20,12 @@ class EstadoUsuario(str, enum.Enum):
 
 # Modelo: Usuario
 class Usuario(Base):
-    """Tabla de usuarios del sistema."""
+    """Tabla de usuarios del sistema.
+
+    Modificado en Examen 2 (SaaS multitenant): se agrega `tenant_id` (NULL =
+    Super Administrador de plataforma), `offline_pin_hash` y
+    `debe_cambiar_contrasena`.
+    """
     __tablename__ = "usuarios"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -33,8 +38,15 @@ class Usuario(Base):
     estado = Column(Enum(EstadoUsuario), default=EstadoUsuario.ACTIVO, nullable=False)
     fecha_registro = Column(DateTime(timezone=True), server_default=func.now())
     ultimo_acceso = Column(DateTime(timezone=True), nullable=True)
+    # [EXAMEN-2] Aislamiento multitenant (nullable: Super Administrador)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="SET NULL"), nullable=True, index=True)
+    # [EXAMEN-2] CU17: PIN offline hasheado con bcrypt, nunca en claro (RNF-13)
+    offline_pin_hash = Column(String(255), nullable=True)
+    # [EXAMEN-2] Contraseña temporal / primer acceso
+    debe_cambiar_contrasena = Column(Boolean, default=False, server_default="false", nullable=False)
     
     # Relaciones
+    tenant = relationship("Tenant", back_populates="usuarios")
     roles = relationship("Rol", secondary="usuarios_roles", back_populates="usuarios")
     cliente = relationship("Cliente", back_populates="usuario", uselist=False)
     administrador = relationship("Administrador", back_populates="usuario", uselist=False)
@@ -42,6 +54,13 @@ class Usuario(Base):
     cajero = relationship("Cajero", back_populates="usuario", uselist=False)
     bitacoras = relationship("Bitacora", back_populates="usuario")
     dispositivos_fcm = relationship("DispositivoFCM", back_populates="usuario", cascade="all, delete-orphan")
+    # [EXAMEN-2] CU17: dispositivos autorizados a operar offline
+    dispositivos = relationship(
+        "DispositivoSincronizacion",
+        back_populates="usuario",
+        foreign_keys="DispositivoSincronizacion.usuario_id",
+        cascade="all, delete-orphan",
+    )
     
     def __repr__(self):
         return f"<Usuario {self.correo}>"
@@ -49,12 +68,19 @@ class Usuario(Base):
 
 # Modelo: Rol
 class Rol(Base):
-    """Tabla de roles del sistema."""
+    """Tabla de roles del sistema.
+
+    Modificado en Examen 2 (SaaS multitenant): se agrega `tenant_id`
+    (NULL = rol de plataforma). El nombre sigue siendo único global para no
+    romper el login del Examen 1 (plan, 3.7.1).
+    """
     __tablename__ = "roles"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     nombre = Column(String(50), unique=True, nullable=False)
     descripcion = Column(Text, nullable=True)
+    # [EXAMEN-2] NULL = rol de plataforma (Super Administrador)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="SET NULL"), nullable=True, index=True)
     
     # Relaciones
     permisos = relationship("Permiso", secondary="roles_permisos", back_populates="roles")
@@ -82,12 +108,23 @@ class Permiso(Base):
 
 # Tabla intermedia: Usuario-Rol
 class UsuarioRol(Base):
-    """Tabla intermedia para la relación N:M entre Usuario y Rol."""
+    """Tabla intermedia para la relación N:M entre Usuario y Rol.
+
+    Modificado en Examen 2 (SaaS multitenant): se agrega `tenant_id`
+    NOT NULL y unicidad compuesta `(tenant_id, usuario_id, rol_id)`.
+    Las escrituras deben crear `UsuarioRol` explícitamente para copiar el
+    tenant del usuario (no usar `usuario.roles.append`).
+    """
     __tablename__ = "usuarios_roles"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "usuario_id", "rol_id", name="uq_usuarios_roles_tenant_usuario_rol"),
+    )
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False)
     rol_id = Column(Integer, ForeignKey("roles.id", ondelete="CASCADE"), nullable=False)
+    # [EXAMEN-2] Se copia del usuario al asignar el rol
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
     
     def __repr__(self):
         return f"<UsuarioRol usuario={self.usuario_id} rol={self.rol_id}>"
@@ -108,14 +145,34 @@ class RolPermiso(Base):
 
 # Modelo: Cliente
 class Cliente(Base):
-    """Tabla de clientes registrados en la plataforma."""
+    """Tabla de clientes registrados en la plataforma.
+
+    Modificado en Examen 2 (SaaS multitenant): se agrega `tenant_id`,
+    contacto, fechas de sincronización y baja lógica; `usuario_id` y
+    `nit_ci` pasan a nullable (cliente creado offline) con unicidad
+    compuesta por tenant (plan, 3.4 y 3.6).
+    """
     __tablename__ = "clientes"
+    __table_args__ = (
+        UniqueConstraint("usuario_id", "tenant_id", name="uq_clientes_usuario_tenant"),
+        UniqueConstraint("tenant_id", "nit_ci", name="uq_clientes_tenant_nit_ci"),
+    )
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False, unique=True)
-    nit_ci = Column(String(20), unique=True, nullable=False)
+    usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=True)
+    nit_ci = Column(String(20), nullable=True)
     direccion_envio = Column(String(500), nullable=True)
     preferencias = Column(JSON, nullable=True)  # JSON nativo (Postgres JSON, SQLite TEXT)
+    # [EXAMEN-2] Aislamiento multitenant
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    # [EXAMEN-2] Datos de contacto para clientes creados offline
+    telefono = Column(String(20), nullable=True)
+    correo = Column(String(255), nullable=True)
+    # [EXAMEN-2] Descarga incremental y baja lógica (RNF-14)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+    # [EXAMEN-2] Fase 3: cliente generado para demostraciones o entrenamiento (RF-023)
+    es_sintetico = Column(Boolean, nullable=False, default=False, server_default="false", index=True)
     
     # Relaciones
     usuario = relationship("Usuario", back_populates="cliente")
@@ -130,11 +187,17 @@ class Cliente(Base):
 
 # Modelo: Administrador
 class Administrador(Base):
-    """Tabla de administradores del sistema."""
+    """Tabla de administradores del sistema.
+
+    Modificado en Examen 2 (SaaS multitenant): se agrega `tenant_id`
+    NOT NULL. Es el mismo actor que "Administrador de Tenant" (plan, 3.7.7).
+    """
     __tablename__ = "administradores"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False, unique=True)
+    # [EXAMEN-2] Aislamiento multitenant (se copia del usuario)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
     
     # Relaciones
     usuario = relationship("Usuario", back_populates="administrador")
@@ -146,12 +209,17 @@ class Administrador(Base):
 
 # Modelo: Encargado de Sucursal
 class EncargadoSucursal(Base):
-    """Tabla de encargado de sucursal."""
+    """Tabla de encargado de sucursal.
+
+    Modificado en Examen 2 (SaaS multitenant): se agrega `tenant_id` NOT NULL.
+    """
     __tablename__ = "encargados_sucursal"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False)
     sucursal_id = Column(Integer, ForeignKey("sucursales.id", ondelete="CASCADE"), nullable=False)
+    # [EXAMEN-2] Aislamiento multitenant (se copia del usuario)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
     
     # Relaciones
     usuario = relationship("Usuario", back_populates="encargado_sucursal")
@@ -163,12 +231,17 @@ class EncargadoSucursal(Base):
 
 # Modelo: Cajero
 class Cajero(Base):
-    """Tabla de cajeros."""
+    """Tabla de cajeros.
+
+    Modificado en Examen 2 (SaaS multitenant): se agrega `tenant_id` NOT NULL.
+    """
     __tablename__ = "cajeros"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False)
     sucursal_id = Column(Integer, ForeignKey("sucursales.id", ondelete="CASCADE"), nullable=False)
+    # [EXAMEN-2] Aislamiento multitenant (se copia del usuario)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
     
     # Relaciones
     usuario = relationship("Usuario", back_populates="cajero")
@@ -181,12 +254,18 @@ class Cajero(Base):
 
 # Modelo: Bitácora
 class Bitacora(Base):
-    """Tabla de bitácora para auditoría del sistema."""
+    """Tabla de bitácora para auditoría del sistema.
+
+    Modificado en Examen 2 (SaaS multitenant): se agrega `tenant_id`
+    nullable (las acciones de plataforma quedan con NULL).
+    """
     __tablename__ = "bitacora"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     fecha_hora = Column(DateTime(timezone=True), server_default=func.now())
     usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True)
+    # [EXAMEN-2] Aislamiento multitenant; NULL = acción de plataforma
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="SET NULL"), nullable=True, index=True)
     ip_address = Column(String(45), nullable=True)
     accion = Column(String(255), nullable=False)
     modulo = Column(String(100), nullable=True)

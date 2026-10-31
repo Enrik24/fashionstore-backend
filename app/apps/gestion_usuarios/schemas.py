@@ -62,10 +62,22 @@ class UsuarioLogin(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    """Schema para respuesta de token."""
+    """Schema para respuesta de token.
+
+    Modificado en Examen 2 (SaaS multitenant): agrega `tenant_id`,
+    `es_super_admin`, `roles`, `debe_cambiar_contrasena` y el resumen del
+    tenant/suscripción para que el cliente conozca su contexto (CU01-CU04).
+    """
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+    # [EXAMEN-2]
+    tenant_id: Optional[int] = None
+    es_super_admin: bool = False
+    roles: List[str] = []
+    debe_cambiar_contrasena: bool = False
+    tenant: Optional[dict] = None
+    suscripcion: Optional[dict] = None
 
 
 class CambioContrasena(BaseModel):

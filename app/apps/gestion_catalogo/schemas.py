@@ -107,7 +107,9 @@ class SucursalBase(BaseModel):
 
 
 class SucursalCreate(SucursalBase):
-    pass
+    # [EXAMEN-2] Fase 2.5: sin ciudad se resuelve la ciudad por defecto en el
+    # servicio, igual que en el asistente CU04.
+    ciudad_id: Optional[int] = None
 
 
 class SucursalUpdate(BaseModel):

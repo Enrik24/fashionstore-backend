@@ -24,11 +24,17 @@ class EstadoPromocion(str, enum.Enum):
 
 
 class Promocion(Base):
-    """Tabla de promociones comerciales."""
+    """Tabla de promociones comerciales.
+
+    Modificado en Examen 2 (SaaS multitenant): se agrega `tenant_id` para
+    evitar que las promociones de un tenant se apliquen en otro.
+    """
     __tablename__ = "promociones"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     nombre = Column(String(150), nullable=False)
+    # [EXAMEN-2] Aislamiento multitenant
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
     descripcion = Column(Text, nullable=True)
     tipo = Column(Enum(TipoPromocion), nullable=False)
     valor = Column(Numeric(10, 2), nullable=True)

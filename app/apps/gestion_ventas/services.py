@@ -161,7 +161,10 @@ class InventarioVentasService:
             tipo=TipoMovimiento.VENTA,
             cantidad=-cantidad,
             motivo=motivo,
-            usuario_id=usuario_id
+            usuario_id=usuario_id,
+            # [EXAMEN-2] Sin contexto HTTP (webhook/job) el tenant se hereda
+            # del inventario para no violar la columna NOT NULL.
+            tenant_id=inv.tenant_id,
         )
         db.add(movimiento)
         await db.flush()
@@ -187,7 +190,8 @@ class InventarioVentasService:
             tipo=TipoMovimiento.DEVOLUCION,
             cantidad=cantidad,
             motivo=motivo,
-            usuario_id=usuario_id
+            usuario_id=usuario_id,
+            tenant_id=inv.tenant_id,
         )
         db.add(movimiento)
         await db.flush()
@@ -218,7 +222,8 @@ class InventarioVentasService:
             tipo=TipoMovimiento.RESERVA,
             cantidad=cantidad,
             motivo="Reserva de prenda para prueba en sucursal",
-            usuario_id=usuario_id
+            usuario_id=usuario_id,
+            tenant_id=inv.tenant_id,
         )
         db.add(movimiento)
         await db.flush()
@@ -247,7 +252,8 @@ class InventarioVentasService:
             tipo=tipo_mov,
             cantidad=-cantidad if comprar else 0,
             motivo=motivo,
-            usuario_id=usuario_id
+            usuario_id=usuario_id,
+            tenant_id=inv.tenant_id,
         )
         db.add(movimiento)
         await db.flush()

@@ -60,8 +60,55 @@ class Settings(BaseSettings):
     CORS_ORIGINS: str = "http://localhost:4200,http://localhost:3000"
     
     # CU26 y CU28 Config
-    PLAZO_DEVOLUCION_DIAS: int = 30
+    # [EXAMEN-2] RN-012: el plazo de devolución/cambio es de 7 días calendario.
+    PLAZO_DEVOLUCION_DIAS: int = 7
+    PLAZO_CAMBIO_DIAS: int = 7
+    PLAZO_CAMBIO_PROMOCION_HORAS: int = 48
     PALABRAS_PROHIBIDAS: str = "estafa,fraude,falso,pesimo,basura,mierda,idiota,ladron,robado,horrible"
+
+    # ============================================================
+    # [EXAMEN-2] Variables del capítulo 6 del plan (Fase 1)
+    # ============================================================
+    # SaaS multitenant
+    SAAS_MODO_ESTRICTO: bool = True
+    TENANT_HEADER_HABILITADO: bool = True
+
+    # Operación offline
+    OFFLINE_LOTE_MAX_OPERACIONES: int = 50
+    OFFLINE_MAX_DIAS_PENDIENTE: int = 30
+    OFFLINE_BACKOFF_BASE_SEG: int = 5
+    SYNC_CONFLICTO_UMBRAL_PRECIO: float = 0.05
+    OFFLINE_PIN_MAX_INTENTOS: int = 5
+    OFFLINE_PIN_LONGITUD_MIN: int = 6
+    OFFLINE_SESION_HORAS_DEFECTO: int = 12
+    OFFLINE_MAX_CLIENTES_DEFECTO: int = 100
+    OFFLINE_RETENCION_DIAS: int = 90
+    DISPOSITIVO_REVOCACION_AUTOMATICA_DIAS: int = 90
+
+    # Idempotencia
+    IDEMPOTENCIA_TTL_HORAS: int = 48
+
+    # Analítica / IA / ML (se usan en la Fase 3, se declaran para no romper el contrato)
+    DASHBOARD_CACHE_TTL_SEG: int = 300
+    IA_MAX_FILAS: int = 5000
+    IA_TIMEOUT_SEG: int = 20
+    IA_PLANTILLAS_HABILITADAS: str = ""
+    ML_RUTA_MODELOS: str = "./modelos_ml"
+    ML_MIN_MESES_HISTORIAL: int = 3
+    ML_MAX_FILAS_ENTRENAMIENTO: int = 200000
+    EXPORT_MAX_MB: int = 50
+
+    # Pagos diferidos y suscripciones (Stripe)
+    STRIPE_WEBHOOK_SECRET_SUSCRIPCIONES: str = ""
+    STRIPE_WEBHOOK_SECRET_PAGOS: str = ""
+    STRIPE_PRICE_BASICO: str = ""
+    STRIPE_PRICE_PROFESIONAL: str = ""
+    STRIPE_MONEDA: str = "bob"
+    STRIPE_API_VERSION: str = ""
+    PAGO_DIFERIDO_VIGENCIA_HORAS: int = 24
+    PAGO_DIFERIDO_MAX_REINTENTOS: int = 5
+    PAGO_DIFERIDO_BACKOFF_BASE_SEG: int = 10
+    PAGO_DIFERIDO_JOB_INTERVALO_SEG: int = 300
 
     class Config:
         env_file = ".env"

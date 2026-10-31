@@ -12,6 +12,12 @@ from decimal import Decimal
 
 from app.database import get_db, AsyncSessionLocal
 from app.security import get_current_user, require_role, get_client_ip
+# [EXAMEN-2] Contexto opcional en lecturas y guarda scoped por tenant en escrituras
+from app.tenant import (
+    contexto_tenant_opcional,
+    get_current_tenant,
+    require_tenant_role,
+)
 from app.apps.gestion_usuarios.models import Usuario
 from app.apps.gestion_usuarios.services import BitacoraService
 from app.services.cloudinary_service import CloudinaryService
@@ -67,7 +73,8 @@ router = APIRouter(prefix="/api/v1", tags=["Gestión de Catálogo, Productos e I
 
 @router.get("/ciudades/", response_model=List[CiudadResponse], name="list_ciudades")
 async def listar_ciudades(
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista todas las ciudades."""
     return await catalogo_services.CiudadService.get_all(db)
@@ -78,7 +85,8 @@ async def crear_ciudad(
     datos: CiudadCreate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Crea una nueva ciudad."""
     ciudad = await catalogo_services.CiudadService.create(db, datos)
@@ -96,7 +104,8 @@ async def crear_ciudad(
 @router.get("/ciudades/{ciudad_id}", response_model=CiudadResponse, name="get_ciudad")
 async def obtener_ciudad(
     ciudad_id: int,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene una ciudad por su ID."""
     return await catalogo_services.CiudadService.get(db, ciudad_id)
@@ -108,7 +117,8 @@ async def actualizar_ciudad(
     datos: CiudadUpdate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Actualiza una ciudad."""
     antes = BitacoraService.foto(await catalogo_services.CiudadService.get(db, ciudad_id))
@@ -132,7 +142,8 @@ async def eliminar_ciudad(
     ciudad_id: int,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Elimina una ciudad."""
     await catalogo_services.CiudadService.delete(db, ciudad_id)
@@ -157,10 +168,20 @@ async def listar_sucursales(
     limit: int = Query(100, ge=1, le=500),
     ciudad_id: Optional[int] = None,
     estado: Optional[str] = None,
-    db: AsyncSession = Depends(get_db)
+    incluir_bajas: bool = Query(
+        False, description="Incluye sucursales dadas de baja (solo Administrador)"
+    ),
+    db: AsyncSession = Depends(get_db),
+    usuario=Depends(contexto_tenant_opcional),
 ):
-    """Lista todas las sucursales."""
-    sucursales, total = await catalogo_services.SucursalService.get_all(db, skip, limit, ciudad_id, estado)
+    """Lista las sucursales del tenant; por defecto excluye las dadas de baja."""
+    puede_ver_bajas = usuario is not None and any(
+        rol.nombre == "Administrador" for rol in (usuario.roles or [])
+    )
+    sucursales, total = await catalogo_services.SucursalService.get_all(
+        db, skip, limit, ciudad_id, estado,
+        incluir_bajas=bool(incluir_bajas and puede_ver_bajas),
+    )
     return sucursales
 
 
@@ -168,11 +189,14 @@ async def listar_sucursales(
 async def crear_sucursal(
     datos: SucursalCreate,
     request: Request,
-    current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    current_user: Usuario = Depends(require_tenant_role("Administrador")),
+    db: AsyncSession = Depends(get_db),
+    tenant=Depends(get_current_tenant),
 ):
     """Crea una nueva sucursal."""
-    sucursal = await catalogo_services.SucursalService.create(db, datos)
+    sucursal = await catalogo_services.SucursalService.create(
+        db, datos, tenant_id=tenant.id
+    )
     await BitacoraService.registrar_evento(
         db=db,
         accion="CREAR_SUCURSAL",
@@ -187,7 +211,8 @@ async def crear_sucursal(
 @router.get("/sucursales/{sucursal_id}", response_model=SucursalConCiudadResponse, name="get_sucursal")
 async def obtener_sucursal(
     sucursal_id: int,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene una sucursal por su ID."""
     return await catalogo_services.SucursalService.get(db, sucursal_id)
@@ -198,8 +223,9 @@ async def actualizar_sucursal(
     sucursal_id: int,
     datos: SucursalUpdate,
     request: Request,
-    current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    current_user: Usuario = Depends(require_tenant_role("Administrador")),
+    db: AsyncSession = Depends(get_db),
+    tenant=Depends(get_current_tenant),
 ):
     """Actualiza una sucursal."""
     antes = BitacoraService.foto(await catalogo_services.SucursalService.get(db, sucursal_id))
@@ -222,8 +248,9 @@ async def actualizar_sucursal(
 async def eliminar_sucursal(
     sucursal_id: int,
     request: Request,
-    current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    current_user: Usuario = Depends(require_tenant_role("Administrador")),
+    db: AsyncSession = Depends(get_db),
+    tenant=Depends(get_current_tenant),
 ):
     """Elimina una sucursal."""
     await catalogo_services.SucursalService.delete(db, sucursal_id)
@@ -243,7 +270,8 @@ async def productos_por_sucursal(
     sucursal_id: int,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene los productos disponibles en una sucursal."""
     inventarios, total = await catalogo_services.InventarioService.get_inventario_sucursal(
@@ -258,7 +286,8 @@ async def productos_por_sucursal(
 
 @router.get("/categorias/", response_model=List[CategoriaResponse], name="list_categorias")
 async def listar_categorias(
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista todas las categorías."""
     return await catalogo_services.CategoriaService.get_all(db)
@@ -269,7 +298,8 @@ async def crear_categoria(
     datos: CategoriaCreate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Crea una nueva categoría."""
     categoria = await catalogo_services.CategoriaService.create(db, datos)
@@ -288,7 +318,8 @@ async def crear_categoria(
 async def obtener_categoria(
     categoria_id: int,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene una categoría por su ID."""
     return await catalogo_services.CategoriaService.get(db, categoria_id)
@@ -300,7 +331,8 @@ async def actualizar_categoria(
     datos: CategoriaUpdate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Actualiza una categoría."""
     antes = BitacoraService.foto(await catalogo_services.CategoriaService.get(db, categoria_id))
@@ -324,7 +356,8 @@ async def eliminar_categoria(
     categoria_id: int,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Elimina una categoría."""
     await catalogo_services.CategoriaService.delete(db, categoria_id)
@@ -344,7 +377,8 @@ async def productos_por_categoria(
     categoria_id: int,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene los productos pertenecientes a una categoría."""
     productos, total = await catalogo_services.ProductoService.get_all(
@@ -360,7 +394,8 @@ async def productos_por_categoria(
 @router.get("/tallas/", response_model=List[TallaResponse], name="list_tallas")
 async def listar_tallas(
     tipo: Optional[str] = None,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista todas las tallas."""
     return await catalogo_services.TallaService.get_all(db, tipo)
@@ -371,7 +406,8 @@ async def crear_talla(
     datos: TallaCreate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Crea una nueva talla."""
     talla = await catalogo_services.TallaService.create(db, datos)
@@ -392,7 +428,8 @@ async def actualizar_talla(
     datos: TallaUpdate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Actualiza una talla."""
     antes = BitacoraService.foto(await catalogo_services.TallaService.get(db, talla_id))
@@ -416,7 +453,8 @@ async def eliminar_talla(
     talla_id: int,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Elimina una talla (las variantes quedan como 'Sin talla')."""
     await catalogo_services.TallaService.delete(db, talla_id)
@@ -437,7 +475,8 @@ async def eliminar_talla(
 
 @router.get("/colores/", response_model=List[ColorResponse], name="list_colores")
 async def listar_colores(
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista todos los colores."""
     return await catalogo_services.ColorService.get_all(db)
@@ -448,7 +487,8 @@ async def crear_color(
     datos: ColorCreate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Crea un nuevo color."""
     color = await catalogo_services.ColorService.create(db, datos)
@@ -469,7 +509,8 @@ async def actualizar_color(
     datos: ColorUpdate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Actualiza un color."""
     antes = BitacoraService.foto(await catalogo_services.ColorService.get(db, color_id))
@@ -493,7 +534,8 @@ async def eliminar_color(
     color_id: int,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Elimina un color (bloqueado si tiene variantes asociadas)."""
     await catalogo_services.ColorService.delete(db, color_id)
@@ -514,7 +556,8 @@ async def eliminar_color(
 
 @router.get("/temporadas/", response_model=List[TemporadaResponse], name="list_temporadas")
 async def listar_temporadas(
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista todas las temporadas."""
     return await catalogo_services.TemporadaService.get_all(db)
@@ -525,7 +568,8 @@ async def crear_temporada(
     datos: TemporadaCreate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Crea una nueva temporada."""
     temporada = await catalogo_services.TemporadaService.create(db, datos)
@@ -544,7 +588,8 @@ async def crear_temporada(
 async def obtener_temporada(
     temporada_id: int,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene una temporada por su ID."""
     return await catalogo_services.TemporadaService.get(db, temporada_id)
@@ -556,7 +601,8 @@ async def actualizar_temporada(
     datos: TemporadaUpdate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Actualiza una temporada."""
     antes = BitacoraService.foto(await catalogo_services.TemporadaService.get(db, temporada_id))
@@ -580,7 +626,8 @@ async def eliminar_temporada(
     temporada_id: int,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Elimina una temporada."""
     await catalogo_services.TemporadaService.delete(db, temporada_id)
@@ -600,7 +647,8 @@ async def productos_por_temporada(
     temporada_id: int,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene los productos pertenecientes a una temporada."""
     productos, total = await catalogo_services.ProductoService.get_all(
@@ -616,7 +664,8 @@ async def productos_por_temporada(
 @router.get("/colecciones/", response_model=List[ColeccionResponse], name="list_colecciones")
 async def listar_colecciones(
     temporada_id: Optional[int] = None,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista todas las colecciones."""
     return await catalogo_services.ColeccionService.get_all(db, temporada_id)
@@ -627,7 +676,8 @@ async def crear_coleccion(
     datos: ColeccionCreate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Crea una nueva colección."""
     coleccion = await catalogo_services.ColeccionService.create(db, datos)
@@ -646,7 +696,8 @@ async def crear_coleccion(
 async def obtener_coleccion(
     coleccion_id: int,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene una colección por su ID."""
     return await catalogo_services.ColeccionService.get(db, coleccion_id)
@@ -658,7 +709,8 @@ async def actualizar_coleccion(
     datos: ColeccionUpdate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Actualiza una colección."""
     antes = BitacoraService.foto(await catalogo_services.ColeccionService.get(db, coleccion_id))
@@ -682,7 +734,8 @@ async def eliminar_coleccion(
     coleccion_id: int,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Elimina una colección."""
     await catalogo_services.ColeccionService.delete(db, coleccion_id)
@@ -700,7 +753,8 @@ async def eliminar_coleccion(
 @router.get("/colecciones/{coleccion_id}/productos", response_model=List[ProductoResponse], name="get_productos_coleccion")
 async def productos_por_coleccion(
     coleccion_id: int,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene los productos asociados a una colección."""
     from app.apps.gestion_catalogo.models import Coleccion, Producto
@@ -722,7 +776,8 @@ async def productos_por_coleccion(
 async def colecciones_de_producto(
     producto_id: int,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista las colecciones a las que pertenece un producto."""
     return await catalogo_services.ColeccionService.get_colecciones_de_producto(db, producto_id)
@@ -734,7 +789,8 @@ async def asociar_producto_coleccion(
     datos: AsociarColeccionRequest,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Asocia un producto a una colección."""
     await catalogo_services.ColeccionService.associate_producto(db, producto_id, datos.coleccion_id)
@@ -755,7 +811,8 @@ async def quitar_producto_coleccion(
     coleccion_id: int,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Quita un producto de una colección."""
     await catalogo_services.ColeccionService.disassociate_producto(db, producto_id, coleccion_id)
@@ -779,7 +836,8 @@ async def listar_proveedores(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista todos los proveedores."""
     proveedores, total = await catalogo_services.ProveedorService.get_all(db, skip, limit)
@@ -791,7 +849,8 @@ async def crear_proveedor(
     datos: ProveedorCreate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Crea un nuevo proveedor."""
     proveedor = await catalogo_services.ProveedorService.create(db, datos)
@@ -810,7 +869,8 @@ async def crear_proveedor(
 async def obtener_proveedor(
     proveedor_id: int,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene un proveedor por su ID."""
     return await catalogo_services.ProveedorService.get(db, proveedor_id)
@@ -822,7 +882,8 @@ async def actualizar_proveedor(
     datos: ProveedorUpdate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Actualiza un proveedor."""
     antes = BitacoraService.foto(await catalogo_services.ProveedorService.get(db, proveedor_id))
@@ -846,7 +907,8 @@ async def eliminar_proveedor(
     proveedor_id: int,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Elimina un proveedor."""
     await catalogo_services.ProveedorService.delete(db, proveedor_id)
@@ -870,7 +932,8 @@ async def crear_recepcion(
     datos: RecepcionCreate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Registra un ingreso de mercadería vinculado a proveedor y sucursal (suma stock + movimiento RECEPCION)."""
     if await _es_encargado(current_user):
@@ -900,7 +963,8 @@ async def listar_recepciones(
     proveedor_id: Optional[int] = None,
     sucursal_id: Optional[int] = None,
     current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista recepciones, filtrables por proveedor y sucursal."""
     if await _es_encargado(current_user):
@@ -914,7 +978,8 @@ async def listar_recepciones(
 async def obtener_recepcion(
     recepcion_id: int,
     current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene una recepción por ID."""
     rec = await catalogo_services.RecepcionService.get(db, recepcion_id)
@@ -934,7 +999,8 @@ async def recepciones_por_proveedor(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
     current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Historial de ingresos de un proveedor (trazabilidad RF06)."""
     return await catalogo_services.RecepcionService.list(db, skip, limit, proveedor_id=proveedor_id)
@@ -955,7 +1021,8 @@ async def listar_productos(
     proveedor_id: Optional[int] = None,
     buscar: Optional[str] = None,
     current_user: Usuario = Depends(require_role("Administrador", "Encargado", "Cliente")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista todos los productos."""
     productos, total = await catalogo_services.ProductoService.get_all(
@@ -969,7 +1036,8 @@ async def crear_producto(
     datos: ProductoCreate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Crea un nuevo producto."""
     producto = await catalogo_services.ProductoService.create(db, datos, datos.stock_por_sucursal)
@@ -988,7 +1056,8 @@ async def crear_producto(
 async def obtener_producto(
     producto_id: int,
     current_user: Usuario = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene un producto por su ID."""
     return await catalogo_services.ProductoService.get(db, producto_id)
@@ -1000,7 +1069,8 @@ async def actualizar_producto(
     datos: ProductoUpdate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Actualiza un producto."""
     antes = BitacoraService.foto(await catalogo_services.ProductoService.get(db, producto_id))
@@ -1024,7 +1094,8 @@ async def eliminar_producto(
     producto_id: int,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Elimina un producto."""
     await catalogo_services.ProductoService.delete(db, producto_id)
@@ -1047,7 +1118,8 @@ async def eliminar_producto(
 async def listar_variantes(
     producto_id: int,
     current_user: Usuario = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista las variantes de un producto."""
     query = (
@@ -1070,7 +1142,8 @@ async def crear_variante(
     request: Request,
     cantidad_inicial: int = Query(0, ge=0),
     current_user: Usuario = Depends(require_role("Administrador")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Agrega una variante a un producto."""
     variante = await catalogo_services.ProductoService.agregar_variante(
@@ -1116,7 +1189,8 @@ async def listar_inventario(
     producto_id: Optional[int] = None,
     estado: Optional[str] = None,
     current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista el inventario global o el inventario de la sucursal asignada si es Encargado."""
     user_roles = [r.nombre.lower() for r in current_user.roles]
@@ -1138,7 +1212,8 @@ async def inventario_por_sucursal(
     skip: int = Query(0, ge=0),
     limit: int = Query(500, ge=1, le=1000),
     current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene el inventario de una sucursal específica."""
     user_roles = [r.nombre.lower() for r in current_user.roles]
@@ -1163,7 +1238,8 @@ async def actualizar_inventario(
     request: Request,
     motivo: str = Query(..., description="Motivo del ajuste"),
     current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Actualiza la cantidad de inventario."""
     user_roles = [r.nombre.lower() for r in current_user.roles]
@@ -1204,7 +1280,8 @@ async def crear_movimiento(
     datos: MovimientoInventarioCreate,
     request: Request,
     current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Registra un movimiento de inventario."""
     user_roles = [r.nombre.lower() for r in current_user.roles]
@@ -1237,7 +1314,8 @@ async def listar_movimientos(
     sucursal_id: Optional[int] = None,
     tipo: Optional[str] = None,
     current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista los movimientos de inventario."""
     from app.apps.gestion_catalogo.models import TipoMovimiento
@@ -1274,7 +1352,8 @@ async def catalogo_publico(
     ordenar_por: Optional[str] = Query(None, description="precio_asc, precio_desc, nombre, fecha"),
     pagina: int = Query(1, ge=1),
     limite: int = Query(20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene el catálogo público de productos con filtros y paginación."""
     filtros = ProductoFilter(
@@ -1315,7 +1394,8 @@ async def buscar_productos_publico(
     ordenar_por: Optional[str] = None,
     pagina: int = Query(1, ge=1),
     limite: int = Query(20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Búsqueda avanzada de productos en el catálogo público."""
     filtros = ProductoFilter(
@@ -1345,7 +1425,8 @@ async def buscar_productos_publico(
 @router.get("/public/productos/populares", response_model=List[ProductoDetalleResponse], name="public_productos_populares")
 async def productos_populares_publico(
     limit: int = Query(10, ge=1, le=50),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene los productos destacados / populares del catálogo."""
     return await catalogo_services.ProductoService.get_productos_populares(db, limit)
@@ -1354,7 +1435,8 @@ async def productos_populares_publico(
 @router.get("/public/productos/{producto_id}", response_model=ProductoDetalleResponse, name="public_detalle_producto")
 async def detalle_producto_publico(
     producto_id: int,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene los detalles públicos de un producto específico."""
     return await catalogo_services.ProductoService.get(db, producto_id)
@@ -1364,7 +1446,8 @@ async def detalle_producto_publico(
 async def productos_relacionados_publico(
     producto_id: int,
     limit: int = Query(6, ge=1, le=20),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene productos relacionados de la misma categoría/temporada."""
     return await catalogo_services.ProductoService.get_productos_relacionados(db, producto_id, limit)
@@ -1375,7 +1458,8 @@ async def disponibilidad_producto(
     producto_id: int,
     talla_id: Optional[int] = None,
     color_id: Optional[int] = None,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene la disponibilidad de un producto por sucursal (público)."""
     return await catalogo_services.DisponibilidadService.get_disponibilidad_producto(
@@ -1387,7 +1471,8 @@ async def disponibilidad_producto(
 async def disponibilidad_producto_por_sucursal(
     producto_id: int,
     sucursal_id: int,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene la disponibilidad de todas las variantes de un producto en una sucursal específica."""
     return await catalogo_services.DisponibilidadService.get_stock_por_sucursal(
@@ -1398,7 +1483,8 @@ async def disponibilidad_producto_por_sucursal(
 @router.get("/public/stock/{variante_id}", name="disponibilidad_variante_todas_sucursales")
 async def stock_variante_todas_sucursales(
     variante_id: int,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene el stock de una variante específica en todas las sucursales."""
     return await catalogo_services.DisponibilidadService.get_disponibilidad_variante(
@@ -1449,7 +1535,8 @@ async def websocket_disponibilidad(websocket: WebSocket, producto_id: int):
 @router.get("/inventario/alertas", response_model=List[InventarioDetalleResponse], name="alertas_stock")
 async def alertas_stock(
     current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene productos con stock bajo el mínimo."""
     return await catalogo_services.InventarioService.get_alertas_stock(db)
@@ -1465,7 +1552,8 @@ async def subir_imagen(
     file: UploadFile = File(...),
     folder: str = Query("fashionstore/productos"),
     current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Sube una imagen a Cloudinary y retorna sus URLs y public_id."""
     try:
@@ -1491,7 +1579,8 @@ async def eliminar_imagen(
     request: Request,
     public_id: str = Query(..., description="ID público de Cloudinary de la imagen"),
     current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Elimina una imagen de Cloudinary por su public_id (limpieza de imágenes huérfanas)."""
     try:
@@ -1526,7 +1615,8 @@ async def listar_favoritos(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=200),
     current_user: Usuario = Depends(require_role("Cliente")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista los productos favoritos del cliente autenticado con estado de disponibilidad."""
     cliente = await obtener_cliente_actual(db, current_user)
@@ -1536,7 +1626,8 @@ async def listar_favoritos(
 @router.get("/favoritos/ids", response_model=FavoritoIdsResponse, name="listar_favoritos_ids", tags=["Favoritos (CU25)"])
 async def listar_favoritos_ids(
     current_user: Usuario = Depends(require_role("Cliente")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene únicamente la lista de IDs de productos marcados como favoritos (para catálogo)."""
     cliente = await obtener_cliente_actual(db, current_user)
@@ -1549,7 +1640,8 @@ async def agregar_favorito(
     producto_id: int,
     request: Request,
     current_user: Usuario = Depends(require_role("Cliente")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Agrega un producto a la lista de favoritos del cliente (idempotente)."""
     cliente = await obtener_cliente_actual(db, current_user)
@@ -1571,7 +1663,8 @@ async def quitar_favorito(
     producto_id: int,
     request: Request,
     current_user: Usuario = Depends(require_role("Cliente")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Quita un producto de la lista de favoritos del cliente (idempotente)."""
     cliente = await obtener_cliente_actual(db, current_user)
@@ -1594,7 +1687,8 @@ async def mover_favorito_al_carrito(
     datos: MoverFavoritoCarritoRequest,
     request: Request,
     current_user: Usuario = Depends(require_role("Cliente")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Mueve una variante de un producto favorito directamente al carrito de compras."""
     cliente = await obtener_cliente_actual(db, current_user)
@@ -1620,7 +1714,8 @@ async def listar_valoraciones_producto(
     producto_id: int,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista las valoraciones públicas aprobadas de un producto."""
     return await catalogo_services.ValoracionService.listar_por_producto(db, producto_id, skip=skip, limit=limit)
@@ -1630,7 +1725,8 @@ async def listar_valoraciones_producto(
 async def verificar_puede_valorar(
     producto_id: int,
     current_user: Usuario = Depends(require_role("Cliente")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Verifica si el cliente actual ha comprado el producto y puede valorarlo (o si ya tiene valoración)."""
     cliente = await obtener_cliente_actual(db, current_user)
@@ -1641,7 +1737,8 @@ async def verificar_puede_valorar(
 async def obtener_mi_valoracion(
     producto_id: int,
     current_user: Usuario = Depends(require_role("Cliente")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Obtiene la valoración propia del cliente para un producto."""
     cliente = await obtener_cliente_actual(db, current_user)
@@ -1654,7 +1751,8 @@ async def crear_valoracion(
     datos: ValoracionCreate,
     request: Request,
     current_user: Usuario = Depends(require_role("Cliente")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Registra una nueva valoración con puntuación de 1 a 5 y comentario."""
     cliente = await obtener_cliente_actual(db, current_user)
@@ -1677,7 +1775,8 @@ async def editar_valoracion(
     datos: ValoracionUpdate,
     request: Request,
     current_user: Usuario = Depends(require_role("Cliente")),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Permite al autor editar su propia valoración existente."""
     cliente = await obtener_cliente_actual(db, current_user)

@@ -89,36 +89,96 @@ class CiudadService:
 # Servicios de Sucursal
 # ============================================
 
+async def _ciudad_para_sucursal(db: AsyncSession, ciudad_id: Optional[int]) -> Ciudad:
+    """Resuelve la ciudad de una sucursal; sin `ciudad_id` usa la ciudad por defecto.
+
+    [EXAMEN-2] Fase 2.5 (C3): la resolución vive aquí para que el CRUD canónico
+    y el asistente CU04 se comporten igual.
+    """
+    if ciudad_id:
+        result = await db.execute(select(Ciudad).where(Ciudad.id == ciudad_id))
+        ciudad = result.scalar_one_or_none()
+        if ciudad is None:
+            raise ValidationException("La ciudad indicada no existe")
+        return ciudad
+
+    result = await db.execute(select(Ciudad).where(Ciudad.nombre == "La Paz"))
+    ciudad = result.scalars().first()
+    if ciudad is None:
+        ciudad = Ciudad(nombre="La Paz", pais="Bolivia")
+        db.add(ciudad)
+        await db.flush()
+    return ciudad
+
+
 class SucursalService:
-    """Servicio de gestión de sucursales."""
+    """Servicio de gestión de sucursales (dueño único del CRUD)."""
     
     @staticmethod
-    async def create(db: AsyncSession, datos: SucursalCreate) -> Sucursal:
-        # Verificar nombre duplicado en la misma ciudad
+    async def create(
+        db: AsyncSession,
+        datos: SucursalCreate,
+        tenant_id: Optional[int] = None,
+    ) -> Sucursal:
+        """Crea una sucursal validando tenant, plan y unicidad lógica.
+
+        [EXAMEN-2] Fase 2.5:
+        - C1: respeta `Plan.max_sucursales` por cualquier ruta.
+        - C2: deduplica por `(tenant_id, nombre)` entre sucursales activas.
+        - C3: resuelve la ciudad por defecto si no se indica.
+        """
+        from app.tenant import get_tenant_demo, tenant_actual
+
+        # C1: tenant del contexto (o el demo si la ruta pública no trae token).
+        if tenant_id is None:
+            tenant_id = tenant_actual()
+        if tenant_id is None:
+            demo = await get_tenant_demo(db)
+            if demo is None:
+                raise ValidationException(
+                    "No hay un tenant en contexto para crear la sucursal"
+                )
+            tenant_id = demo.id
+
+        # Import diferido: evita el ciclo gestion_catalogo <-> gestion_saas (R1).
+        from app.apps.gestion_saas.services import SuscripcionService
+
+        await SuscripcionService.verificar_limite_sucursales(db, tenant_id)
+
+        # C2: el criterio coincide con la restricción única real.
         result = await db.execute(
             select(Sucursal).where(
-                and_(
-                    Sucursal.nombre == datos.nombre,
-                    Sucursal.ciudad_id == datos.ciudad_id
-                )
+                Sucursal.tenant_id == tenant_id,
+                Sucursal.nombre == datos.nombre,
+                Sucursal.deleted_at.is_(None),
             )
         )
         if result.scalar_one_or_none():
-            raise ConflictException("Ya existe una sucursal con este nombre en la misma ciudad")
-        
-        sucursal = Sucursal(**datos.model_dump())
+            raise ConflictException("Ya existe una sucursal con ese nombre en el tenant")
+
+        ciudad = await _ciudad_para_sucursal(db, datos.ciudad_id)
+
+        payload = datos.model_dump()
+        payload["ciudad_id"] = ciudad.id
+        payload["tenant_id"] = tenant_id
+        sucursal = Sucursal(**payload)
         db.add(sucursal)
         await db.commit()
         await db.refresh(sucursal)
         return sucursal
     
     @staticmethod
-    async def get(db: AsyncSession, sucursal_id: int) -> Sucursal:
-        result = await db.execute(
+    async def get(
+        db: AsyncSession, sucursal_id: int, incluir_bajas: bool = False
+    ) -> Sucursal:
+        query = (
             select(Sucursal)
             .options(selectinload(Sucursal.ciudad))
             .where(Sucursal.id == sucursal_id)
         )
+        if not incluir_bajas:
+            query = query.where(Sucursal.deleted_at.is_(None))
+        result = await db.execute(query)
         sucursal = result.scalar_one_or_none()
         if not sucursal:
             raise NotFoundException(f"Sucursal con ID {sucursal_id} no encontrada")
@@ -130,10 +190,13 @@ class SucursalService:
         skip: int = 0,
         limit: int = 100,
         ciudad_id: Optional[int] = None,
-        estado: Optional[str] = None
+        estado: Optional[str] = None,
+        incluir_bajas: bool = False,
     ) -> Tuple[List[Sucursal], int]:
         query = select(Sucursal).options(selectinload(Sucursal.ciudad))
         
+        if not incluir_bajas:
+            query = query.where(Sucursal.deleted_at.is_(None))
         if ciudad_id:
             query = query.where(Sucursal.ciudad_id == ciudad_id)
         if estado:
@@ -154,19 +217,18 @@ class SucursalService:
     async def update(db: AsyncSession, sucursal_id: int, datos: SucursalUpdate) -> Sucursal:
         sucursal = await SucursalService.get(db, sucursal_id)
         
-        # Verificar duplicado de nombre si se cambia
+        # C2: mismo criterio que en `create` y que la restricción única.
         if datos.nombre and datos.nombre != sucursal.nombre:
-            ciudad_id = datos.ciudad_id or sucursal.ciudad_id
             result = await db.execute(
                 select(Sucursal).where(
-                    and_(
-                        Sucursal.nombre == datos.nombre,
-                        Sucursal.ciudad_id == ciudad_id
-                    )
+                    Sucursal.tenant_id == sucursal.tenant_id,
+                    Sucursal.nombre == datos.nombre,
+                    Sucursal.id != sucursal_id,
+                    Sucursal.deleted_at.is_(None),
                 )
             )
             if result.scalar_one_or_none():
-                raise ConflictException("Ya existe una sucursal con este nombre en la misma ciudad")
+                raise ConflictException("Ya existe una sucursal con ese nombre en el tenant")
         
         update_data = datos.model_dump(exclude_unset=True)
         for field, value in update_data.items():
@@ -178,9 +240,10 @@ class SucursalService:
     
     @staticmethod
     async def delete(db: AsyncSession, sucursal_id: int):
+        # Una sucursal ya dada de baja entra por `get` y devuelve 404.
         sucursal = await SucursalService.get(db, sucursal_id)
         
-        # Verificar que no tenga inventario activo
+        # Guarda heredada del Examen 1: no se da de baja con inventario activo.
         result = await db.execute(
             select(Inventario).where(
                 and_(
@@ -191,8 +254,21 @@ class SucursalService:
         )
         if result.scalars().first():
             raise ConflictException("No se puede eliminar una sucursal con inventario activo")
-        
-        await db.delete(sucursal)
+
+        # El tenant nunca se queda sin locales operativos.
+        activas = (await db.execute(
+            select(func.count(Sucursal.id)).where(
+                Sucursal.tenant_id == sucursal.tenant_id,
+                Sucursal.deleted_at.is_(None),
+            )
+        )).scalar_one() or 0
+        if activas <= 1:
+            raise ConflictException(
+                "No se puede dar de baja la última sucursal activa del tenant"
+            )
+
+        # C5.3: baja lógica; `updated_at` se dispara por `onupdate=func.now()`.
+        sucursal.deleted_at = func.now()
         await db.commit()
 
 
@@ -1404,9 +1480,22 @@ class DatosInicialesCatalogoService:
     """Servicio para crear datos iniciales del catálogo."""
     
     @staticmethod
-    async def crear_datos_iniciales(db: AsyncSession):
-        """Crea datos iniciales: categorías, tallas, colores, etc."""
-        
+    async def crear_datos_iniciales(db: AsyncSession, tenant_id: Optional[int] = None):
+        """Crea datos iniciales por tenant: categorías, tallas y colores.
+
+        Modificado en Examen 2 (SaaS multitenant): el catálogo dejó de ser
+        global; cada tenant recibe su propia copia (plan, 9.1.6).
+        """
+        from app.tenant import get_tenant_demo, tenant_actual
+
+        if tenant_id is None:
+            tenant_id = tenant_actual()
+        if tenant_id is None:
+            demo = await get_tenant_demo(db)
+            if demo is None:
+                return
+            tenant_id = demo.id
+
         # Crear categorías
         categorias_data = [
             ("Poleras", "Poleras y camisetas para hombre y mujer"),
@@ -1419,9 +1508,13 @@ class DatosInicialesCatalogoService:
         ]
         
         for nombre, desc in categorias_data:
-            result = await db.execute(select(Categoria).where(Categoria.nombre == nombre))
+            result = await db.execute(
+                select(Categoria).where(
+                    Categoria.nombre == nombre, Categoria.tenant_id == tenant_id
+                )
+            )
             if not result.scalar_one_or_none():
-                categoria = Categoria(nombre=nombre, descripcion=desc)
+                categoria = Categoria(nombre=nombre, descripcion=desc, tenant_id=tenant_id)
                 db.add(categoria)
         
         # Crear tallas
@@ -1444,9 +1537,17 @@ class DatosInicialesCatalogoService:
         ]
         
         for valor, tipo, desc in tallas_data:
-            result = await db.execute(select(Talla).where(Talla.valor == valor))
+            result = await db.execute(
+                select(Talla).where(
+                    Talla.valor == valor,
+                    Talla.tipo == tipo,
+                    Talla.tenant_id == tenant_id,
+                )
+            )
             if not result.scalar_one_or_none():
-                talla = Talla(valor=valor, tipo=tipo, descripcion=desc)
+                talla = Talla(
+                    valor=valor, tipo=tipo, descripcion=desc, tenant_id=tenant_id
+                )
                 db.add(talla)
         
         # Crear colores
@@ -1468,9 +1569,15 @@ class DatosInicialesCatalogoService:
         ]
         
         for nombre, hex_code in colores_data:
-            result = await db.execute(select(Color).where(Color.nombre == nombre))
+            result = await db.execute(
+                select(Color).where(
+                    Color.nombre == nombre, Color.tenant_id == tenant_id
+                )
+            )
             if not result.scalar_one_or_none():
-                color = Color(nombre=nombre, codigo_hex=hex_code)
+                color = Color(
+                    nombre=nombre, codigo_hex=hex_code, tenant_id=tenant_id
+                )
                 db.add(color)
         
         await db.commit()

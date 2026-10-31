@@ -3,7 +3,7 @@ Modelos SQLAlchemy para Servicios Inteligentes y Reportes.
 Contiene: Reporte, IndicadorKPI.
 (Implementación completa en Iteración 3)
 """
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Text, Float, JSON
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Text, Float, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
@@ -30,11 +30,19 @@ class FormatoReporte(str, enum.Enum):
 
 # Modelo: Reporte
 class Reporte(Base):
-    """Tabla de reportes generados."""
+    """Tabla de reportes generados.
+
+    Modificado en Examen 2 (SaaS multitenant): `tenant_id` (NULL solo para
+    reportes de plataforma), `sucursal_id` y `usuario_id`.
+    """
     __tablename__ = "reportes"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     administrador_id = Column(Integer, ForeignKey("administradores.id", ondelete="SET NULL"), nullable=True)
+    # [EXAMEN-2] Aislamiento y alcance del reporte (CU10-CU12)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True, index=True)
+    sucursal_id = Column(Integer, ForeignKey("sucursales.id", ondelete="SET NULL"), nullable=True)
+    usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True)
     tipo = Column(Enum(TipoReporte), nullable=False)
     titulo = Column(String(200), nullable=False)
     fecha_generacion = Column(DateTime(timezone=True), server_default=func.now())
@@ -51,11 +59,21 @@ class Reporte(Base):
 
 # Modelo: IndicadorKPI
 class IndicadorKPI(Base):
-    """Tabla de indicadores KPI."""
+    """Tabla de indicadores KPI.
+
+    Modificado en Examen 2 (SaaS multitenant): `tenant_id` y `sucursal_id`
+    con unicidad `(tenant_id, sucursal_id, nombre, periodo)`.
+    """
     __tablename__ = "indicadores_kpi"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "sucursal_id", "nombre", "periodo", name="uq_kpi_tenant_sucursal_nombre_periodo"),
+    )
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     nombre = Column(String(100), nullable=False)
+    # [EXAMEN-2] Aislamiento multitenant y por sucursal
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True, index=True)
+    sucursal_id = Column(Integer, ForeignKey("sucursales.id", ondelete="SET NULL"), nullable=True)
     descripcion = Column(Text, nullable=True)
     valor_actual = Column(Float, default=0)
     valor_objetivo = Column(Float, default=0)
