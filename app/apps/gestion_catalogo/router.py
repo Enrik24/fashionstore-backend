@@ -39,6 +39,8 @@ from app.apps.gestion_catalogo.schemas import (
     ColeccionCreate, ColeccionUpdate, ColeccionResponse,
     # Proveedor
     ProveedorCreate, ProveedorUpdate, ProveedorResponse,
+    # Tipo de tela (punto 3)
+    TipoTelaCreate, TipoTelaUpdate, TipoTelaResponse,
     # Producto
     ProductoCreate, ProductoUpdate, ProductoResponse, ProductoDetalleResponse,
     # Variante
@@ -1020,13 +1022,16 @@ async def listar_productos(
     temporada_id: Optional[int] = None,
     proveedor_id: Optional[int] = None,
     buscar: Optional[str] = None,
+    tipo_tela_id: Optional[int] = None,
+    composicion: Optional[str] = None,
     current_user: Usuario = Depends(require_role("Administrador", "Encargado", "Cliente")),
     db: AsyncSession = Depends(get_db),
     _contexto=Depends(contexto_tenant_opcional),
 ):
     """Lista todos los productos."""
     productos, total = await catalogo_services.ProductoService.get_all(
-        db, skip, limit, categoria_id, estado, genero, temporada_id, proveedor_id, buscar
+        db, skip, limit, categoria_id, estado, genero, temporada_id, proveedor_id,
+        buscar, tipo_tela_id, composicion,
     )
     return productos
 
@@ -1035,11 +1040,16 @@ async def listar_productos(
 async def crear_producto(
     datos: ProductoCreate,
     request: Request,
-    current_user: Usuario = Depends(require_role("Administrador")),
+    current_user: Usuario = Depends(require_tenant_role("Administrador")),
+    tenant=Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
-    _contexto=Depends(contexto_tenant_opcional),
 ):
     """Crea un nuevo producto."""
+    # [EXAMEN-2] Fase B: límite de productos del plan contratado (aplica también al
+    # Super Admin con X-Tenant-ID, que no tiene tenant_id propio).
+    from app.apps.gestion_saas.services import SuscripcionService
+
+    await SuscripcionService.verificar_limite_productos(db, tenant.id)
     producto = await catalogo_services.ProductoService.create(db, datos, datos.stock_por_sucursal)
     await BitacoraService.registrar_evento(
         db=db,
@@ -1108,6 +1118,65 @@ async def eliminar_producto(
         detalles=f"Producto eliminado: ID {producto_id}"
     )
     return {"message": "Producto eliminado exitosamente"}
+
+
+# ============================================
+# Endpoints de Tipo de Tela (punto 3 de la profesora)
+# ============================================
+
+@router.get("/tipos-tela/", response_model=List[TipoTelaResponse], name="list_tipos_tela")
+async def listar_tipos_tela(
+    incluir_inactivos: bool = Query(False),
+    current_user: Usuario = Depends(get_current_user),
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lista los tipos de tela del tenant autenticado."""
+    return await catalogo_services.TipoTelaService.get_all(db, incluir_inactivos, tenant.id)
+
+
+@router.post("/tipos-tela/", response_model=TipoTelaResponse, status_code=201, name="create_tipo_tela")
+async def crear_tipo_tela(
+    datos: TipoTelaCreate,
+    current_user: Usuario = Depends(require_tenant_role("Administrador", "Encargado")),
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Crea un tipo de tela para el tenant."""
+    return await catalogo_services.TipoTelaService.create(db, datos, tenant.id)
+
+
+@router.get("/tipos-tela/{tipo_tela_id}", response_model=TipoTelaResponse, name="get_tipo_tela")
+async def obtener_tipo_tela(
+    tipo_tela_id: int,
+    current_user: Usuario = Depends(get_current_user),
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    return await catalogo_services.TipoTelaService.get(db, tipo_tela_id, tenant.id)
+
+
+@router.put("/tipos-tela/{tipo_tela_id}", response_model=TipoTelaResponse, name="update_tipo_tela")
+async def actualizar_tipo_tela(
+    tipo_tela_id: int,
+    datos: TipoTelaUpdate,
+    current_user: Usuario = Depends(require_tenant_role("Administrador", "Encargado")),
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    return await catalogo_services.TipoTelaService.update(db, tipo_tela_id, datos, tenant.id)
+
+
+@router.delete("/tipos-tela/{tipo_tela_id}", name="delete_tipo_tela")
+async def eliminar_tipo_tela(
+    tipo_tela_id: int,
+    current_user: Usuario = Depends(require_tenant_role("Administrador")),
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """Baja lógica: los productos históricos conservan la referencia."""
+    await catalogo_services.TipoTelaService.delete(db, tipo_tela_id, tenant.id)
+    return {"message": "Tipo de tela eliminado exitosamente"}
 
 
 # ============================================

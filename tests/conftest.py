@@ -153,6 +153,24 @@ def limpiar_contexto_tenant():
     clear_tenant_context()
 
 
+@pytest.fixture(autouse=True)
+def sin_groq_real(monkeypatch):
+    """Desactiva Groq en los tests: determinista, sin red ni consumo de cuota.
+
+    Los tests de CU10/CU13/CU20-CU23 fueron escritos contra el camino
+    heurístico/fallback de GroqService (sin API key). Si la suite pega a
+    la API real, la interpretación del LLM es no determinista y consume
+    la cuota del plan gratuito. Vaciar la key y soltar el cliente del
+    singleton hace que _interpretar_con_groq devuelva None y que los
+    métodos de GroqService usen su fallback local.
+    """
+    from app.services.groq_service import groq_service
+
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "")
+    monkeypatch.setattr(groq_service, "api_key", "")
+    monkeypatch.setattr(groq_service, "client", None)
+
+
 @pytest_asyncio.fixture(scope="function")
 async def superadmin_auth_tokens(client: AsyncClient):
     """Tokens del Super Administrador de la plataforma (sin tenant)."""

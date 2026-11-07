@@ -13,7 +13,7 @@ from app.apps.gestion_catalogo.models import (
     Proveedor, Producto, VarianteProducto, Inventario, MovimientoInventario,
     EstadoStock, TipoMovimiento, EstadoSucursal, EstadoProducto,
     ProductoFavorito, ValoracionProducto, EstadoValoracion,
-    Recepcion, DetalleRecepcion
+    Recepcion, DetalleRecepcion, TipoTela
 )
 from app.apps.gestion_catalogo.schemas import (
     CiudadCreate, CiudadUpdate, SucursalCreate, SucursalUpdate,
@@ -347,9 +347,36 @@ class CategoriaService:
 class TallaService:
     """Servicio de gestión de tallas."""
     
+    # [EXAMEN-2] Fase D / RF-034: mapa de orden de talla (mayor/menor).
+    ORDEN_TALLAS = {
+        "XXS": 5, "2XS": 5,
+        "XS": 10,
+        "S": 20,
+        "M": 30,
+        "L": 40,
+        "XL": 50,
+        "XXL": 60, "2XL": 60,
+        "XXXL": 70, "3XL": 70,
+    }
+
+    @staticmethod
+    def calcular_orden(valor: Optional[str]) -> Optional[int]:
+        """Devuelve el orden numérico de una talla (None si no es reconocida)."""
+        if not valor:
+            return None
+        clave = str(valor).strip().upper()
+        if clave in TallaService.ORDEN_TALLAS:
+            return TallaService.ORDEN_TALLAS[clave]
+        if clave.isdigit() and 20 <= int(clave) <= 60:
+            return int(clave) * 10
+        return None
+
     @staticmethod
     async def create(db: AsyncSession, datos: TallaCreate) -> Talla:
-        talla = Talla(**datos.model_dump())
+        valores = datos.model_dump()
+        if valores.get("orden") is None:
+            valores["orden"] = TallaService.calcular_orden(valores.get("valor"))
+        talla = Talla(**valores)
         db.add(talla)
         await db.commit()
         await db.refresh(talla)
@@ -375,6 +402,8 @@ class TallaService:
     async def update(db: AsyncSession, talla_id: int, datos: TallaUpdate) -> Talla:
         talla = await TallaService.get(db, talla_id)
         update_data = datos.model_dump(exclude_unset=True)
+        if "valor" in update_data and "orden" not in update_data:
+            update_data["orden"] = TallaService.calcular_orden(update_data["valor"])
         for field, value in update_data.items():
             setattr(talla, field, value)
         await db.commit()
@@ -671,6 +700,104 @@ class ProveedorService:
 # Servicios de Producto
 # ============================================
 
+# ============================================
+# Servicios de Tipo de Tela (punto 3 de la profesora)
+# ============================================
+
+def _tenant_catalogo() -> Optional[int]:
+    """Tenant de la petición; None en llamadas internas (pruebas/seed)."""
+    from app.tenant import tenant_actual
+
+    return tenant_actual()
+
+
+class TipoTelaService:
+    """CRUD de tipos de tela con aislamiento por tenant y baja lógica."""
+
+    @staticmethod
+    async def get(db: AsyncSession, tipo_tela_id: int, tenant_id: Optional[int] = None) -> TipoTela:
+        query = select(TipoTela).where(TipoTela.id == tipo_tela_id)
+        tenant_id = tenant_id if tenant_id is not None else _tenant_catalogo()
+        if tenant_id is not None:
+            query = query.where(TipoTela.tenant_id == tenant_id)
+        tipo_tela = (await db.execute(query)).scalar_one_or_none()
+        if tipo_tela is None or tipo_tela.deleted_at is not None:
+            raise NotFoundException(f"Tipo de tela con ID {tipo_tela_id} no encontrado")
+        return tipo_tela
+
+    @staticmethod
+    async def get_all(
+        db: AsyncSession, incluir_inactivos: bool = False, tenant_id: Optional[int] = None
+    ) -> List[TipoTela]:
+        query = select(TipoTela).where(TipoTela.deleted_at.is_(None))
+        tenant_id = tenant_id if tenant_id is not None else _tenant_catalogo()
+        if tenant_id is not None:
+            query = query.where(TipoTela.tenant_id == tenant_id)
+        if not incluir_inactivos:
+            query = query.where(TipoTela.estado == EstadoProducto.ACTIVO)
+        return list((await db.execute(query.order_by(TipoTela.nombre.asc()))).scalars().all())
+
+    @staticmethod
+    async def _validar_nombre_unico(
+        db: AsyncSession, nombre: str, tenant_id: Optional[int], excluir_id: Optional[int] = None
+    ) -> None:
+        query = select(TipoTela).where(func.lower(TipoTela.nombre) == nombre.strip().lower())
+        if tenant_id is not None:
+            query = query.where(TipoTela.tenant_id == tenant_id)
+        if excluir_id is not None:
+            query = query.where(TipoTela.id != excluir_id)
+        if (await db.execute(query)).scalars().first() is not None:
+            raise ConflictException("Ya existe un tipo de tela con ese nombre")
+
+    @staticmethod
+    async def create(db: AsyncSession, datos, tenant_id: Optional[int] = None) -> TipoTela:
+        tenant_id = tenant_id if tenant_id is not None else _tenant_catalogo()
+        nombre = datos.nombre.strip()
+        await TipoTelaService._validar_nombre_unico(db, nombre, tenant_id)
+        valores = datos.model_dump()
+        valores["nombre"] = nombre
+        if tenant_id is not None:
+            valores["tenant_id"] = tenant_id
+        tipo_tela = TipoTela(**valores)
+        db.add(tipo_tela)
+        await db.commit()
+        await db.refresh(tipo_tela)
+        return tipo_tela
+
+    @staticmethod
+    async def update(db: AsyncSession, tipo_tela_id: int, datos, tenant_id: Optional[int] = None) -> TipoTela:
+        tipo_tela = await TipoTelaService.get(db, tipo_tela_id, tenant_id)
+        cambios = datos.model_dump(exclude_unset=True)
+        if cambios.get("nombre"):
+            cambios["nombre"] = cambios["nombre"].strip()
+            await TipoTelaService._validar_nombre_unico(
+                db, cambios["nombre"], tipo_tela.tenant_id, excluir_id=tipo_tela.id
+            )
+        for campo, valor in cambios.items():
+            setattr(tipo_tela, campo, valor)
+        await db.commit()
+        await db.refresh(tipo_tela)
+        return tipo_tela
+
+    @staticmethod
+    async def delete(db: AsyncSession, tipo_tela_id: int, tenant_id: Optional[int] = None) -> None:
+        tipo_tela = await TipoTelaService.get(db, tipo_tela_id, tenant_id)
+        tipo_tela.deleted_at = datetime.utcnow()
+        tipo_tela.estado = EstadoProducto.INACTIVO
+        await db.commit()
+
+    @staticmethod
+    async def validar_para_producto(
+        db: AsyncSession, tipo_tela_id: Optional[int], tenant_id: Optional[int] = None
+    ) -> None:
+        if tipo_tela_id is None:
+            return
+        try:
+            await TipoTelaService.get(db, int(tipo_tela_id), tenant_id)
+        except NotFoundException:
+            raise ValidationException("El tipo de tela no pertenece al tenant")
+
+
 class ProductoService:
     """Servicio de gestión de productos."""
     
@@ -684,6 +811,8 @@ class ProductoService:
             raise ConflictException("Ya existe un producto con este SKU")
         
         datos_dict = datos.model_dump(exclude={"stock_por_sucursal"})
+        # [EXAMEN-2] Fase A: el tipo de tela debe ser del mismo tenant.
+        await TipoTelaService.validar_para_producto(db, datos_dict.get("tipo_tela_id"))
         producto = Producto(**datos_dict)
         db.add(producto)
         await db.flush()
@@ -770,6 +899,7 @@ class ProductoService:
                 selectinload(Producto.categoria),
                 selectinload(Producto.temporada),
                 selectinload(Producto.proveedor),
+                selectinload(Producto.tipo_tela),
                 selectinload(Producto.colecciones),
                 selectinload(Producto.variantes).selectinload(VarianteProducto.talla),
                 selectinload(Producto.variantes).selectinload(VarianteProducto.color),
@@ -792,12 +922,15 @@ class ProductoService:
         genero: Optional[str] = None,
         temporada_id: Optional[int] = None,
         proveedor_id: Optional[int] = None,
-        buscar: Optional[str] = None
+        buscar: Optional[str] = None,
+        tipo_tela_id: Optional[int] = None,
+        composicion: Optional[str] = None
     ) -> Tuple[List[Producto], int]:
         query = select(Producto).options(
             selectinload(Producto.categoria),
             selectinload(Producto.temporada),
             selectinload(Producto.proveedor),
+            selectinload(Producto.tipo_tela),
             selectinload(Producto.variantes)
         )
         
@@ -811,6 +944,11 @@ class ProductoService:
             query = query.where(Producto.temporada_id == temporada_id)
         if proveedor_id:
             query = query.where(Producto.proveedor_id == proveedor_id)
+        # [EXAMEN-2] Fase A / RF-033
+        if tipo_tela_id:
+            query = query.where(Producto.tipo_tela_id == tipo_tela_id)
+        if composicion:
+            query = query.where(Producto.composicion.ilike(f"%{composicion}%"))
         if buscar:
             query = query.where(
                 or_(
@@ -842,6 +980,7 @@ class ProductoService:
                 selectinload(Producto.categoria),
                 selectinload(Producto.temporada),
                 selectinload(Producto.proveedor),
+                selectinload(Producto.tipo_tela),
                 selectinload(Producto.colecciones),
                 selectinload(Producto.variantes).selectinload(VarianteProducto.talla),
                 selectinload(Producto.variantes).selectinload(VarianteProducto.color)
@@ -933,6 +1072,8 @@ class ProductoService:
             .options(
                 selectinload(Producto.categoria),
                 selectinload(Producto.temporada),
+                selectinload(Producto.proveedor),
+                selectinload(Producto.tipo_tela),
                 selectinload(Producto.colecciones),
                 selectinload(Producto.variantes).selectinload(VarianteProducto.talla),
                 selectinload(Producto.variantes).selectinload(VarianteProducto.color)
@@ -954,6 +1095,7 @@ class ProductoService:
                 selectinload(Producto.categoria),
                 selectinload(Producto.temporada),
                 selectinload(Producto.proveedor),
+                selectinload(Producto.tipo_tela),
                 selectinload(Producto.colecciones),
                 selectinload(Producto.variantes).selectinload(VarianteProducto.talla),
                 selectinload(Producto.variantes).selectinload(VarianteProducto.color),
@@ -985,6 +1127,9 @@ class ProductoService:
                 raise ConflictException("Ya existe un producto con este SKU")
         
         update_data = datos.model_dump(exclude_unset=True)
+        # [EXAMEN-2] Fase A: misma validación de tenant al actualizar.
+        if "tipo_tela_id" in update_data:
+            await TipoTelaService.validar_para_producto(db, update_data["tipo_tela_id"])
         for field, value in update_data.items():
             setattr(producto, field, value)
         
@@ -1546,9 +1691,43 @@ class DatosInicialesCatalogoService:
             )
             if not result.scalar_one_or_none():
                 talla = Talla(
-                    valor=valor, tipo=tipo, descripcion=desc, tenant_id=tenant_id
+                    valor=valor, tipo=tipo, descripcion=desc, tenant_id=tenant_id,
+                    orden=TallaService.calcular_orden(valor),
                 )
                 db.add(talla)
+
+        # [EXAMEN-2] Fase D: backfill de `orden` en tallas previas.
+        await db.flush()
+        pendientes = await db.execute(
+            select(Talla).where(Talla.tenant_id == tenant_id, Talla.orden.is_(None))
+        )
+        for talla in pendientes.scalars().all():
+            talla.orden = TallaService.calcular_orden(talla.valor)
+
+        # [EXAMEN-2] Fase A: tipos de tela base del tenant (RF-033).
+        telas_data = [
+            ("Algodón", "Fibra natural suave y transpirable", "Lavar a 30°C, no usar secadora"),
+            ("Poliéster", "Fibra sintética resistente y de secado rápido", "Lavar a 40°C, planchar a baja temperatura"),
+            ("Mezcla", "Combinación de algodón y fibra sintética", "Lavar a 30°C con agua fría"),
+            ("Lino", "Fibra natural fresca de verano", "Lavar a mano y planchar húmeda"),
+            ("Lana", "Fibra natural térmica", "Lavar en seco o programa de lana"),
+            ("Denim", "Tejido de algodón grueso para jeans", "Lavar del revés con agua fría"),
+            ("Cuero", "Material natural para calzado y accesorios", "Limpiar con paño húmedo, no lavar"),
+            ("Sintético", "Textil técnico para accesorios y deporte", "Lavar a 30°C, no usar suavizante"),
+        ]
+        for nombre, descripcion, cuidados in telas_data:
+            result = await db.execute(
+                select(TipoTela).where(
+                    TipoTela.nombre == nombre, TipoTela.tenant_id == tenant_id
+                )
+            )
+            if not result.scalar_one_or_none():
+                db.add(TipoTela(
+                    nombre=nombre,
+                    descripcion=descripcion,
+                    cuidados_lavado=cuidados,
+                    tenant_id=tenant_id,
+                ))
         
         # Crear colores
         colores_data = [

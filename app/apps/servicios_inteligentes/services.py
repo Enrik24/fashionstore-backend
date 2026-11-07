@@ -937,72 +937,160 @@ class RecomendacionService:
         # Si todo el catálogo filtrado quedó sin stock, no dejar vacío: usar original.
         if con_stock:
             productos = con_stock
-        # Priorizar: misma temporada habitual + talla habitual disponible + con stock.
-        def _score_prioridad(p) -> tuple:
-            temp = getattr(getattr(p, "temporada", None), "nombre", None)
-            return (
-                0 if (temporada_habitual and temp == temporada_habitual) else 1,
-                0 if _tiene_talla(p, talla_habitual) else 1,
-                -stock_por_producto.get(p.id, 0),
-            )
-        productos = sorted(productos, key=_score_prioridad)[:40]
+        # ============================================================
+        # MODO IA (Groq) — DESHABILITADO. Codigo conservado comentado.
+        #
+        # PARA REACTIVAR LA IA (Groq) EN ESTE METODO:
+        #   1. Comenta (antepone # a cada linea) TODO el bloque
+        #      'MODO ACTIVO (sin IA)' de abajo, desde `import random`
+        #      hasta el `return RecomendacionResponse(...)` final.
+        #   2. Descomenta (quita el # inicial de cada linea) TODO
+        #      este bloque 'MODO IA (Groq)', desde `# Priorizar:`
+        #      hasta `# recomendaciones=items_recomendados[:limite]`.
+        #   3. Verifica GROQ_API_KEY en .env y reinicia el backend.
+        # No hay que cambiar nada mas: ambos bloques usan las
+        # mismas variables (productos, stock_por_producto,
+        # historial_compras, cliente_nombre, limite, preferencias,
+        # talla_habitual, temporada_habitual) y devuelven el mismo
+        # RecomendacionResponse, asi que el frontend no se entera.
+        # ============================================================
+        # # Priorizar: misma temporada habitual + talla habitual disponible + con stock.
+        # def _score_prioridad(p) -> tuple:
+            # temp = getattr(getattr(p, "temporada", None), "nombre", None)
+            # return (
+                # 0 if (temporada_habitual and temp == temporada_habitual) else 1,
+                # 0 if _tiene_talla(p, talla_habitual) else 1,
+                # -stock_por_producto.get(p.id, 0),
+            # )
+        # productos = sorted(productos, key=_score_prioridad)[:40]
+#
+        # catalogo_resumido = [
+            # {
+                # "id": p.id,
+                # "nombre": p.nombre,
+                # "categoria": p.categoria.nombre if p.categoria else "General",
+                # "genero": p.genero.value if hasattr(p.genero, 'value') else str(p.genero) if p.genero else "UNISEX",
+                # "precio": float(p.precio or 0),
+                # "temporada": getattr(getattr(p, "temporada", None), "nombre", None),
+                # "stock_disponible": stock_por_producto.get(p.id, 0),
+                # "talla_habitual_disponible": _tiene_talla(p, talla_habitual),
+            # }
+            # for p in productos
+        # ]
+#
+        # # Llamar a Groq con contexto del cliente (talla/temporada/disponibilidad)
+        # ai_res = await groq_service.get_recomendaciones(
+            # cliente_nombre=cliente_nombre,
+            # historial_compras=historial_compras,
+            # productos_catalogo=catalogo_resumido,
+            # preferencias=preferencias,
+            # talla_habitual=talla_habitual,
+            # temporada_habitual=temporada_habitual,
+        # )
+#
+        # # IDs ya comprados: nunca se recomiendan de vuelta
+        # ids_comprados = {h.get("producto_id") for h in historial_compras if h.get("producto_id")}
+        # categorias_compradas = {_normalizar_texto(h.get("categoria") or "") for h in historial_compras if h.get("categoria")}
+        # categorias_compradas.discard("")
+#
+        # # Mapear productos con detalles completos (excluyendo lo ya comprado y sin stock)
+        # prods_map = {p.id: p for p in productos}
+        # candidatos_ia = []
+        # for rec in ai_res.get("recomendaciones", []):
+            # pid = rec.get("producto_id")
+            # if pid in ids_comprados:
+                # continue
+            # if stock_por_producto.get(pid, 1) <= 0:
+                # continue
+            # prod = prods_map.get(pid)
+            # if prod:
+                # candidatos_ia.append((prod, rec.get("razon", "Recomendado para ti")))
+        # # Diversificar lo que devolvió la IA: prioriza categorías que
+        # # complementan la compra y limita 1 por categoría
+        # candidatos_ia = _diversificar_por_categoria(
+            # _ordenar_por_complemento([p for p, _ in candidatos_ia], categorias_compradas),
+            # limite,
+        # )
+        # razones = {rec.get("producto_id"): rec.get("razon", "Recomendado para ti") for rec in ai_res.get("recomendaciones", [])}
+        # items_recomendados: List[RecomendacionItem] = []
+        # for prod in candidatos_ia:
+            # img_list = _lista_imagenes(prod.imagenes)
+            # items_recomendados.append(RecomendacionItem(
+                # producto_id=prod.id,
+                # nombre=prod.nombre,
+                # sku=prod.sku,
+                # razon=razones.get(prod.id, "Recomendado para ti"),
+                # imagen_url=_imagen_principal(prod),
+                # imagenes=img_list,
+                # precio=float(prod.precio or 0),
+                # categoria=prod.categoria.nombre if prod.categoria else None,
+                # categoria_id=prod.categoria_id,
+                # genero=prod.genero.value if hasattr(prod.genero, 'value') else str(prod.genero) if prod.genero else None
+            # ))
+#
+        # # Si el LLM devolvió pocos o ninguno que coincida con DB, rellenar con
+        # # destacados DIVERSIFICADOS (complemento de outfit, 1 por categoría,
+        # # excluyendo lo ya comprado)
+        # if len(items_recomendados) < limite and productos:
+            # used_ids = {item.producto_id for item in items_recomendados} | ids_comprados
+            # candidatos = _diversificar_por_categoria(
+                # _ordenar_por_complemento(
+                    # [p for p in productos if p.id not in used_ids],
+                    # categorias_compradas,
+                # ),
+                # limite - len(items_recomendados),
+            # )
+            # for p in candidatos:
+                # img_list = _lista_imagenes(p.imagenes)
+                # items_recomendados.append(RecomendacionItem(
+                    # producto_id=p.id,
+                    # nombre=p.nombre,
+                    # sku=p.sku,
+                    # razon="Completa tu outfit con esta prenda complementaria",
+                    # imagen_url=_imagen_principal(p),
+                    # imagenes=img_list,
+                    # precio=float(p.precio or 0),
+                    # categoria=p.categoria.nombre if p.categoria else None,
+                    # categoria_id=p.categoria_id,
+                    # genero=p.genero.value if hasattr(p.genero, 'value') else str(p.genero) if p.genero else None
+                # ))
+#
+        # return RecomendacionResponse(
+            # cliente_id=cliente_id,
+            # estilo_detectado=ai_res.get("estilo_detectado", "Urbano Contemporáneo"),
+            # mensaje_personalizado=ai_res.get("mensaje_personalizado", f"¡Hola {cliente_nombre}! Descubre lo que seleccionamos para ti."),
+            # recomendaciones=items_recomendados[:limite]
+        # )
 
-        catalogo_resumido = [
-            {
-                "id": p.id,
-                "nombre": p.nombre,
-                "categoria": p.categoria.nombre if p.categoria else "General",
-                "genero": p.genero.value if hasattr(p.genero, 'value') else str(p.genero) if p.genero else "UNISEX",
-                "precio": float(p.precio or 0),
-                "temporada": getattr(getattr(p, "temporada", None), "nombre", None),
-                "stock_disponible": stock_por_producto.get(p.id, 0),
-                "talla_habitual_disponible": _tiene_talla(p, talla_habitual),
-            }
-            for p in productos
-        ]
+        # ============================================================
+        # MODO ACTIVO (sin IA): productos aleatorios por genero.
+        # - Genero inferido del historial (_genero_dominante):
+        #   HOMBRE -> HOMBRE + UNISEX, MUJER -> MUJER + UNISEX,
+        #   sin historial/empate -> los 3 generos. El filtro ya se
+        #   aplico arriba con _filtrar_productos_por_genero().
+        # - Solo productos con stock (filtro ya aplicado arriba) y
+        #   excluyendo lo ya comprado. Se baraja y se diversifica
+        #   1 por categoria primero (_diversificar_por_categoria).
+        # - Cero llamadas a Groq: no consume cuota del plan gratuito.
+        #
+        # PARA VOLVER A LA IA: ver instrucciones en el bloque
+        # 'MODO IA (Groq)' de arriba.
+        # ============================================================
+        import random
 
-        # Llamar a Groq con contexto del cliente (talla/temporada/disponibilidad)
-        ai_res = await groq_service.get_recomendaciones(
-            cliente_nombre=cliente_nombre,
-            historial_compras=historial_compras,
-            productos_catalogo=catalogo_resumido,
-            preferencias=preferencias,
-            talla_habitual=talla_habitual,
-            temporada_habitual=temporada_habitual,
-        )
-
-        # IDs ya comprados: nunca se recomiendan de vuelta
         ids_comprados = {h.get("producto_id") for h in historial_compras if h.get("producto_id")}
-        categorias_compradas = {_normalizar_texto(h.get("categoria") or "") for h in historial_compras if h.get("categoria")}
-        categorias_compradas.discard("")
+        candidatos = [p for p in productos if p.id not in ids_comprados]
+        random.shuffle(candidatos)
+        elegidos = _diversificar_por_categoria(candidatos, limite)
 
-        # Mapear productos con detalles completos (excluyendo lo ya comprado y sin stock)
-        prods_map = {p.id: p for p in productos}
-        candidatos_ia = []
-        for rec in ai_res.get("recomendaciones", []):
-            pid = rec.get("producto_id")
-            if pid in ids_comprados:
-                continue
-            if stock_por_producto.get(pid, 1) <= 0:
-                continue
-            prod = prods_map.get(pid)
-            if prod:
-                candidatos_ia.append((prod, rec.get("razon", "Recomendado para ti")))
-        # Diversificar lo que devolvió la IA: prioriza categorías que
-        # complementan la compra y limita 1 por categoría
-        candidatos_ia = _diversificar_por_categoria(
-            _ordenar_por_complemento([p for p, _ in candidatos_ia], categorias_compradas),
-            limite,
-        )
-        razones = {rec.get("producto_id"): rec.get("razon", "Recomendado para ti") for rec in ai_res.get("recomendaciones", [])}
         items_recomendados: List[RecomendacionItem] = []
-        for prod in candidatos_ia:
+        for prod in elegidos:
             img_list = _lista_imagenes(prod.imagenes)
             items_recomendados.append(RecomendacionItem(
                 producto_id=prod.id,
                 nombre=prod.nombre,
                 sku=prod.sku,
-                razon=razones.get(prod.id, "Recomendado para ti"),
+                razon="Recomendado para ti",
                 imagen_url=_imagen_principal(prod),
                 imagenes=img_list,
                 precio=float(prod.precio or 0),
@@ -1011,37 +1099,10 @@ class RecomendacionService:
                 genero=prod.genero.value if hasattr(prod.genero, 'value') else str(prod.genero) if prod.genero else None
             ))
 
-        # Si el LLM devolvió pocos o ninguno que coincida con DB, rellenar con
-        # destacados DIVERSIFICADOS (complemento de outfit, 1 por categoría,
-        # excluyendo lo ya comprado)
-        if len(items_recomendados) < limite and productos:
-            used_ids = {item.producto_id for item in items_recomendados} | ids_comprados
-            candidatos = _diversificar_por_categoria(
-                _ordenar_por_complemento(
-                    [p for p in productos if p.id not in used_ids],
-                    categorias_compradas,
-                ),
-                limite - len(items_recomendados),
-            )
-            for p in candidatos:
-                img_list = _lista_imagenes(p.imagenes)
-                items_recomendados.append(RecomendacionItem(
-                    producto_id=p.id,
-                    nombre=p.nombre,
-                    sku=p.sku,
-                    razon="Completa tu outfit con esta prenda complementaria",
-                    imagen_url=_imagen_principal(p),
-                    imagenes=img_list,
-                    precio=float(p.precio or 0),
-                    categoria=p.categoria.nombre if p.categoria else None,
-                    categoria_id=p.categoria_id,
-                    genero=p.genero.value if hasattr(p.genero, 'value') else str(p.genero) if p.genero else None
-                ))
-
         return RecomendacionResponse(
             cliente_id=cliente_id,
-            estilo_detectado=ai_res.get("estilo_detectado", "Urbano Contemporáneo"),
-            mensaje_personalizado=ai_res.get("mensaje_personalizado", f"¡Hola {cliente_nombre}! Descubre lo que seleccionamos para ti."),
+            estilo_detectado="Selección aleatoria",
+            mensaje_personalizado=f"¡Hola {cliente_nombre}! Descubre estas prendas para ti.",
             recomendaciones=items_recomendados[:limite]
         )
 

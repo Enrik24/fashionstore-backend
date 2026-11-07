@@ -11,7 +11,7 @@ extender sus modelos (`estado_sincronizacion`, `origen`, etc.).
 """
 from sqlalchemy import (
     BigInteger, Boolean, Column, DateTime, Enum, ForeignKey, Index, Integer,
-    JSON, String, Text, Time, UniqueConstraint, Uuid,
+    JSON, Numeric, String, Text, Time, UniqueConstraint, Uuid,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -48,6 +48,8 @@ class TipoOperacionOffline(str, enum.Enum):
     ORDEN_PAGO_DIFERIDO = "ORDEN_PAGO_DIFERIDO"
     DEVOLUCION_CAMBIO = "DEVOLUCION_CAMBIO"
     PAGO_DIFERIDO = "PAGO_DIFERIDO"
+    # [EXAMEN-2] Fase C / CU18: reposición creada sin conexión.
+    REPOSICION = "REPOSICION"
 
 
 class EstadoPagoDiferido(str, enum.Enum):
@@ -326,3 +328,66 @@ class PuntoSincronizacion(Base):
 
     def __repr__(self):
         return f"<PuntoSincronizacion tenant={self.tenant_id} dispositivo={self.dispositivo_id}>"
+
+
+# ============================================================
+# [EXAMEN-2] Fase E / RF-032 / RN-020 — Compensaciones
+# ============================================================
+
+class TipoCompensacion(str, enum.Enum):
+    """Medio con el que se devuelve el dinero de una venta rechazada."""
+    REEMBOLSO_EFECTIVO = "REEMBOLSO_EFECTIVO"
+    REEMBOLSO_TARJETA = "REEMBOLSO_TARJETA"
+    NOTA_CREDITO = "NOTA_CREDITO"
+    SALDO_FAVOR = "SALDO_FAVOR"
+
+
+class EstadoCompensacion(str, enum.Enum):
+    PENDIENTE = "PENDIENTE"
+    EN_PROCESO = "EN_PROCESO"
+    COMPLETADA = "COMPLETADA"
+    FALLIDA = "FALLIDA"
+    NO_APLICA = "NO_APLICA"
+
+
+class Compensacion(Base):
+    """Compensación económica de una venta offline ya pagada y rechazada.
+
+    [EXAMEN-2] Fase E: la unique por `operacion_offline_id` garantiza que el
+    reintento de sincronización nunca duplique el dinero (RN-005 / RN-020).
+    """
+    __tablename__ = "compensaciones"
+    __table_args__ = (
+        UniqueConstraint("operacion_offline_id", name="uq_compensaciones_operacion"),
+        Index("ix_compensaciones_tenant_estado", "tenant_id", "estado"),
+        Index("ix_compensaciones_tenant_fecha", "tenant_id", "fecha_creacion"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    operacion_offline_id = Column(
+        Integer, ForeignKey("operaciones_offline.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    orden_id = Column(Integer, ForeignKey("ordenes.id", ondelete="SET NULL"), nullable=True)
+    cliente_id = Column(Integer, ForeignKey("clientes.id", ondelete="SET NULL"), nullable=True)
+    tipo = Column(Enum(TipoCompensacion), nullable=False)
+    monto = Column(Numeric(10, 2), nullable=False)
+    moneda = Column(String(3), nullable=False, default="BOB", server_default="BOB")
+    estado = Column(
+        Enum(EstadoCompensacion), nullable=False, default=EstadoCompensacion.PENDIENTE
+    )
+    motivo = Column(String(200), nullable=True)
+    referencia_externa = Column(String(120), nullable=True)
+    notificado_cliente = Column(Boolean, nullable=False, default=False, server_default="false")
+    error_detalle = Column(Text, nullable=True)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_resolucion = Column(DateTime(timezone=True), nullable=True)
+    resuelto_por = Column(Integer, ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True)
+
+    operacion = relationship("OperacionOffline")
+    orden = relationship("Orden")
+    cliente = relationship("Cliente")
+    usuario_resolucion = relationship("Usuario", foreign_keys=[resuelto_por])
+
+    def __repr__(self):
+        return f"<Compensacion {self.tipo} {self.monto}: {self.estado}>"

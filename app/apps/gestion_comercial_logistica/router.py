@@ -14,7 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.tenant import autenticacion_flexible
-from app.apps.gestion_comercial_logistica.cambio_service import CambioDevolucionService
+from app.apps.gestion_comercial_logistica.cambio_service import (
+    AlternativaTallaService,
+    CambioDevolucionService,
+)
 from app.apps.gestion_comercial_logistica.schemas import (
     CambioRequest,
     RechazarDevolucionRequest,
@@ -188,6 +191,177 @@ async def rechazar_devolucion(
     )
     await db.commit()
     return resultado
+
+
+# ======================================================================
+# CU18 — Reposición
+# ======================================================================
+
+@router.post("/devoluciones/reposicion")
+async def registrar_reposicion(
+    datos: CambioRequest,
+    contexto=Depends(autenticacion_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    """Crea una reposición (fuerza `tipo = REPOSICION`)."""
+    payload = datos.model_dump()
+    payload["tipo"] = "REPOSICION"
+    resultado = await CambioDevolucionService.procesar_cambio(
+        db,
+        _tenant_id(contexto),
+        getattr(_usuario(contexto), "id", None),
+        payload,
+        es_offline=datos.uuid_offline is not None,
+    )
+    await db.commit()
+    return resultado
+
+
+@router.get("/devoluciones/reposiciones")
+async def listar_reposiciones(
+    estado: str | None = Query(None),
+    desde: datetime | None = Query(None),
+    hasta: datetime | None = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    contexto=Depends(autenticacion_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    return {
+        "reposiciones": await CambioDevolucionService.consultar_historial(
+            db,
+            _tenant_id(contexto),
+            tipo="REPOSICION",
+            estado=estado,
+            desde=desde,
+            hasta=hasta,
+            skip=skip,
+            limit=limit,
+        )
+    }
+
+
+@router.get("/devoluciones/{solicitud_id}/nota-reposicion")
+async def nota_reposicion(
+    solicitud_id: int,
+    contexto=Depends(autenticacion_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    contenido, nombre = await CambioDevolucionService.generar_nota_reposicion(
+        db, _tenant_id(contexto), solicitud_id
+    )
+    return Response(
+        content=contenido,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}"'},
+    )
+
+
+# ======================================================================
+# Fase D — Alternativas de talla y notificaciones al cliente
+# ======================================================================
+
+@router.get("/devoluciones/alternativas-talla/{variante_id}")
+async def alternativas_talla(
+    variante_id: int,
+    sucursal_id: int | None = Query(None),
+    direccion: str = Query("MAYOR", pattern="^(MAYOR|MENOR|mayor|menor)$"),
+    cantidad: int = Query(1, ge=1),
+    contexto=Depends(autenticacion_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    return await AlternativaTallaService.buscar(
+        db,
+        _tenant_id(contexto),
+        variante_id,
+        sucursal_id,
+        direccion.upper(),
+        cantidad,
+    )
+
+
+@router.post("/devoluciones/{solicitud_id}/notificar-alternativa")
+async def notificar_alternativa(
+    solicitud_id: int,
+    contexto=Depends(autenticacion_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    """Notifica al cliente que no hay talla alternativa (SIN_ALTERNATIVA)."""
+    from app.services.notificacion_service import NotificacionService
+
+    tenant_id = _tenant_id(contexto)
+    usuario_id = getattr(_usuario(contexto), "id", None)
+    solicitud = await CambioDevolucionService.obtener_solicitud(db, tenant_id, solicitud_id)
+    filas = await NotificacionService.crear(
+        db,
+        tenant_id=tenant_id,
+        cliente_id=solicitud.cliente_id,
+        usuario_id=usuario_id,
+        tipo="SIN_ALTERNATIVA",
+        asunto="No encontramos tu talla",
+        mensaje=(
+            "No hay stock de la talla solicitada. Puedes pedir una devolución "
+            "o un traspaso desde otra sucursal."
+        ),
+        referencia=("solicitud_devolucion", solicitud.id),
+    )
+    await db.commit()
+    return {
+        "solicitud_id": solicitud.id,
+        "notificaciones": [fila.id for fila in filas],
+        "estado": [
+            fila.estado.value if hasattr(fila.estado, "value") else fila.estado
+            for fila in filas
+        ],
+    }
+
+
+@router.get("/notificaciones/mis-notificaciones")
+async def mis_notificaciones(
+    cliente_id: int | None = Query(None),
+    estado: str | None = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    contexto=Depends(autenticacion_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.notificacion_service import NotificacionService
+
+    usuario = _usuario(contexto)
+    cliente = cliente_id or getattr(usuario, "cliente_id", None)
+    filas = await NotificacionService.listar(
+        db, _tenant_id(contexto), cliente_id=cliente,
+        estado=estado, skip=skip, limit=limit,
+    )
+    return {
+        "notificaciones": [
+            {
+                "id": fila.id,
+                "tipo": fila.tipo,
+                "canal": fila.canal.value if hasattr(fila.canal, "value") else fila.canal,
+                "asunto": fila.asunto,
+                "mensaje": fila.mensaje,
+                "estado": fila.estado.value if hasattr(fila.estado, "value") else fila.estado,
+                "leida": fila.leida,
+                "fecha_creacion": fila.fecha_creacion.isoformat() if fila.fecha_creacion else None,
+            }
+            for fila in filas
+        ]
+    }
+
+
+@router.patch("/notificaciones/{notificacion_id}/leida")
+async def marcar_notificacion_leida(
+    notificacion_id: int,
+    contexto=Depends(autenticacion_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.notificacion_service import NotificacionService
+
+    fila = await NotificacionService.marcar_leida(
+        db, _tenant_id(contexto), notificacion_id
+    )
+    return {"id": fila.id, "estado": fila.estado.value, "leida": fila.leida}
 
 
 @router.get("/devoluciones/{solicitud_id}/nota")

@@ -7,7 +7,6 @@ from typing import List
 import os
 from functools import lru_cache
 
-
 class Settings(BaseSettings):
     """Configuración de la aplicación cargada desde variables de entorno."""
     
@@ -42,6 +41,8 @@ class Settings(BaseSettings):
     STRIPE_WEBHOOK_SECRET: str = ""
     STRIPE_SUCCESS_URL: str = "http://localhost:4200/pago-exitoso"
     STRIPE_CANCEL_URL: str = "http://localhost:4200/pago-cancelado"
+    STRIPE_SUSCRIPCION_SUCCESS_URL: str = "http://localhost:4200/suscripcion-exitosa"
+    STRIPE_SUSCRIPCION_CANCEL_URL: str = "http://localhost:4200/suscripcion-cancelada"
     
     # PayPal
     PAYPAL_CLIENT_ID: str = ""
@@ -109,6 +110,13 @@ class Settings(BaseSettings):
     PAGO_DIFERIDO_MAX_REINTENTOS: int = 5
     PAGO_DIFERIDO_BACKOFF_BASE_SEG: int = 10
     PAGO_DIFERIDO_JOB_INTERVALO_SEG: int = 300
+
+    # [EXAMEN-2] Fase B (punto 6): respaldos de base de datos por tenant.
+    BACKUP_MODO: str = "logico"  # "logico" (JSON.GZ) | "sql" (INSERTs por tenant) | "pg_dump" (producción)
+    BACKUP_DIR: str = "./backups"
+    BACKUP_PERMITE_RESTAURACION: bool = False
+    BACKUP_JOB_INTERVALO_SEG: int = 3600
+    BACKUP_TIMEOUT_SEG: int = 300
 
     class Config:
         env_file = ".env"

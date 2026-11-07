@@ -1789,7 +1789,11 @@ class DevolucionService:
                 )
 
             # Si es cambio, validar disponibilidad de la nueva variante
-            if datos.tipo == TipoSolicitudDevolucion.CAMBIO:
+            # [EXAMEN-2] Fase C: la reposición también exige variante y stock.
+            if datos.tipo in (
+                TipoSolicitudDevolucion.CAMBIO,
+                TipoSolicitudDevolucion.REPOSICION,
+            ):
                 if not it.variante_cambio_id:
                     raise BadRequestException("Para solicitudes de CAMBIO es obligatorio especificar la nueva variante deseada")
                 
@@ -1982,7 +1986,10 @@ class DevolucionService:
             sucursal_id = res_suc.scalar_one_or_none()
 
         if sucursal_id:
-            if solicitud.tipo == TipoSolicitudDevolucion.CAMBIO:
+            if solicitud.tipo in (
+                TipoSolicitudDevolucion.CAMBIO,
+                TipoSolicitudDevolucion.REPOSICION,
+            ):
                 for it in solicitud.detalles:
                     if it.variante_producto_id:
                         await InventarioVentasService.reintegrar_stock_devolucion(
@@ -2015,7 +2022,10 @@ class DevolucionService:
                             motivo=f"Reintegro por devolución {solicitud.numero_solicitud}"
                         )
 
-        if solicitud.tipo == TipoSolicitudDevolucion.CAMBIO:
+        if solicitud.tipo in (
+            TipoSolicitudDevolucion.CAMBIO,
+            TipoSolicitudDevolucion.REPOSICION,
+        ):
             solicitud.estado = EstadoSolicitudDevolucion.COMPLETADA
             solicitud.fecha_resolucion = ahora
         elif solicitud.tipo == TipoSolicitudDevolucion.DEVOLUCION:

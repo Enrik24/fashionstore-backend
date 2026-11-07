@@ -94,6 +94,60 @@ class StripeService:
         }
 
     @staticmethod
+    def create_checkout_session_suscripcion(
+        suscripcion_id: int,
+        tenant_id: int,
+        plan_id: int,
+        plan_nombre: str,
+        precio_mensual: Decimal,
+        email_usuario: Optional[str] = None,
+        success_url: Optional[str] = None,
+        cancel_url: Optional[str] = None,
+        moneda: str = "usd",
+    ) -> Dict[str, str]:
+        """Crea una sesión de Stripe Checkout para pagar un plan."""
+        stripe.api_key = settings.STRIPE_API_KEY
+
+        s_url = success_url or (
+            f"{settings.STRIPE_SUSCRIPCION_SUCCESS_URL}"
+            f"?session_id={{CHECKOUT_SESSION_ID}}&suscripcion_id={suscripcion_id}"
+        )
+        c_url = cancel_url or (
+            f"{settings.STRIPE_SUSCRIPCION_CANCEL_URL}?suscripcion_id={suscripcion_id}"
+        )
+
+        total_centavos = max(int(Decimal(str(precio_mensual)) * 100), 50)
+
+        session_params: Dict[str, Any] = {
+            "payment_method_types": ["card"],
+            "line_items": [{
+                "price_data": {
+                    "currency": (moneda or "usd").lower(),
+                    "product_data": {"name": f"Plan {plan_nombre}"},
+                    "unit_amount": total_centavos,
+                },
+                "quantity": 1,
+            }],
+            "mode": "payment",
+            "success_url": s_url,
+            "cancel_url": c_url,
+            "metadata": {
+                "tipo": "suscripcion",
+                "suscripcion_id": str(suscripcion_id),
+                "tenant_id": str(tenant_id),
+                "plan_id": str(plan_id),
+            },
+        }
+        if email_usuario:
+            session_params["customer_email"] = email_usuario
+
+        session = stripe.checkout.Session.create(**session_params)
+        return {
+            "session_id": session.id,
+            "checkout_url": session.url,
+        }
+
+    @staticmethod
     def retrieve_session(session_id: str) -> stripe.checkout.Session:
         """Obtiene los detalles de una sesión de Stripe."""
         stripe.api_key = settings.STRIPE_API_KEY

@@ -21,13 +21,19 @@ from app.apps.gestion_ventas.models import (
     Orden,
     Reserva,
     SolicitudDevolucion,
+    TipoSolicitudDevolucion,
+)
+from app.apps.operaciones_offline.models import (
+    Compensacion,
+    EstadoCompensacion,
 )
 
 _CACHE: dict[tuple, dict[str, Any]] = {}
 _WIDGETS = {
     "Administrador": [
         "ventas_dia", "ventas_mes", "stock_critico", "reservas_pendientes",
-        "tasa_devoluciones", "top_cambiadas", "ticket_promedio",
+        "tasa_devoluciones", "tasa_reposiciones", "prendas_repuestas",
+        "monto_compensaciones", "top_cambiadas", "ticket_promedio",
     ],
     "Encargado": [
         "ventas_dia", "ventas_mes", "stock_critico", "reservas_pendientes",
@@ -171,6 +177,10 @@ class DashboardService:
             select(func.count(SolicitudDevolucion.id)).where(
                 SolicitudDevolucion.tenant_id == tenant_id,
                 func.date(SolicitudDevolucion.fecha_solicitud) >= inicio,
+                SolicitudDevolucion.tipo.in_([
+                    TipoSolicitudDevolucion.DEVOLUCION,
+                    TipoSolicitudDevolucion.CAMBIO,
+                ]),
             )
         )
         ventas = await cls._ventas_rango(db, tenant_id, inicio, hoy, None)
@@ -181,6 +191,92 @@ class DashboardService:
             "ventas": base,
             "tasa_pct": round((total_dev / base) * 100, 2) if base else 0.0,
         }
+
+    @classmethod
+    async def calcular_tasa_reposiciones(
+        cls, db: AsyncSession, tenant_id: int, periodo: str | None = None
+    ) -> dict:
+        """[EXAMEN-2] Punto 4: reposiciones del período sobre las ventas."""
+        hoy = date.today()
+        inicio = hoy.replace(day=1) if (periodo or "MES").upper() == "MES" else hoy - timedelta(days=30)
+        reposiciones = (await db.execute(
+            select(func.count(SolicitudDevolucion.id)).where(
+                SolicitudDevolucion.tenant_id == tenant_id,
+                SolicitudDevolucion.tipo == TipoSolicitudDevolucion.REPOSICION,
+                func.date(SolicitudDevolucion.fecha_solicitud) >= inicio,
+            )
+        )).scalar() or 0
+        ventas = await cls._ventas_rango(db, tenant_id, inicio, hoy, None)
+        base = ventas["ordenes"] or 0
+        return {
+            "reposiciones": int(reposiciones),
+            "ventas": base,
+            "tasa_pct": round((int(reposiciones) / base) * 100, 2) if base else 0.0,
+        }
+
+    @classmethod
+    async def calcular_monto_compensaciones(
+        cls, db: AsyncSession, tenant_id: int, periodo: str | None = None
+    ) -> dict:
+        """[EXAMEN-2] Punto 4: dinero compensado por ventas offline rechazadas."""
+        hoy = date.today()
+        inicio = hoy.replace(day=1) if (periodo or "MES").upper() == "MES" else hoy - timedelta(days=30)
+        filas = (await db.execute(
+            select(Compensacion.estado, func.count(Compensacion.id), func.sum(Compensacion.monto))
+            .where(
+                Compensacion.tenant_id == tenant_id,
+                func.date(Compensacion.fecha_creacion) >= inicio,
+            )
+            .group_by(Compensacion.estado)
+        )).all()
+        por_estado = {
+            (estado.value if hasattr(estado, "value") else str(estado)): {
+                "cantidad": int(total or 0),
+                "monto": round(_f(monto), 2),
+            }
+            for estado, total, monto in filas
+        }
+        total = round(sum(v["monto"] for v in por_estado.values()), 2)
+        pendientes = sum(
+            v["monto"] for k, v in por_estado.items()
+            if k in {EstadoCompensacion.PENDIENTE.value, EstadoCompensacion.FALLIDA.value}
+        )
+        return {
+            "monto_total": total,
+            "monto_pendiente": round(pendientes, 2),
+            "cantidad": sum(v["cantidad"] for v in por_estado.values()),
+            "por_estado": por_estado,
+        }
+
+    @classmethod
+    async def calcular_prendas_repuestas(
+        cls, db: AsyncSession, tenant_id: int, limite: int = 5
+    ) -> list[dict]:
+        """[EXAMEN-2] Punto 4: top de prendas repuestas (solo REPOSICION)."""
+        result = await db.execute(
+            select(
+                Producto.nombre,
+                Talla.valor,
+                Color.nombre,
+                func.sum(DetalleSolicitudDevolucion.cantidad),
+            )
+            .join(SolicitudDevolucion, SolicitudDevolucion.id == DetalleSolicitudDevolucion.solicitud_id)
+            .join(VarianteProducto, VarianteProducto.id == DetalleSolicitudDevolucion.variante_producto_id)
+            .join(Producto, Producto.id == VarianteProducto.producto_id)
+            .outerjoin(Talla, Talla.id == VarianteProducto.talla_id)
+            .outerjoin(Color, Color.id == VarianteProducto.color_id)
+            .where(
+                DetalleSolicitudDevolucion.tenant_id == tenant_id,
+                SolicitudDevolucion.tipo == TipoSolicitudDevolucion.REPOSICION,
+            )
+            .group_by(Producto.nombre, Talla.valor, Color.nombre)
+            .order_by(func.sum(DetalleSolicitudDevolucion.cantidad).desc())
+            .limit(min(int(limite), 20))
+        )
+        return [
+            {"producto": fila[0], "talla": fila[1], "color": fila[2], "unidades": int(fila[3] or 0)}
+            for fila in result.all()
+        ]
 
     @classmethod
     async def calcular_top_cambiadas(
@@ -237,6 +333,9 @@ class DashboardService:
             "stock_critico": await cls.calcular_stock_critico(db, tenant_id, sucursal_id),
             "reservas_pendientes": await cls.calcular_reservas_pendientes(db, tenant_id, sucursal_id),
             "tasa_devoluciones": await cls.calcular_tasa_devoluciones(db, tenant_id, periodo),
+            "tasa_reposiciones": await cls.calcular_tasa_reposiciones(db, tenant_id, periodo),
+            "prendas_repuestas": await cls.calcular_prendas_repuestas(db, tenant_id),
+            "monto_compensaciones": await cls.calcular_monto_compensaciones(db, tenant_id, periodo),
             "top_cambiadas": await cls.calcular_top_cambiadas(db, tenant_id),
             "ticket_promedio": await cls.calcular_ticket_promedio(db, tenant_id, periodo),
         }
@@ -355,6 +454,12 @@ class DashboardService:
             return {"kpi": kpi, **await cls.calcular_reservas_pendientes(db, tenant_id, sucursal_id)}
         if kpi in ("tasa_devoluciones", "devoluciones"):
             return {"kpi": kpi, **await cls.calcular_tasa_devoluciones(db, tenant_id, periodo)}
+        if kpi in ("tasa_reposiciones", "reposiciones"):
+            return {"kpi": kpi, **await cls.calcular_tasa_reposiciones(db, tenant_id, periodo)}
+        if kpi in ("prendas_repuestas", "repuestas"):
+            return {"kpi": kpi, "items": await cls.calcular_prendas_repuestas(db, tenant_id)}
+        if kpi in ("monto_compensaciones", "compensaciones"):
+            return {"kpi": kpi, **await cls.calcular_monto_compensaciones(db, tenant_id, periodo)}
         if kpi in ("top_cambiadas", "cambiadas"):
             return {"kpi": kpi, "items": await cls.calcular_top_cambiadas(db, tenant_id)}
         if kpi in ("ticket_promedio", "ticket"):

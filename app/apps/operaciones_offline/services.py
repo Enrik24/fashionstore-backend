@@ -60,7 +60,10 @@ from app.apps.gestion_usuarios.models import (
 _INTENTOS_PIN: dict[tuple[int, str], int] = {}
 _BLOQUEOS_PIN: dict[tuple[int, str], datetime] = {}
 _BLOQUEO_MINUTOS = 15
-_ROLES_OFFLINE = {"Administrador", "Encargado", "Cajero", "Super Administrador"}
+# Roles que pueden operar offline seg\u00fan CU17 (Cajero/Encargado/Cliente)
+# y CU05/CU06/CU15. Sin "Cliente" el solicitante nunca recib\u00eda token
+# y el frontend quedaba sin expira_en futuro (haySesionOffline=false).
+_ROLES_OFFLINE = {"Administrador", "Encargado", "Cajero", "Cliente", "Super Administrador"}
 
 
 # ============================================================
@@ -560,7 +563,13 @@ class SesionOfflineService:
         config = await ConfiguracionOfflineService.obtener_configuracion(db, tenant_id)
         dispositivo = None
         if dispositivo_id:
-            dispositivo = await DispositivoService.obtener_dispositivo(db, dispositivo_id, tenant_id)
+            try:
+                dispositivo = await DispositivoService.obtener_dispositivo(db, dispositivo_id, tenant_id)
+            except NotFoundException:
+                # Dispositivo aún no registrado en este backend (UUID
+                # generado localmente o registrado contra otro backend):
+                # el estado es "inactivo", no un error 404.
+                dispositivo = None
         clave = (usuario_id, str(dispositivo.id)) if dispositivo else (usuario_id, "")
         intentos = _INTENTOS_PIN.get(clave, 0)
 

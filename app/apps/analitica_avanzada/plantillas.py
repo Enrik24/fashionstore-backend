@@ -185,10 +185,15 @@ PLANTILLAS: list[dict] = [
     },
     {
         "clave": "devoluciones_periodo",
-        "nombre": "Devoluciones y cambios del período",
-        "descripcion": "Solicitudes de devolución/cambio registradas en el período.",
+        "nombre": "Devoluciones y reposiciones del período",
+        "descripcion": "Solicitudes de devolución, cambio o reposición registradas en el período.",
         "categoria": "DEVOLUCIONES",
-        "palabras_clave": ["devolución", "devolucion", "devoluciones", "cambio", "cambios"],
+        "palabras_clave": [
+            "devolución", "devolucion", "devoluciones", "cambio", "cambios",
+            # [EXAMEN-2] Fase C/D: sinónimos del nuevo flujo de reposición.
+            "reposición", "reposicion", "reposiciones", "repuesta", "repuestas",
+            "compensación", "compensacion", "compensaciones",
+        ],
         "parametros": [_p("fecha_inicio", "fecha"), _p("fecha_fin", "fecha")],
         "columnas": ["numero_solicitud", "tipo", "estado", "fecha_solicitud", "monto_reembolso"],
         "visualizacion": "TABLA",
@@ -231,10 +236,14 @@ PLANTILLAS: list[dict] = [
     },
     {
         "clave": "prendas_mas_cambiadas",
-        "nombre": "Prendas más cambiadas",
-        "descripcion": "Variantes con más unidades devueltas o cambiadas.",
+        "nombre": "Prendas más repuestas",
+        "descripcion": "Variantes con más unidades devueltas, cambiadas o repuestas.",
         "categoria": "DEVOLUCIONES",
-        "palabras_clave": ["prenda", "prendas", "cambiada", "cambiadas", "más cambiada", "mas cambiada"],
+        "palabras_clave": [
+            "prenda", "prendas", "cambiada", "cambiadas", "más cambiada", "mas cambiada",
+            # [EXAMEN-2] Punto 4: el reporte ahora habla de prendas repuestas.
+            "repuesta", "repuestas", "reposición", "reposicion", "reposiciones",
+        ],
         "parametros": [_p("limite", "entero", por_defecto=10)],
         "columnas": ["producto", "variante", "unidades_devueltas"],
         "visualizacion": "BARRAS",

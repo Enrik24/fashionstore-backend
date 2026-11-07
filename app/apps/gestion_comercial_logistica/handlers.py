@@ -23,9 +23,29 @@ async def manejar_devolucion_cambio(
     )
 
 
+async def manejar_reposicion(
+    db: AsyncSession, operacion, contexto: dict | None = None
+) -> dict:
+    """Procesa una reposición creada sin conexión (CU18).
+
+    `procesar_cambio_offline` lee `payload["tipo"]`, así que el mismo flujo
+    idempotente sirve para devolución y reposición.
+    """
+    payload = dict(operacion.payload_json or {})
+    payload.setdefault("tipo", "REPOSICION")
+    operacion.payload_json = payload
+    return await CambioDevolucionService.procesar_cambio_offline(
+        db, operacion, contexto
+    )
+
+
 def registrar_handlers() -> None:
-    """Registra el tipo propio del Paquete 4 (plan 4.7)."""
+    """Registra los tipos propios del Paquete 4 (plan 4.7)."""
     registrar_manejador(
         TipoOperacionOffline.DEVOLUCION_CAMBIO.value,
         manejar_devolucion_cambio,
+    )
+    registrar_manejador(
+        TipoOperacionOffline.REPOSICION.value,
+        manejar_reposicion,
     )

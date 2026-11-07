@@ -70,6 +70,11 @@ class UsoTenantResponse(BaseModel):
     max_sucursales: int
     usuarios_actuales: int
     productos_actuales: int
+    # [EXAMEN-2] Fase B: límites nuevos y consumo de respaldos.
+    max_usuarios: Optional[int] = None
+    max_productos: Optional[int] = None
+    backups_mes_actual: int = 0
+    max_backups_manuales: Optional[int] = None
 
 
 class TenantDetalleResponse(TenantResponse):
@@ -91,6 +96,14 @@ class PlanCreate(BaseModel):
     estado: str = Field("ACTIVO", pattern=r"^(ACTIVO|INACTIVO)$")
     orden: int = 0
     soporte_prioritario: bool = False
+    # [EXAMEN-2] Fase B (punto 6)
+    max_usuarios: Optional[int] = Field(None, ge=1)
+    max_productos: Optional[int] = Field(None, ge=1)
+    backup_automatico: bool = False
+    backup_frecuencia_horas: Optional[int] = Field(None, ge=1)
+    backup_retencion_dias: int = Field(7, ge=1)
+    backup_manual_mensual: Optional[int] = Field(None, ge=0)
+    permite_restauracion: bool = False
 
 
 class PlanUpdate(BaseModel):
@@ -103,6 +116,13 @@ class PlanUpdate(BaseModel):
     estado: Optional[str] = Field(None, pattern=r"^(ACTIVO|INACTIVO)$")
     orden: Optional[int] = None
     soporte_prioritario: Optional[bool] = None
+    max_usuarios: Optional[int] = Field(None, ge=1)
+    max_productos: Optional[int] = Field(None, ge=1)
+    backup_automatico: Optional[bool] = None
+    backup_frecuencia_horas: Optional[int] = Field(None, ge=1)
+    backup_retencion_dias: Optional[int] = Field(None, ge=1)
+    backup_manual_mensual: Optional[int] = Field(None, ge=0)
+    permite_restauracion: Optional[bool] = None
 
 
 class PlanResponse(BaseModel):
@@ -116,12 +136,63 @@ class PlanResponse(BaseModel):
     estado: str
     orden: int
     soporte_prioritario: bool
+    max_usuarios: Optional[int] = None
+    max_productos: Optional[int] = None
+    backup_automatico: bool = False
+    backup_frecuencia_horas: Optional[int] = None
+    backup_retencion_dias: int = 7
+    backup_manual_mensual: Optional[int] = None
+    permite_restauracion: bool = False
     model_config = ConfigDict(from_attributes=True)
 
 
 class PlanConUsoResponse(PlanResponse):
     tenants_activos: int = 0
     suscripciones_activas: int = 0
+
+
+# ============================================================
+# [EXAMEN-2] Fase B — Respaldos y restauraciones
+# ============================================================
+
+class BackupResponse(BaseModel):
+    id: int
+    tenant_id: int
+    tipo: str
+    estado: str
+    fecha_inicio: Optional[datetime] = None
+    fecha_fin: Optional[datetime] = None
+    tamano_bytes: Optional[int] = None
+    hash_sha256: Optional[str] = None
+    retencion_hasta: Optional[datetime] = None
+    creado_por: Optional[int] = None
+    error_detalle: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RestauracionCreate(BaseModel):
+    motivo: Optional[str] = Field(None, max_length=200)
+
+
+class RestauracionResponse(BaseModel):
+    id: int
+    tenant_id: int
+    backup_id: int
+    solicitado_por: Optional[int] = None
+    estado: str
+    motivo: Optional[str] = None
+    fecha_solicitud: Optional[datetime] = None
+    fecha_inicio: Optional[datetime] = None
+    fecha_fin: Optional[datetime] = None
+    error_detalle: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BackupUsoResponse(BaseModel):
+    tenant_id: int
+    backups_mes_actual: int
+    max_backups_manuales: Optional[int] = None
+    restantes_mes_actual: Optional[int] = None
 
 
 class ImpactoPlanResponse(BaseModel):
@@ -195,9 +266,21 @@ class PagoSuscripcionResponse(BaseModel):
     moneda: str
     estado: str
     stripe_payment_intent_id: Optional[str] = None
+    stripe_checkout_session_id: Optional[str] = None
     referencia: Optional[str] = None
     fecha: Optional[datetime] = None
     model_config = ConfigDict(from_attributes=True)
+
+
+class SuscripcionStripeCheckoutRequest(BaseModel):
+    suscripcion_id: int
+    success_url: Optional[str] = None
+    cancel_url: Optional[str] = None
+
+
+class SuscripcionStripeCheckoutResponse(BaseModel):
+    checkout_url: str
+    session_id: str
 
 
 class HistorialPagosResponse(BaseModel):

@@ -123,9 +123,10 @@ class ReporteGenerativoService:
                 f"Texto del usuario: {texto}"
             )
             respuesta = await cliente.client.chat.completions.create(
-                model="llama-3.1-70b-versatile",
+                model="openai/gpt-oss-20b",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
+                response_format={"type": "json_object"},
             )
             import json
 

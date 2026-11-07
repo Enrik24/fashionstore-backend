@@ -12,6 +12,7 @@ Diseño obligatorio del plan 9.2.5:
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from typing import Any, Iterable, Optional
 from uuid import UUID, uuid4
@@ -42,6 +43,8 @@ from app.apps.operaciones_offline.models import (
 )
 from app.apps.operaciones_offline.registro_manejadores import obtener_manejador
 from app.apps.operaciones_offline.schemas import LoteSyncRequest, OperacionLoteItem
+
+logger = logging.getLogger(__name__)
 
 TIPOS_VALIDOS = {t.value for t in TipoOperacionOffline}
 ESTADOS_REINTENTABLES = {
@@ -413,12 +416,39 @@ class SincronizacionService:
             )
             operacion.requiere_revision = manual
             operacion.motivo_rechazo = str(exc)
-            operacion.resultado_json = {
+            resultado_json = {
                 "estado": operacion.estado_sincronizacion.value,
                 "motivo": str(exc),
                 "datos_resultado": exc.datos or {},
                 "reintentar": manual,
             }
+            # [EXAMEN-2] Fase E / RF-032: si la venta ya estaba pagada, se
+            # genera la compensación antes de responder al dispositivo.
+            try:
+                from app.apps.operaciones_offline.compensacion_service import (
+                    CompensacionService,
+                )
+
+                payload = operacion.payload_json or {}
+                compensacion = await CompensacionService.crear_para_operacion(
+                    db,
+                    operacion,
+                    conflicto={
+                        "tipo_conflicto": exc.tipo_conflicto,
+                        "datos": exc.datos or {},
+                    },
+                    monto=payload.get("total") or payload.get("monto_total"),
+                    motivo=f"Venta offline rechazada: {exc.tipo_conflicto or 'RECHAZO'}",
+                )
+                if compensacion is not None:
+                    resultado_json["compensacion_id"] = compensacion.id
+                    resultado_json["compensacion_estado"] = compensacion.estado.value
+                    operacion.requiere_revision = True
+            except Exception:
+                logger.exception(
+                    "No se pudo crear la compensación de la operación %s", operacion.id
+                )
+            operacion.resultado_json = resultado_json
             await db.commit()
             return cls.construir_resultado(
                 uuid_operacion,

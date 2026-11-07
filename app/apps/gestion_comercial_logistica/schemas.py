@@ -23,11 +23,19 @@ class CambioRequest(BaseModel):
     numero_comprobante: Optional[str] = Field(None, max_length=50)
     uuid_venta_offline: Optional[UUID] = None
     uuid_offline: Optional[UUID] = None
-    tipo: str = Field("CAMBIO", pattern="^(CAMBIO|DEVOLUCION|cambio|devolucion)$")
+    # [EXAMEN-2] Fase C: el flujo natural es devolución; CAMBIO se conserva
+    # como alias legacy para los clientes offline antiguos.
+    tipo: str = Field(
+        "DEVOLUCION",
+        pattern="^(CAMBIO|DEVOLUCION|REPOSICION|cambio|devolucion|reposicion)$",
+    )
     motivo: str = Field(..., max_length=40)
     motivo_detalle: Optional[str] = Field(None, max_length=500)
     sucursal_id: Optional[int] = None
     metodo_pago_diferencia: str = Field("EFECTIVO", max_length=30)
+    # [EXAMEN-2] Fase D: alternativas de talla cuando no hay stock.
+    direccion_talla: Optional[str] = Field("MAYOR", pattern="^(MAYOR|MENOR|mayor|menor)$")
+    aceptar_sin_alternativa: bool = False
     observaciones: Optional[str] = Field(None, max_length=1000)
     items: list[CambioItemRequest] = Field(..., min_length=1)
 

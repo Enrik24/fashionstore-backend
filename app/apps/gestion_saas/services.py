@@ -10,7 +10,7 @@ from decimal import Decimal
 import re
 import secrets
 import unicodedata
-from typing import Optional
+from typing import Dict, Optional
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +26,8 @@ from app.exceptions import (
 )
 from app.security import get_password_hash
 from app.apps.gestion_saas.models import (
+    Backup,
+    EstadoBackup,
     EstadoPlan,
     EstadoSuscripcion,
     EstadoTenant,
@@ -33,6 +35,7 @@ from app.apps.gestion_saas.models import (
     Plan,
     Suscripcion,
     Tenant,
+    TipoBackup,
 )
 from app.apps.gestion_saas.schemas import (
     DatosEmpresaUpdate,
@@ -314,12 +317,30 @@ class TenantService:
         suscripcion = result.scalars().first()
         if suscripcion and suscripcion.plan:
             max_sucursales = suscripcion.plan.max_sucursales
+        # [EXAMEN-2] Fase B (punto 6): límites nuevos y respaldos del mes.
+        max_usuarios = suscripcion.plan.max_usuarios if suscripcion and suscripcion.plan else None
+        max_productos = suscripcion.plan.max_productos if suscripcion and suscripcion.plan else None
+        max_backups_manuales = (
+            suscripcion.plan.backup_manual_mensual if suscripcion and suscripcion.plan else None
+        )
+        inicio_mes = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        backups_mes = (await db.execute(
+            select(func.count(Backup.id)).where(
+                Backup.tenant_id == tenant_id,
+                Backup.tipo == TipoBackup.MANUAL,
+                Backup.fecha_inicio >= inicio_mes,
+            )
+        )).scalar_one() or 0
         return {
             "tenant_id": tenant_id,
             "sucursales_actuales": sucursales,
             "max_sucursales": max_sucursales,
             "usuarios_actuales": usuarios,
             "productos_actuales": productos,
+            "max_usuarios": max_usuarios,
+            "max_productos": max_productos,
+            "backups_mes_actual": int(backups_mes),
+            "max_backups_manuales": max_backups_manuales,
         }
 
     @staticmethod
@@ -460,19 +481,46 @@ class PlanService:
 
     @staticmethod
     async def sembrar_planes(db: AsyncSession):
-        """Semillas idempotentes de los únicos dos planes (plan, 3.7.11)."""
+        """Semillas idempotentes de los tres planes (plan, 3.7.11 y punto 6)."""
         planes = [
-            ("Básico", "Hasta 2 sucursales, sin reportes IA", Decimal("199.00"), 2, False, True, 1),
-            ("Profesional", "Hasta 10 sucursales, reportes IA y pago diferido", Decimal("399.00"), 10, True, True, 2),
+            dict(nombre="Básico", descripcion="Hasta 2 sucursales, sin reportes IA",
+                 precio_mensual=Decimal("199.00"), max_sucursales=2, max_usuarios=10,
+                 max_productos=500, permite_reportes_ia=False, permite_pago_diferido=True,
+                 orden=1, soporte_prioritario=False, backup_automatico=True,
+                 backup_frecuencia_horas=168, backup_retencion_dias=7,
+                 backup_manual_mensual=0, permite_restauracion=False),
+            dict(nombre="Profesional", descripcion="Hasta 10 sucursales, reportes IA y pago diferido",
+                 precio_mensual=Decimal("399.00"), max_sucursales=10, max_usuarios=50,
+                 max_productos=5000, permite_reportes_ia=True, permite_pago_diferido=True,
+                 orden=2, soporte_prioritario=False, backup_automatico=True,
+                 backup_frecuencia_horas=24, backup_retencion_dias=30,
+                 backup_manual_mensual=2, permite_restauracion=False),
+            dict(nombre="Empresarial", descripcion="Límites ampliados, respaldos cada 6 h y restauración",
+                 precio_mensual=Decimal("799.00"), max_sucursales=50, max_usuarios=200,
+                 max_productos=None, permite_reportes_ia=True, permite_pago_diferido=True,
+                 orden=3, soporte_prioritario=True, backup_automatico=True,
+                 backup_frecuencia_horas=6, backup_retencion_dias=365,
+                 backup_manual_mensual=None, permite_restauracion=True),
         ]
-        for nombre, desc, precio, max_suc, ia, pago, orden in planes:
-            result = await db.execute(select(Plan).where(Plan.nombre == nombre))
-            if result.scalar_one_or_none() is None:
-                db.add(Plan(
-                    nombre=nombre, descripcion=desc, precio_mensual=precio,
-                    max_sucursales=max_suc, permite_reportes_ia=ia,
-                    permite_pago_diferido=pago, orden=orden,
-                ))
+        for datos in planes:
+            result = await db.execute(select(Plan).where(Plan.nombre == datos["nombre"]))
+            plan = result.scalar_one_or_none()
+            if plan is None:
+                db.add(Plan(**datos))
+                continue
+            # Completa los campos de la Fase B sin tocar precios ya definidos.
+            if plan.max_usuarios is None and datos["max_usuarios"] is not None:
+                plan.max_usuarios = datos["max_usuarios"]
+            if plan.max_productos is None and datos["max_productos"] is not None:
+                plan.max_productos = datos["max_productos"]
+            if not plan.backup_automatico:
+                plan.backup_automatico = datos["backup_automatico"]
+            if plan.backup_frecuencia_horas is None:
+                plan.backup_frecuencia_horas = datos["backup_frecuencia_horas"]
+            if plan.backup_manual_mensual is None and datos["backup_manual_mensual"] is not None:
+                plan.backup_manual_mensual = datos["backup_manual_mensual"]
+            if datos["permite_restauracion"]:
+                plan.permite_restauracion = True
         await db.flush()
 
 
@@ -491,6 +539,82 @@ class SuscripcionService:
             raise LimitePlanExcedido(
                 f"El tenant tiene {actuales} sucursales y el plan permite {plan.max_sucursales}"
             )
+
+    @staticmethod
+    async def _plan_activo(db: AsyncSession, tenant_id: int) -> Optional[Plan]:
+        result = await db.execute(
+            select(Suscripcion)
+            .options(selectinload(Suscripcion.plan))
+            .where(
+                Suscripcion.tenant_id == tenant_id,
+                Suscripcion.estado == EstadoSuscripcion.ACTIVA,
+            )
+        )
+        suscripcion = result.scalars().first()
+        if suscripcion is None:
+            raise ValidationException("El tenant no tiene una suscripción activa")
+        return suscripcion.plan
+
+    @staticmethod
+    async def verificar_limite_usuarios(db: AsyncSession, tenant_id: int):
+        """[EXAMEN-2] Fase B: bloquea el alta de usuarios por encima del plan."""
+        plan = await SuscripcionService._plan_activo(db, tenant_id)
+        if plan is None or plan.max_usuarios is None:
+            return plan
+        actuales = (await db.execute(
+            select(func.count(Usuario.id)).where(
+                Usuario.tenant_id == tenant_id,
+            )
+        )).scalar_one() or 0
+        if actuales >= plan.max_usuarios:
+            raise LimitePlanExcedido(
+                f"El plan {plan.nombre} permite {plan.max_usuarios} usuarios"
+            )
+        return plan
+
+    @staticmethod
+    async def verificar_limite_productos(db: AsyncSession, tenant_id: int):
+        """[EXAMEN-2] Fase B: bloquea el alta de productos por encima del plan."""
+        plan = await SuscripcionService._plan_activo(db, tenant_id)
+        if plan is None or plan.max_productos is None:
+            return plan
+        actuales = (await db.execute(
+            select(func.count(Producto.id)).where(
+                Producto.tenant_id == tenant_id,
+                Producto.deleted_at.is_(None),
+            )
+        )).scalar_one() or 0
+        if actuales >= plan.max_productos:
+            raise LimitePlanExcedido(
+                f"El plan {plan.nombre} permite {plan.max_productos} productos"
+            )
+        return plan
+
+    @staticmethod
+    async def _validar_limites_plan(db: AsyncSession, tenant_id: int, plan: Plan) -> None:
+        """Valida sucursales, usuarios y productos antes de asignar un plan."""
+        await SuscripcionService._validar_limite_sucursales(db, tenant_id, plan)
+        if plan.max_usuarios is not None:
+            usuarios = (await db.execute(
+                select(func.count(Usuario.id)).where(
+                Usuario.tenant_id == tenant_id,
+                )
+            )).scalar_one() or 0
+            if usuarios > plan.max_usuarios:
+                raise LimitePlanExcedido(
+                    f"El tenant tiene {usuarios} usuarios y el plan permite {plan.max_usuarios}"
+                )
+        if plan.max_productos is not None:
+            productos = (await db.execute(
+                select(func.count(Producto.id)).where(
+                    Producto.tenant_id == tenant_id,
+                    Producto.deleted_at.is_(None),
+                )
+            )).scalar_one() or 0
+            if productos > plan.max_productos:
+                raise LimitePlanExcedido(
+                    f"El tenant tiene {productos} productos y el plan permite {plan.max_productos}"
+                )
 
     @staticmethod
     async def verificar_limite_sucursales(db: AsyncSession, tenant_id: int):
@@ -532,7 +656,7 @@ class SuscripcionService:
         if result.scalars().first():
             raise ConflictException("El tenant ya tiene una suscripción activa")
 
-        await SuscripcionService._validar_limite_sucursales(db, datos.tenant_id, plan)
+        await SuscripcionService._validar_limites_plan(db, datos.tenant_id, plan)
         hoy = date.today()
         suscripcion = Suscripcion(
             tenant_id=datos.tenant_id,
@@ -566,7 +690,7 @@ class SuscripcionService:
         plan = await PlanService.obtener_plan(db, plan_id)
         if plan.estado != EstadoPlan.ACTIVO:
             raise ValidationException("El plan está inactivo")
-        await SuscripcionService._validar_limite_sucursales(db, suscripcion.tenant_id, plan)
+        await SuscripcionService._validar_limites_plan(db, suscripcion.tenant_id, plan)
         suscripcion.plan_id = plan.id
         await db.commit()
         await db.refresh(suscripcion)
@@ -655,6 +779,102 @@ class PagoSuscripcionService:
         await db.commit()
         await db.refresh(pago)
         return pago
+
+    @staticmethod
+    async def crear_sesion_stripe(
+        db: AsyncSession, suscripcion_id: int,
+        email_usuario: Optional[str] = None,
+        success_url: Optional[str] = None,
+        cancel_url: Optional[str] = None,
+        tenant_id: Optional[int] = None,
+    ) -> Dict[str, str]:
+        from app.apps.gestion_ventas.models import EstadoTransaccion
+        from app.services.stripe_service import StripeService
+
+        suscripcion = await SuscripcionService.obtener(db, suscripcion_id)
+        if tenant_id is not None and suscripcion.tenant_id != tenant_id:
+            raise NotFoundException("Suscripción no encontrada")
+        plan = suscripcion.plan
+        if plan is None:
+            plan = await PlanService.obtener_plan(db, suscripcion.plan_id)
+
+        if not email_usuario:
+            tenant = await TenantService.obtener_tenant(db, suscripcion.tenant_id)
+            email_usuario = tenant.correo_contacto
+
+        session_data = StripeService.create_checkout_session_suscripcion(
+            suscripcion_id=suscripcion.id,
+            tenant_id=suscripcion.tenant_id,
+            plan_id=plan.id,
+            plan_nombre=plan.nombre,
+            precio_mensual=plan.precio_mensual,
+            email_usuario=email_usuario,
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+
+        pago = PagoSuscripcion(
+            tenant_id=suscripcion.tenant_id,
+            suscripcion_id=suscripcion.id,
+            monto=plan.precio_mensual,
+            moneda="USD",
+            estado=EstadoTransaccion.PENDIENTE,
+            stripe_checkout_session_id=session_data["session_id"],
+            referencia=session_data["session_id"],
+            datos_respuesta={"session_id": session_data["session_id"], "plan_id": plan.id},
+        )
+        db.add(pago)
+        await db.commit()
+        return session_data
+
+    @staticmethod
+    async def procesar_pago_stripe_completado(
+        db: AsyncSession, session_id: str, suscripcion_id: Optional[int] = None
+    ) -> str:
+        from app.apps.gestion_ventas.models import EstadoTransaccion
+        from app.services.stripe_service import StripeService
+
+        session_stripe = StripeService.retrieve_session(session_id)
+        status = getattr(session_stripe, "payment_status", None) or "unknown"
+        if status != "paid":
+            return status
+
+        result = await db.execute(
+            select(PagoSuscripcion).where(
+                PagoSuscripcion.stripe_checkout_session_id == session_id
+            )
+        )
+        pago = result.scalar_one_or_none()
+        if pago is None and suscripcion_id is not None:
+            result = await db.execute(
+                select(PagoSuscripcion)
+                .where(
+                    PagoSuscripcion.suscripcion_id == suscripcion_id,
+                    PagoSuscripcion.estado == EstadoTransaccion.PENDIENTE,
+                )
+                .order_by(PagoSuscripcion.fecha.desc())
+                .limit(1)
+            )
+            pago = result.scalar_one_or_none()
+
+        if pago is None:
+            return status
+
+        payment_intent = getattr(session_stripe, "payment_intent", None)
+        if payment_intent:
+            pago.stripe_payment_intent_id = payment_intent
+        respuesta = dict(pago.datos_respuesta or {})
+        respuesta.update({
+            "session_id": session_id,
+            "payment_intent": payment_intent,
+            "payment_status": status,
+        })
+        pago.datos_respuesta = respuesta
+        await db.flush()
+
+        if pago.estado != EstadoTransaccion.CONFIRMADO:
+            await PagoSuscripcionService.confirmar(db, pago.id)
+        return status
 
     @staticmethod
     async def historial(db: AsyncSession, tenant_id: int, skip: int = 0, limit: int = 50) -> tuple[list[PagoSuscripcion], int]:
@@ -777,6 +997,8 @@ class ConfiguracionTenantService:
 
     @staticmethod
     async def crear_usuario(db: AsyncSession, tenant_id: int, datos: UsuarioConfigCreate) -> Usuario:
+        # [EXAMEN-2] Fase B: límite de usuarios del plan.
+        await SuscripcionService.verificar_limite_usuarios(db, tenant_id)
         result = await db.execute(select(Sucursal).where(
             Sucursal.id == datos.sucursal_id, Sucursal.tenant_id == tenant_id
         ))

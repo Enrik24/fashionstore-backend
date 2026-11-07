@@ -6,18 +6,28 @@
 - Endpoints `/api/v1/saas/configuracion`, `/mi-suscripcion` y `/mi-plan`:
   Administrador del tenant resuelto por el token.
 """
-from fastapi import APIRouter, Depends, Query
+from datetime import datetime
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.exceptions import NotFoundException
+from app.exceptions import BadRequestException, NotFoundException
+from app.security import get_current_user
 from app.tenant import (
     require_super_admin,
     require_tenant_role,
     get_current_tenant,
 )
+from app.apps.gestion_saas.backup_service import BackupService
 from app.apps.gestion_saas.schemas import (
     AsistenteConfiguracionResponse,
+    BackupResponse,
+    BackupUsoResponse,
+    RestauracionCreate,
+    RestauracionResponse,
     CambioPlanRequest,
     ConfiguracionOfflineResponse,
     ConfiguracionTenantResponse,
@@ -34,6 +44,8 @@ from app.apps.gestion_saas.schemas import (
     PreferenciasOfflineUpdate,
     SuscripcionCreate,
     SuscripcionResponse,
+    SuscripcionStripeCheckoutRequest,
+    SuscripcionStripeCheckoutResponse,
     SuscripcionUpdate,
     SucursalConfigCreate,
     TenantCreate,
@@ -275,31 +287,84 @@ async def cancelar_suscripcion(
     }
 
 
-@router.post("/suscripciones/checkout")
+@router.post("/suscripciones/checkout", response_model=SuscripcionStripeCheckoutResponse)
 async def checkout_suscripcion(
-    datos: PagoSuscripcionCreate,
+    datos: SuscripcionStripeCheckoutRequest,
+    tenant=Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
-    _=Depends(require_super_admin),
+    current_user=Depends(require_tenant_role("Administrador")),
 ):
-    """RN-011: crea el intento de cobro. Sin clave Stripe opera en modo simulado."""
-    pago = await PagoSuscripcionService.registrar(db, datos)
-    return {
-        "modo": "simulado",
-        "pago_id": pago.id,
-        "estado": pago.estado,
-        "mensaje": "Configure STRIPE_API_KEY para cobrar con Stripe",
-    }
+    """RN-011: crea sesión de Stripe Checkout para pagar el plan de la suscripción."""
+    return await PagoSuscripcionService.crear_sesion_stripe(
+        db,
+        datos.suscripcion_id,
+        email_usuario=getattr(current_user, "correo", None),
+        success_url=datos.success_url,
+        cancel_url=datos.cancel_url,
+        tenant_id=tenant.id,
+    )
+
+
+@router.post("/suscripciones/stripe/confirmar-retorno")
+async def confirmar_retorno_suscripcion(
+    session_id: str = Query(...),
+    suscripcion_id: int = Query(...),
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+    _=Depends(get_current_user),
+):
+    """Verifica y confirma el pago de suscripción tras el retorno de Stripe."""
+    status = await PagoSuscripcionService.procesar_pago_stripe_completado(
+        db, session_id, suscripcion_id
+    )
+    if status != "paid":
+        raise BadRequestException(
+            f"Stripe aún no registra el pago (estado: {status}). "
+            "Si ya pagaste, espera unos segundos y reintenta."
+        )
+    return {"mensaje": "Pago de suscripción confirmado", "payment_status": status}
 
 
 @router.post("/webhooks/stripe")
-async def webhook_stripe(payload: dict, db: AsyncSession = Depends(get_db)):
-    """Confirmación de pago de suscripción (idempotente por payment_intent)."""
+async def webhook_stripe(
+    request: Request,
+    stripe_signature: str = Header(None, alias="stripe-signature"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Confirmación de pago de suscripción vía webhook Stripe (`checkout.session.completed`)."""
     from sqlalchemy import select
 
     from app.apps.gestion_saas.models import PagoSuscripcion
     from app.apps.gestion_ventas.models import EstadoTransaccion
+    from app.services.stripe_service import StripeService
 
-    payment_intent = payload.get("data", {}).get("object", {}).get("id") or payload.get("payment_intent_id")
+    # Flujo oficial: validar firma y procesar con metadata.
+    if stripe_signature:
+        try:
+            payload = await request.body()
+            event = StripeService.construct_webhook_event(payload, stripe_signature)
+        except Exception as exc:
+            raise BadRequestException(f"Error validando webhook de Stripe: {exc}")
+        if event["type"] == "checkout.session.completed":
+            session = event["data"]["object"]
+            meta = session.get("metadata") or {}
+            try:
+                suscripcion_id = int(meta.get("suscripcion_id")) if meta.get("suscripcion_id") else None
+            except (TypeError, ValueError):
+                suscripcion_id = None
+            status = await PagoSuscripcionService.procesar_pago_stripe_completado(
+                db, session["id"], suscripcion_id
+            )
+            return {"recibido": True, "procesado": status == "paid", "pago_estado": status}
+        return {"recibido": True, "procesado": False, "motivo": f"Tipo de evento no procesado: {event['type']}"}
+
+    # Compatibilidad: payload JSON sin firma (idempotente por payment_intent).
+    try:
+        payload_json = await request.json()
+    except Exception:
+        return {"recibido": True, "procesado": False, "motivo": "Payload inválido"}
+    payment_intent = (payload_json.get("data", {}).get("object", {}).get("id")
+                      or payload_json.get("payment_intent_id"))
     if not payment_intent:
         return {"recibido": True, "procesado": False, "motivo": "Sin payment_intent_id"}
     result = await db.execute(
@@ -419,13 +484,123 @@ async def funcionalidades_plan(
 ):
     suscripcion = await SuscripcionService.mi_suscripcion(db, tenant.id)
     config = await ConfiguracionOfflineService.obtener_configuracion(db, tenant.id)
+    plan = suscripcion.plan if suscripcion else None
     return {
-        "plan": suscripcion.plan.nombre if suscripcion and suscripcion.plan else None,
-        "reportes_ia": bool(suscripcion and suscripcion.plan and suscripcion.plan.permite_reportes_ia),
-        "pago_diferido": bool(suscripcion and suscripcion.plan and suscripcion.plan.permite_pago_diferido),
+        "plan": plan.nombre if plan else None,
+        "reportes_ia": bool(plan and plan.permite_reportes_ia),
+        "pago_diferido": bool(plan and plan.permite_pago_diferido),
         "carrito_offline": config.habilitar_carrito_offline,
-        "max_sucursales": suscripcion.plan.max_sucursales if suscripcion and suscripcion.plan else 0,
+        "max_sucursales": plan.max_sucursales if plan else 0,
+        # [EXAMEN-2] Fase B (punto 6): límites y respaldos del plan.
+        "max_usuarios": plan.max_usuarios if plan else None,
+        "max_productos": plan.max_productos if plan else None,
+        "backup_automatico": bool(plan and plan.backup_automatico),
+        "backup_frecuencia_horas": plan.backup_frecuencia_horas if plan else None,
+        "backup_retencion_dias": plan.backup_retencion_dias if plan else None,
+        "backup_manual_mensual": plan.backup_manual_mensual if plan else None,
+        "permite_restauracion": bool(plan and plan.permite_restauracion),
     }
+
+
+# ============================================================
+# [EXAMEN-2] Fase B (punto 6) — Respaldos y restauraciones (RF-035)
+# ============================================================
+
+@router.get("/backups/uso", response_model=BackupUsoResponse)
+async def uso_backups(
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_tenant_role("Administrador")),
+):
+    """Cuántos respaldos manuales quedan este mes según el plan."""
+    return await BackupService.uso(db, tenant.id)
+
+
+@router.get("/backups", response_model=list[BackupResponse])
+async def listar_backups(
+    estado: str | None = Query(None),
+    tipo: str | None = Query(None),
+    desde: datetime | None = Query(None),
+    hasta: datetime | None = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_tenant_role("Administrador")),
+):
+    return await BackupService.listar(
+        db, tenant.id, estado=estado, tipo=tipo, desde=desde, hasta=hasta,
+        skip=skip, limit=limit,
+    )
+
+
+@router.post("/backups", response_model=BackupResponse, status_code=201)
+async def crear_backup(
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_tenant_role("Administrador")),
+):
+    """Crea y ejecuta un respaldo manual (valida el límite mensual del plan)."""
+    return await BackupService.crear_manual(db, tenant.id, current_user.id)
+
+
+@router.get("/restauraciones", response_model=list[RestauracionResponse])
+async def listar_restauraciones(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_tenant_role("Administrador")),
+):
+    return await BackupService.listar_restauraciones(db, tenant.id, skip, limit)
+
+
+@router.get("/backups/{backup_id}", response_model=BackupResponse)
+async def obtener_backup(
+    backup_id: int,
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_tenant_role("Administrador")),
+):
+    return await BackupService.obtener(db, tenant.id, backup_id)
+
+
+@router.get("/backups/{backup_id}/descargar")
+async def descargar_backup(
+    backup_id: int,
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_tenant_role("Administrador")),
+):
+    backup = await BackupService.obtener(db, tenant.id, backup_id)
+    if not backup.ruta or not Path(backup.ruta).exists():
+        raise NotFoundException("El archivo del respaldo no está disponible")
+    ruta = Path(backup.ruta)
+    media_type = (
+        "text/sql"
+        if ruta.suffix == ".sql"
+        else "application/gzip" if ruta.suffix == ".gz" else "application/octet-stream"
+    )
+    return FileResponse(
+        backup.ruta,
+        media_type=media_type,
+        filename=ruta.name,
+    )
+
+
+@router.post("/backups/{backup_id}/restaurar", response_model=RestauracionResponse)
+async def restaurar_backup(
+    backup_id: int,
+    datos: RestauracionCreate | None = None,
+    tenant=Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_tenant_role("Administrador")),
+):
+    """Registra y ejecuta la restauración (protegida por plan y por flag)."""
+    motivo = datos.motivo if datos else None
+    return await BackupService.restaurar(
+        db, tenant.id, backup_id, current_user.id, motivo=motivo
+    )
 
 
 @router.get("/mi-suscripcion/pagos", response_model=HistorialPagosResponse)

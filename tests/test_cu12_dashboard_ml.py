@@ -39,7 +39,12 @@ async def test_dashboard_admin_con_cache(
     assert set(cuerpo["widgets"]) == {
         "ventas_dia", "ventas_mes", "stock_critico", "reservas_pendientes",
         "tasa_devoluciones", "top_cambiadas", "ticket_promedio",
+        # [EXAMEN-2] Punto 4: KPIs de reposiciones y compensaciones.
+        "tasa_reposiciones", "prendas_repuestas", "monto_compensaciones",
     }
+    assert "tasa_pct" in cuerpo["widgets"]["tasa_reposiciones"]
+    assert "monto_total" in cuerpo["widgets"]["monto_compensaciones"]
+    assert isinstance(cuerpo["widgets"]["prendas_repuestas"], list)
     assert cuerpo["widgets"]["ventas_dia"]["ordenes"] >= 1
     assert cuerpo["widgets"]["ventas_mes"]["actual"]["total"] >= 150.0
 

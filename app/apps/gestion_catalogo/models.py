@@ -50,6 +50,9 @@ class TipoMovimiento(str, enum.Enum):
     TRASPASO_ENTRADA = "TRASPASO_ENTRADA"
     MERMA = "MERMA"
     CAMBIO = "CAMBIO"
+    # [EXAMEN-2] Fase C / CU18: la reposición distingue entrada y salida.
+    REPOSICION_ENTRADA = "REPOSICION_ENTRADA"
+    REPOSICION_SALIDA = "REPOSICION_SALIDA"
 
 
 # Modelo: Ciudad
@@ -158,6 +161,8 @@ class Talla(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     valor = Column(String(10), nullable=False)
     tipo = Column(String(50), nullable=True)  # ropa, calzado, accesorios
+    # [EXAMEN-2] Fase D / RF-034: orden de talla para buscar mayor/menor.
+    orden = Column(Integer, nullable=True)
     descripcion = Column(String(100), nullable=True)
     # [EXAMEN-2] Aislamiento multitenant
     tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -284,6 +289,35 @@ class Proveedor(Base):
 
 
 # Modelo: Producto
+# Modelo: Tipo de tela (punto 3 de la profesora)
+class TipoTela(Base):
+    """Catálogo de tipos de tela del tenant (RF-033 / RN-021).
+
+    [EXAMEN-2] Fase A: entidad propia por tenant para poder filtrar el
+    catálogo y usarla en reportes; la composición sigue siendo texto libre en
+    `Producto.composicion`.
+    """
+    __tablename__ = "tipos_tela"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "nombre", name="uq_tipos_tela_tenant_nombre"),
+        Index("ix_tipos_tela_tenant_estado", "tenant_id", "estado"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    nombre = Column(String(80), nullable=False)
+    descripcion = Column(Text, nullable=True)
+    cuidados_lavado = Column(String(200), nullable=True)
+    estado = Column(Enum(EstadoProducto), default=EstadoProducto.ACTIVO, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+    productos = relationship("Producto", back_populates="tipo_tela")
+
+    def __repr__(self):
+        return f"<TipoTela {self.nombre}>"
+
+
 class Producto(Base):
     """Tabla de productos (prendas de vestir).
 
@@ -298,6 +332,8 @@ class Producto(Base):
         # [EXAMEN-2] Índices obligatorios del plan, 16.1
         Index("ix_productos_tenant_estado", "tenant_id", "estado"),
         Index("ix_productos_tenant_categoria", "tenant_id", "categoria_id"),
+        # [EXAMEN-2] Fase A / RF-033: filtro del catálogo por tipo de tela.
+        Index("ix_productos_tenant_tipo_tela", "tenant_id", "tipo_tela_id"),
     )
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -315,6 +351,9 @@ class Producto(Base):
     categoria_id = Column(Integer, ForeignKey("categorias.id", ondelete="SET NULL"), nullable=True)
     temporada_id = Column(Integer, ForeignKey("temporadas.id", ondelete="SET NULL"), nullable=True)
     proveedor_id = Column(Integer, ForeignKey("proveedores.id", ondelete="SET NULL"), nullable=True)
+    # [EXAMEN-2] Fase A / RF-033: tela normalizada por tenant y composición libre.
+    tipo_tela_id = Column(Integer, ForeignKey("tipos_tela.id", ondelete="SET NULL"), nullable=True)
+    composicion = Column(String(200), nullable=True)  # "80% algodón, 20% poliéster"
     # [EXAMEN-2] Aislamiento multitenant
     tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
     # [EXAMEN-2] Base de la descarga incremental CU05
@@ -327,6 +366,7 @@ class Producto(Base):
     categoria = relationship("Categoria", back_populates="productos")
     temporada = relationship("Temporada", back_populates="productos")
     proveedor = relationship("Proveedor", back_populates="productos")
+    tipo_tela = relationship("TipoTela", back_populates="productos")  # [EXAMEN-2] Fase A
     variantes = relationship("VarianteProducto", back_populates="producto")
     colecciones = relationship("Coleccion", secondary="productos_colecciones", back_populates="productos")
     favoritos = relationship("ProductoFavorito", back_populates="producto", cascade="all, delete-orphan")

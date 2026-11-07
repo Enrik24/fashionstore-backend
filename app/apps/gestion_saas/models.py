@@ -9,7 +9,7 @@ Regla anti-duplicados (plan, capítulo 3): los modelos existentes del Examen 1
 aquí; se extienden en su app original con la convención `# [EXAMEN-2]`.
 """
 from sqlalchemy import (
-    Boolean, CheckConstraint, Column, Date, DateTime, Enum, ForeignKey,
+    BigInteger, Boolean, CheckConstraint, Column, Date, DateTime, Enum, ForeignKey,
     Index, Integer, JSON, Numeric, String, Text, text,
 )
 from sqlalchemy.orm import relationship
@@ -125,6 +125,14 @@ class Plan(Base):
     )
     orden = Column(Integer, nullable=False, default=0, server_default="0")  # [EXAMEN-2] apoyo: presentación
     soporte_prioritario = Column(Boolean, nullable=False, default=False, server_default="false")  # [EXAMEN-2] apoyo: CU02
+    # [EXAMEN-2] Fase B (punto 6): límites y respaldos por plan.
+    max_usuarios = Column(Integer, nullable=True)  # NULL = ilimitado
+    max_productos = Column(Integer, nullable=True)  # NULL = ilimitado
+    backup_automatico = Column(Boolean, nullable=False, default=False, server_default="false")
+    backup_frecuencia_horas = Column(Integer, nullable=True)  # NULL = sin automático
+    backup_retencion_dias = Column(Integer, nullable=False, default=7, server_default="7")
+    backup_manual_mensual = Column(Integer, nullable=True)  # NULL = ilimitado, 0 = ninguno
+    permite_restauracion = Column(Boolean, nullable=False, default=False, server_default="false")
 
     suscripciones = relationship("Suscripcion", back_populates="plan")
 
@@ -196,6 +204,7 @@ class PagoSuscripcion(Base):
         Index("ix_pagos_suscripcion_tenant_fecha", "tenant_id", "fecha"),
         Index("ix_pagos_suscripcion_suscripcion_estado", "suscripcion_id", "estado"),
         Index("uq_pagos_suscripcion_tenant_pi", "tenant_id", "stripe_payment_intent_id", unique=True),
+        Index("ix_pagos_suscripcion_stripe_session", "stripe_checkout_session_id"),
     )
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -210,6 +219,7 @@ class PagoSuscripcion(Base):
         server_default=EstadoTransaccion.PENDIENTE.value,
     )
     stripe_payment_intent_id = Column(String(120), nullable=True, index=True)
+    stripe_checkout_session_id = Column(String(120), nullable=True, index=True)
     referencia = Column(String(120), nullable=True)
     fecha = Column(DateTime(timezone=True), server_default=func.now())
     idempotency_key = Column(String(255), nullable=True)  # [EXAMEN-2] apoyo: evita doble cobro
@@ -220,3 +230,90 @@ class PagoSuscripcion(Base):
 
     def __repr__(self):
         return f"<PagoSuscripcion tenant={self.tenant_id} monto={self.monto}: {self.estado}>"
+
+
+# ============================================================
+# [EXAMEN-2] Fase B (punto 6) — Respaldos y restauraciones
+# ============================================================
+
+class TipoBackup(str, enum.Enum):
+    MANUAL = "MANUAL"
+    AUTOMATICO = "AUTOMATICO"
+
+
+class EstadoBackup(str, enum.Enum):
+    EN_PROCESO = "EN_PROCESO"
+    COMPLETADO = "COMPLETADO"
+    FALLIDO = "FALLIDO"
+    EXPIRADO = "EXPIRADO"
+
+
+class EstadoRestauracion(str, enum.Enum):
+    SOLICITADA = "SOLICITADA"
+    EN_PROCESO = "EN_PROCESO"
+    COMPLETADA = "COMPLETADA"
+    FALLIDA = "FALLIDA"
+
+
+class Backup(Base):
+    """Respaldo por tenant (manual o automático) con retención por plan.
+
+    [EXAMEN-2] Fase B / RF-035 / RN-023 / RNF-19: el archivo se guarda en
+    `settings.BACKUP_DIR` y la fila conserva hash, tamaño y expiración.
+    """
+    __tablename__ = "backups"
+    __table_args__ = (
+        Index("ix_backups_tenant_fecha", "tenant_id", "fecha_inicio"),
+        Index("ix_backups_tenant_estado", "tenant_id", "estado"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    tipo = Column(Enum(TipoBackup), nullable=False)
+    estado = Column(
+        Enum(EstadoBackup), nullable=False, default=EstadoBackup.EN_PROCESO,
+        server_default=EstadoBackup.EN_PROCESO.value,
+    )
+    fecha_inicio = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_fin = Column(DateTime(timezone=True), nullable=True)
+    tamano_bytes = Column(BigInteger, nullable=True)
+    ruta = Column(String(500), nullable=True)
+    hash_sha256 = Column(String(64), nullable=True)
+    retencion_hasta = Column(DateTime(timezone=True), nullable=True)
+    creado_por = Column(Integer, ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True)
+    error_detalle = Column(Text, nullable=True)
+
+    tenant = relationship("Tenant")
+    creador = relationship("Usuario", foreign_keys=[creado_por])
+    restauraciones = relationship("Restauracion", back_populates="backup")
+
+    def __repr__(self):
+        return f"<Backup tenant={self.tenant_id} {self.tipo}: {self.estado}>"
+
+
+class Restauracion(Base):
+    """Solicitud de restauración de un respaldo (RF-035)."""
+    __tablename__ = "restauraciones"
+    __table_args__ = (
+        Index("ix_restauraciones_tenant_fecha", "tenant_id", "fecha_solicitud"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    backup_id = Column(Integer, ForeignKey("backups.id", ondelete="RESTRICT"), nullable=False)
+    solicitado_por = Column(Integer, ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True)
+    estado = Column(
+        Enum(EstadoRestauracion), nullable=False, default=EstadoRestauracion.SOLICITADA,
+        server_default=EstadoRestauracion.SOLICITADA.value,
+    )
+    motivo = Column(String(200), nullable=True)
+    fecha_solicitud = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_inicio = Column(DateTime(timezone=True), nullable=True)
+    fecha_fin = Column(DateTime(timezone=True), nullable=True)
+    error_detalle = Column(Text, nullable=True)
+
+    backup = relationship("Backup", back_populates="restauraciones")
+    solicitante = relationship("Usuario", foreign_keys=[solicitado_por])
+
+    def __repr__(self):
+        return f"<Restauracion tenant={self.tenant_id} backup={self.backup_id}: {self.estado}>"

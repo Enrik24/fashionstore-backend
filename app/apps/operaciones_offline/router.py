@@ -574,6 +574,108 @@ async def descartar_conflicto(
 
 
 # ============================================================
+# [EXAMEN-2] Fase E — Compensaciones de ventas rechazadas (RF-032)
+# ============================================================
+
+def _serializar_compensacion(compensacion) -> dict:
+    return {
+        "id": compensacion.id,
+        "tenant_id": compensacion.tenant_id,
+        "operacion_offline_id": compensacion.operacion_offline_id,
+        "orden_id": compensacion.orden_id,
+        "cliente_id": compensacion.cliente_id,
+        "tipo": compensacion.tipo.value if hasattr(compensacion.tipo, "value") else compensacion.tipo,
+        "monto": float(compensacion.monto or 0),
+        "moneda": compensacion.moneda,
+        "estado": compensacion.estado.value if hasattr(compensacion.estado, "value") else compensacion.estado,
+        "motivo": compensacion.motivo,
+        "referencia_externa": compensacion.referencia_externa,
+        "notificado_cliente": compensacion.notificado_cliente,
+        "error_detalle": compensacion.error_detalle,
+        "fecha_creacion": compensacion.fecha_creacion.isoformat() if compensacion.fecha_creacion else None,
+        "fecha_resolucion": compensacion.fecha_resolucion.isoformat() if compensacion.fecha_resolucion else None,
+        "resuelto_por": compensacion.resuelto_por,
+    }
+
+
+@router.get("/compensaciones/resumen")
+async def resumen_compensaciones(
+    contexto=Depends(autenticacion_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.apps.operaciones_offline.compensacion_service import CompensacionService
+
+    return await CompensacionService.resumen(db, int(contexto["tenant"].id))
+
+
+@router.get("/compensaciones")
+async def listar_compensaciones(
+    estado: Optional[str] = Query(None),
+    desde: Optional[datetime] = Query(None),
+    hasta: Optional[datetime] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=200),
+    contexto=Depends(autenticacion_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.apps.operaciones_offline.compensacion_service import CompensacionService
+
+    filas = await CompensacionService.listar(
+        db, int(contexto["tenant"].id), estado=estado,
+        desde=desde, hasta=hasta, skip=skip, limit=limit,
+    )
+    return {"compensaciones": [_serializar_compensacion(f) for f in filas]}
+
+
+@router.get("/compensaciones/{compensacion_id}")
+async def obtener_compensacion(
+    compensacion_id: int,
+    contexto=Depends(autenticacion_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.apps.operaciones_offline.compensacion_service import CompensacionService
+
+    compensacion = await CompensacionService.obtener(
+        db, int(contexto["tenant"].id), compensacion_id
+    )
+    return _serializar_compensacion(compensacion)
+
+
+@router.post("/compensaciones/{compensacion_id}/confirmar-efectivo")
+async def confirmar_compensacion_efectivo(
+    compensacion_id: int,
+    contexto=Depends(autenticacion_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.apps.operaciones_offline.compensacion_service import CompensacionService
+
+    compensacion = await CompensacionService.confirmar_efectivo(
+        db,
+        int(contexto["tenant"].id),
+        compensacion_id,
+        getattr(contexto.get("usuario"), "id", None),
+    )
+    return _serializar_compensacion(compensacion)
+
+
+@router.post("/compensaciones/{compensacion_id}/reintentar")
+async def reintentar_compensacion(
+    compensacion_id: int,
+    contexto=Depends(autenticacion_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.apps.operaciones_offline.compensacion_service import CompensacionService
+
+    compensacion = await CompensacionService.reintentar(
+        db,
+        int(contexto["tenant"].id),
+        compensacion_id,
+        getattr(contexto.get("usuario"), "id", None),
+    )
+    return _serializar_compensacion(compensacion)
+
+
+# ============================================================
 # WebSocket de sincronización
 # ============================================================
 

@@ -167,6 +167,8 @@ class TallaBase(BaseModel):
     valor: str = Field(..., min_length=1, max_length=10)
     tipo: Optional[str] = Field(None, max_length=50)
     descripcion: Optional[str] = Field(None, max_length=100)
+    # [EXAMEN-2] Fase D / RF-034: orden de talla para alternativas mayor/menor.
+    orden: Optional[int] = Field(None, ge=0)
 
 
 class TallaCreate(TallaBase):
@@ -177,6 +179,8 @@ class TallaUpdate(BaseModel):
     valor: Optional[str] = Field(None, min_length=1, max_length=10)
     tipo: Optional[str] = Field(None, max_length=50)
     descripcion: Optional[str] = Field(None, max_length=100)
+    # [EXAMEN-2] Fase D / RF-034: orden de talla para alternativas mayor/menor.
+    orden: Optional[int] = Field(None, ge=0)
 
 
 class TallaResponse(TallaBase):
@@ -296,6 +300,34 @@ class ProveedorResponse(ProveedorBase):
 # ============================================
 # Schemas de Producto
 # ============================================
+# ============================================
+# Schemas de Tipo de Tela (punto 3 de la profesora)
+# ============================================
+class TipoTelaBase(BaseModel):
+    nombre: str = Field(..., min_length=1, max_length=80)
+    descripcion: Optional[str] = None
+    cuidados_lavado: Optional[str] = Field(None, max_length=200)
+    estado: Optional[EstadoProductoEnum] = EstadoProductoEnum.ACTIVO
+
+
+class TipoTelaCreate(TipoTelaBase):
+    pass
+
+
+class TipoTelaUpdate(BaseModel):
+    nombre: Optional[str] = Field(None, min_length=1, max_length=80)
+    descripcion: Optional[str] = None
+    cuidados_lavado: Optional[str] = Field(None, max_length=200)
+    estado: Optional[EstadoProductoEnum] = None
+
+
+class TipoTelaResponse(TipoTelaBase):
+    id: int
+    tenant_id: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class ProductoBase(BaseModel):
     sku: str = Field(..., min_length=1, max_length=50)
     nombre: str = Field(..., min_length=1, max_length=200)
@@ -310,6 +342,9 @@ class ProductoBase(BaseModel):
     categoria_id: Optional[int] = None
     temporada_id: Optional[int] = None
     proveedor_id: Optional[int] = None
+    # [EXAMEN-2] Fase A / RF-033: tipo de tela y composición.
+    tipo_tela_id: Optional[int] = None
+    composicion: Optional[str] = Field(None, max_length=200)
 
     @field_validator("imagenes", mode="before")
     @classmethod
@@ -333,6 +368,9 @@ class ProductoUpdate(BaseModel):
     categoria_id: Optional[int] = None
     temporada_id: Optional[int] = None
     proveedor_id: Optional[int] = None
+    # [EXAMEN-2] Fase A / RF-033: tipo de tela y composición.
+    tipo_tela_id: Optional[int] = None
+    composicion: Optional[str] = Field(None, max_length=200)
 
     @field_validator("imagenes", mode="before")
     @classmethod
@@ -355,6 +393,7 @@ class ProductoResponse(ProductoBase):
     categoria: Optional[CategoriaResponse] = None
     temporada: Optional[TemporadaResponse] = None
     proveedor: Optional[ProveedorResponse] = None
+    tipo_tela: Optional["TipoTelaResponse"] = None
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -401,6 +440,7 @@ class ProductoDetalleResponse(ProductoResponse):
     categoria: Optional[CategoriaResponse] = None
     temporada: Optional[TemporadaResponse] = None
     proveedor: Optional[ProveedorResponse] = None
+    tipo_tela: Optional["TipoTelaResponse"] = None
     variantes: List[VarianteProductoDetalleResponse] = []
     colecciones: List[ColeccionResponse] = []
     

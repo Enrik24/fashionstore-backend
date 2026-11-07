@@ -1243,12 +1243,22 @@ class DatosInicialesService:
         # ------------------------------------------------------------
         # 4. Planes Básico y Profesional
         # ------------------------------------------------------------
+        # [EXAMEN-2] Fase B (punto 6): tercer plan con límites y respaldos.
+        # [EXAMEN-2] Precios unificados con PlanService.sembrar_planes: 199/399/799.
         planes_data = [
-            ("Básico", "Plan inicial para una o dos sucursales", 299.00, 2, False, True, 0, False),
-            ("Profesional", "Plan completo con reportes IA", 799.00, 10, True, True, 1, True),
+            ("Básico", "Plan inicial para una o dos sucursales", 199.00, 2, False, True, 1, False,
+             10, 500, True, 168, 7, 0, False),
+            ("Profesional", "Plan completo con reportes IA", 399.00, 10, True, True, 2, False,
+             50, 5000, True, 24, 30, 2, False),
+            ("Empresarial", "Plan ampliado con respaldos y restauración", 799.00, 50, True, True, 3, True,
+             200, None, True, 6, 365, None, True),
         ]
         planes = {}
-        for nombre, desc, precio, max_suc, ia, diferido, orden, soporte in planes_data:
+        for (
+            nombre, desc, precio, max_suc, ia, diferido, orden, soporte,
+            max_usr, max_prod, backup_auto, backup_horas, backup_dias,
+            backup_manual, restauracion,
+        ) in planes_data:
             result = await db.execute(select(Plan).where(Plan.nombre == nombre))
             plan = result.scalar_one_or_none()
             if plan is None:
@@ -1262,9 +1272,32 @@ class DatosInicialesService:
                     orden=orden,
                     soporte_prioritario=soporte,
                     estado=EstadoPlan.ACTIVO,
+                    max_usuarios=max_usr,
+                    max_productos=max_prod,
+                    backup_automatico=backup_auto,
+                    backup_frecuencia_horas=backup_horas,
+                    backup_retencion_dias=backup_dias,
+                    backup_manual_mensual=backup_manual,
+                    permite_restauracion=restauracion,
                 )
                 db.add(plan)
                 await db.flush()
+            else:
+                # Completa los campos nuevos de los planes ya sembrados.
+                if plan.max_usuarios is None and max_usr is not None:
+                    plan.max_usuarios = max_usr
+                if plan.max_productos is None and max_prod is not None:
+                    plan.max_productos = max_prod
+                if not plan.backup_automatico:
+                    plan.backup_automatico = backup_auto
+                if plan.backup_frecuencia_horas is None:
+                    plan.backup_frecuencia_horas = backup_horas
+                if plan.backup_retencion_dias in (None, 7) and backup_dias != 7:
+                    plan.backup_retencion_dias = backup_dias
+                if plan.backup_manual_mensual is None and backup_manual is not None:
+                    plan.backup_manual_mensual = backup_manual
+                if restauracion and not plan.permite_restauracion:
+                    plan.permite_restauracion = restauracion
             planes[nombre] = plan
 
         # ------------------------------------------------------------

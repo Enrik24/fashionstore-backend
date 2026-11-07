@@ -549,7 +549,9 @@ class PasarelaPago(Base):
 # Enumeraciones adicionales para CU28
 class TipoSolicitudDevolucion(str, enum.Enum):
     DEVOLUCION = "DEVOLUCION"
-    CAMBIO = "CAMBIO"
+    # [EXAMEN-2] CU18: reposición = devolución + prenda nueva del mismo producto.
+    REPOSICION = "REPOSICION"
+    CAMBIO = "CAMBIO"  # legacy: se conserva para clientes y datos antiguos
 
 
 class MotivoDevolucion(str, enum.Enum):
@@ -570,6 +572,8 @@ class EstadoSolicitudDevolucion(str, enum.Enum):
     PENDIENTE_SINCRONIZACION = "PENDIENTE_SINCRONIZACION"
     CONFLICTO_MANUAL = "CONFLICTO_MANUAL"
     ERROR_VENTA_INVALIDA = "ERROR_VENTA_INVALIDA"
+    # [EXAMEN-2] Fase D / RF-034: no hay talla alternativa con stock.
+    SIN_ALTERNATIVA = "SIN_ALTERNATIVA"
 
 
 class TipoDiferencia(str, enum.Enum):
@@ -591,6 +595,14 @@ class SolicitudDevolucion(Base):
     __table_args__ = (
         UniqueConstraint("tenant_id", "numero_solicitud", name="uq_solicitudes_tenant_numero"),
         UniqueConstraint("tenant_id", "uuid_offline", name="uq_solicitudes_tenant_uuid"),
+        # [EXAMEN-2] Fase C / CU18: número de reposición único por tenant.
+        Index(
+            "uq_solicitudes_tenant_numero_reposicion",
+            "tenant_id",
+            "numero_reposicion",
+            unique=True,
+            postgresql_where=text("numero_reposicion IS NOT NULL"),
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -625,6 +637,9 @@ class SolicitudDevolucion(Base):
     nota_devolucion_url = Column(String(500), nullable=True)  # [EXAMEN-2] PDF
     usuario_procesa_id = Column(Integer, ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True)  # [EXAMEN-2] CU13
     motivo_rechazo = Column(Text, nullable=True)  # [EXAMEN-2] trazabilidad
+    # [EXAMEN-2] Fase C / CU18: numeración y nota propias de la reposición.
+    numero_reposicion = Column(String(50), nullable=True)
+    nota_reposicion_url = Column(String(500), nullable=True)
 
     # Relaciones
     cliente = relationship("Cliente", back_populates="solicitudes_devolucion")
@@ -669,6 +684,65 @@ class DetalleSolicitudDevolucion(Base):
 
     def __repr__(self):
         return f"<DetalleSolicitudDevolucion {self.id} - Solicitud {self.solicitud_id}>"
+
+
+# ============================================================
+# [EXAMEN-2] Fase D / RF-037 / RN-024 — Notificaciones al cliente
+# ============================================================
+
+class CanalNotificacion(str, enum.Enum):
+    PUSH = "PUSH"
+    CORREO = "CORREO"
+    SMS = "SMS"
+
+
+class EstadoNotificacion(str, enum.Enum):
+    PENDIENTE = "PENDIENTE"
+    ENVIADA = "ENVIADA"
+    FALLIDA = "FALLIDA"
+    LEIDA = "LEIDA"
+
+
+class NotificacionCliente(Base):
+    """Notificación persistida antes de intentar el envío (RN-024).
+
+    [EXAMEN-2] Fase D: si FCM/correo/SMS falla, la fila queda `FALLIDA` y es
+    reintentable; la sucursal siempre puede consultarla.
+    """
+    __tablename__ = "notificaciones_cliente"
+    __table_args__ = (
+        Index("ix_notificaciones_cliente_fecha", "tenant_id", "fecha_creacion"),
+        Index("ix_notificaciones_cliente_estado", "tenant_id", "estado"),
+        # [EXAMEN-2] Evita duplicados al reintentar (plan, capítulo 11).
+        Index(
+            "uq_notificaciones_cliente_referencia",
+            "tenant_id", "tipo", "referencia_tipo", "referencia_id", "canal",
+            unique=True,
+            postgresql_where=text("referencia_id IS NOT NULL"),
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    cliente_id = Column(Integer, ForeignKey("clientes.id", ondelete="SET NULL"), nullable=True)
+    usuario_id = Column(Integer, ForeignKey("usuarios.id", ondelete="SET NULL"), nullable=True)
+    tipo = Column(String(50), nullable=False)  # COMPENSACION, DEVOLUCION, REPOSICION, SIN_ALTERNATIVA
+    canal = Column(Enum(CanalNotificacion), nullable=False)
+    asunto = Column(String(150), nullable=True)
+    mensaje = Column(Text, nullable=False)
+    estado = Column(Enum(EstadoNotificacion), nullable=False, default=EstadoNotificacion.PENDIENTE)
+    referencia_tipo = Column(String(50), nullable=True)
+    referencia_id = Column(Integer, nullable=True)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_envio = Column(DateTime(timezone=True), nullable=True)
+    leida = Column(Boolean, nullable=False, default=False, server_default="false")
+    error_detalle = Column(Text, nullable=True)
+
+    cliente = relationship("Cliente")
+    usuario = relationship("Usuario")
+
+    def __repr__(self):
+        return f"<NotificacionCliente {self.tipo} {self.canal}: {self.estado}>"
 
 
 # Importar modelos relacionados para registrar relaciones

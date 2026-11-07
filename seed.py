@@ -41,7 +41,7 @@ from app.apps.gestion_catalogo.models import (
     Ciudad, Sucursal, Categoria, Talla, Color, EstadoSucursal,
     Proveedor, Temporada, Coleccion, Producto, ProductoColeccion,
     VarianteProducto, Inventario, MovimientoInventario,
-    EstadoProducto, GeneroProducto, EstadoStock, TipoMovimiento
+    EstadoProducto, GeneroProducto, EstadoStock, TipoMovimiento, TipoTela
 )
 from app.apps.gestion_ventas.models import (
     Cupon, TipoCupon, EstadoCupon
@@ -2013,6 +2013,87 @@ async def seed_productos_y_stock(db, sucursales, temp_map, col_map):
 
 
 # =====================================================================
+# 5.1 [EXAMEN-2] PUNTO 3: TIPOS DE TELA Y COMPOSICIÓN
+# =====================================================================
+
+# nombre -> (descripción, cuidados de lavado, composición sugerida, categorías objetivo)
+TIPOS_TELA_SEED = [
+    ("Algodón", "Fibra natural suave y transpirable", "Lavar a 30 °C, no usar secadora",
+     "100% algodón", ("Poleras", "Camisas", "Canguros")),
+    ("Poliéster", "Fibra sintética resistente y de secado rápido", "Lavar a 30 °C, planchar a baja temperatura",
+     "100% poliéster", ("Calzado",)),
+    ("Mezcla", "Combinación de fibras naturales y sintéticas", "Lavar a 30 °C, no blanquear",
+     "80% algodón, 20% poliéster", ("Chaquetas", "Canguros", "Shorts")),
+    ("Lino", "Fibra natural fresca y ligera", "Lavar a mano y secar a la sombra",
+     "100% lino", ("Camisas",)),
+    ("Lana", "Fibra natural abrigadora", "Lavar en frío a mano, secar en plano",
+     "80% lana, 20% acrílico", ("Abrigos", "Chaquetas")),
+    ("Denim", "Tela resistente de sarga de algodón", "Lavar del revés a 30 °C",
+     "98% algodón, 2% elastano", ("Pantalones", "Shorts")),
+    ("Cuero", "Cuero natural de tacto suave", "Limpiar con paño húmedo, no lavar en máquina",
+     "100% cuero", ()),
+    ("Sintético", "Material sintético de bajo mantenimiento", "Limpiar con paño húmedo",
+     "100% sintético", ("Accesorios", "Calzado")),
+]
+
+
+async def seed_tipos_tela(db: AsyncSession, tenant_id: int) -> None:
+    """Crea los tipos de tela base del tenant y asigna los productos huérfanos."""
+    creados = 0
+    por_nombre: Dict[str, TipoTela] = {}
+    for nombre, descripcion, cuidados, composicion, categorias in TIPOS_TELA_SEED:
+        res = await db.execute(
+            select(TipoTela).where(
+                TipoTela.tenant_id == tenant_id,
+                TipoTela.nombre == nombre,
+            )
+        )
+        tipo = res.scalar_one_or_none()
+        if tipo is None:
+            tipo = TipoTela(
+                tenant_id=tenant_id,
+                nombre=nombre,
+                descripcion=descripcion,
+                cuidados_lavado=cuidados,
+                estado=EstadoProducto.ACTIVO,
+            )
+            db.add(tipo)
+            await db.flush()
+            creados += 1
+        por_nombre[nombre] = tipo
+
+    composiciones = {nombre: composicion for nombre, _, _, composicion, _ in TIPOS_TELA_SEED}
+    tela_por_categoria: Dict[str, str] = {}
+    for nombre, _, _, _, categorias in TIPOS_TELA_SEED:
+        for categoria in categorias:
+            tela_por_categoria.setdefault(categoria, nombre)
+
+    categorias = {
+        c.id: c.nombre
+        for c in (await db.execute(
+            select(Categoria).where(Categoria.tenant_id == tenant_id)
+        )).scalars().all()
+    }
+    productos = (await db.execute(
+        select(Producto).where(
+            Producto.tenant_id == tenant_id,
+            Producto.tipo_tela_id.is_(None),
+        )
+    )).scalars().all()
+    asignados = 0
+    for producto in productos:
+        nombre_tela = tela_por_categoria.get(categorias.get(producto.categoria_id))
+        if not nombre_tela:
+            continue
+        producto.tipo_tela_id = por_nombre[nombre_tela].id
+        if not producto.composicion:
+            producto.composicion = composiciones[nombre_tela]
+        asignados += 1
+    await db.flush()
+    print(f"  [OK] Tipos de tela: {creados} nuevos, {asignados} productos asignados")
+
+
+# =====================================================================
 # 6. PROMOCIONES Y CUPONES
 # =====================================================================
 
@@ -2266,6 +2347,9 @@ async def run_seeders():
             
             print("\n5. Verificando Catálogo de Productos...")
             await seed_productos_y_stock(session, sucursales_map, temp_map, col_map)
+
+            print("\n5.1 Verificando tipos de tela y composición...")
+            await seed_tipos_tela(session, tenant_demo.id)
             
             print("\n6. Verificando Promociones y Cupones...")
             await seed_promociones(session)

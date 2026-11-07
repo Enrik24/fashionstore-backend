@@ -14,6 +14,7 @@ import io
 
 from app.database import get_db
 from app.security import get_current_user, require_role, get_client_ip
+from app.tenant import get_current_tenant, require_tenant_role
 from app.apps.gestion_usuarios.models import Usuario, Cliente, EncargadoSucursal, Cajero
 from app.apps.gestion_usuarios import services as usuario_services
 from app.apps.gestion_usuarios.schemas import (
@@ -228,10 +229,16 @@ async def crear_usuario(
     datos: UsuarioCreate,
     request: Request,
     rol: str = Query("Cliente", description="Rol a asignar"),
-    current_user: Usuario = Depends(require_role("Administrador")),
+    current_user: Usuario = Depends(require_tenant_role("Administrador")),
+    tenant=Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db)
 ):
     """Crea un nuevo usuario (solo administradores)."""
+    # [EXAMEN-2] Fase B: límite de usuarios del plan contratado (aplica también al
+    # Super Admin con X-Tenant-ID, que no tiene tenant_id propio).
+    from app.apps.gestion_saas.services import SuscripcionService
+
+    await SuscripcionService.verificar_limite_usuarios(db, tenant.id)
     usuario = await usuario_services.UsuarioService.create_usuario(db, datos, rol)
     await usuario_services.BitacoraService.registrar_evento(
         db=db,

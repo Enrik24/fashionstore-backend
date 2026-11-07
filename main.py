@@ -101,6 +101,31 @@ async def _job_expiracion_pagos_offline() -> None:
             logger.exception("Error en el job de expiración de pagos/offline")
 
 
+async def _job_respaldos() -> None:
+    """[EXAMEN-2] Fase B: retención y respaldos automáticos por plan (RF-035)."""
+    from app.apps.gestion_saas.backup_service import BackupService
+    from app.database import AsyncSessionLocal
+
+    while True:
+        await asyncio.sleep(max(60, settings.BACKUP_JOB_INTERVALO_SEG))
+        try:
+            async with AsyncSessionLocal() as session:
+                expirados = await BackupService.aplicar_retencion(session)
+                pendientes = await BackupService.respaldos_pendientes(session)
+                for tenant_id in pendientes:
+                    await BackupService.crear_automatico(session, tenant_id)
+                if expirados or pendientes:
+                    logger.info(
+                        "Job de respaldos: expirados=%s pendientes=%s",
+                        expirados,
+                        pendientes,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error en el job de respaldos")
+
+
 async def _job_revocacion_dispositivos() -> None:
     """Revoca a diario los dispositivos inactivos (CU17, RN-019)."""
     from app.apps.operaciones_offline.services import DispositivoService
@@ -137,6 +162,8 @@ async def lifespan(app: FastAPI):
     app.state.job_expiracion = job_expiracion
     job_revocacion = asyncio.create_task(_job_revocacion_dispositivos())
     app.state.job_revocacion = job_revocacion
+    job_respaldos = asyncio.create_task(_job_respaldos())
+    app.state.job_respaldos = job_respaldos
     
     # Crear tablas en la base de datos
     async with engine.begin() as conn:
@@ -170,12 +197,17 @@ async def lifespan(app: FastAPI):
     logger.info("Cerrando FashionStore API...")
     job_expiracion.cancel()
     job_revocacion.cancel()
+    job_respaldos.cancel()
     try:
         await job_expiracion
     except asyncio.CancelledError:
         pass
     try:
         await job_revocacion
+    except asyncio.CancelledError:
+        pass
+    try:
+        await job_respaldos
     except asyncio.CancelledError:
         pass
     await engine.dispose()

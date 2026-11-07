@@ -26,7 +26,13 @@ from app.exceptions import (
     OperacionRechazada,
     ValidationException,
 )
-from app.apps.gestion_catalogo.models import Inventario, Producto, Sucursal, VarianteProducto
+from app.apps.gestion_catalogo.models import (
+    Inventario,
+    Producto,
+    Sucursal,
+    Talla,
+    VarianteProducto,
+)
 from app.apps.gestion_usuarios.models import Cliente, Usuario
 from app.apps.gestion_ventas.models import (
     Comprobante,
@@ -70,6 +76,141 @@ def _decimal(valor) -> Decimal:
 
 def _aware(valor: datetime) -> datetime:
     return valor if valor.tzinfo else valor.replace(tzinfo=timezone.utc)
+
+
+class AlternativaTallaService:
+    """Busca tallas mayor/menor con stock para una variante (RF-034).
+
+    El orden de comparación es `Talla.orden` (Fase D); si la talla no tiene
+    orden, la alternativa se busca únicamente por color (misma talla).
+    """
+
+    @staticmethod
+    async def buscar(
+        db: AsyncSession,
+        tenant_id: int,
+        variante_id: int,
+        sucursal_id: int | None = None,
+        direccion: str = "MAYOR",
+        cantidad: int = 1,
+    ) -> dict:
+        variante = (await db.execute(
+            select(VarianteProducto)
+            .options(
+                selectinload(VarianteProducto.talla),
+                selectinload(VarianteProducto.color),
+            )
+            .where(
+                VarianteProducto.id == variante_id,
+                VarianteProducto.tenant_id == tenant_id,
+            )
+        )).scalar_one_or_none()
+        if variante is None:
+            raise NotFoundException("Variante no encontrada para el tenant")
+
+        direccion = str(direccion or "MAYOR").upper()
+        variantes = (await db.execute(
+            select(VarianteProducto)
+            .options(
+                selectinload(VarianteProducto.talla),
+                selectinload(VarianteProducto.color),
+            )
+            .where(
+                VarianteProducto.producto_id == variante.producto_id,
+                VarianteProducto.tenant_id == tenant_id,
+                VarianteProducto.deleted_at.is_(None),
+                VarianteProducto.id != variante.id,
+            )
+        )).scalars().all()
+
+        inventarios = [] if not variantes else (await db.execute(
+            select(Inventario).where(
+                Inventario.tenant_id == tenant_id,
+                Inventario.variante_producto_id.in_([v.id for v in variantes]),
+            )
+        )).scalars().all()
+        stock: dict[int, dict[int, int]] = {}
+        for inventario in inventarios:
+            disponible = max(
+                0, int(inventario.cantidad or 0) - int(inventario.cantidad_reservada or 0)
+            )
+            if disponible <= 0:
+                continue
+            stock.setdefault(inventario.variante_producto_id, {})[
+                inventario.sucursal_id
+            ] = disponible
+
+        orden_original = variante.talla.orden if variante.talla else None
+        candidatos = [
+            v for v in variantes
+            if v.talla is not None and v.talla.orden is not None
+        ]
+        if orden_original is not None:
+            if direccion == "MENOR":
+                candidatos = [v for v in candidatos if v.talla.orden < orden_original]
+                candidatos.sort(key=lambda v: v.talla.orden, reverse=True)
+            else:
+                candidatos = [v for v in candidatos if v.talla.orden > orden_original]
+                candidatos.sort(key=lambda v: v.talla.orden)
+        else:
+            candidatos = []
+
+        # Misma talla en otro color (el cliente acepta cambio de color).
+        mismo_orden = [
+            v for v in variantes
+            if v.talla is not None and orden_original is not None
+            and v.talla.orden == orden_original
+        ]
+
+        def _item(v: VarianteProducto, criterio: str) -> dict:
+            sucursales = stock.get(v.id, {})
+            total = sum(sucursales.values())
+            return {
+                "variante_id": v.id,
+                "talla": v.talla.valor if v.talla else None,
+                "color": v.color.nombre if v.color else None,
+                "color_id": v.color_id,
+                "criterio": criterio,
+                "stock_total": total,
+                "sucursal_id": (
+                    sucursal_id if sucursal_id in sucursales else (
+                        max(sucursales, key=sucursales.get) if sucursales else None
+                    )
+                ),
+                "stock": (
+                    sucursales.get(sucursal_id)
+                    if sucursal_id in sucursales
+                    else (sucursales[max(sucursales, key=sucursales.get)] if sucursales else 0)
+                ),
+                "misma_sucursal": sucursal_id in sucursales,
+            }
+
+        alternativas = [
+            _item(v, "TALLA_MAYOR" if direccion == "MAYOR" else "TALLA_MENOR")
+            for v in candidatos if stock.get(v.id)
+        ] + [
+            _item(v, "MISMA_TALLA_OTRO_COLOR")
+            for v in mismo_orden if stock.get(v.id)
+        ]
+
+        elegida = next((a for a in alternativas if a["misma_sucursal"]), None)
+        if elegida is None:
+            elegida = next((a for a in alternativas if a["stock"] >= cantidad), None)
+
+        return {
+            "variante_original_id": variante.id,
+            "producto_id": variante.producto_id,
+            "talla_original": variante.talla.valor if variante.talla else None,
+            "direccion": direccion,
+            "cantidad": cantidad,
+            "encontrada": elegida is not None,
+            "variante_id": elegida["variante_id"] if elegida else None,
+            "talla": elegida["talla"] if elegida else None,
+            "color": elegida["color"] if elegida else None,
+            "sucursal_id": elegida["sucursal_id"] if elegida else None,
+            "stock": elegida["stock"] if elegida else 0,
+            "alternativas": alternativas,
+        }
 
 
 class CambioDevolucionService:
@@ -180,8 +321,12 @@ class CambioDevolucionService:
         tipo_enum = tipo if isinstance(tipo, TipoSolicitudDevolucion) else TipoSolicitudDevolucion(str(tipo).upper())
         if motivo_enum == MotivoDevolucion.OTRO and not (detalle or "").strip():
             raise ValidationException("El motivo OTRO exige una descripción en motivo_detalle")
-        if tipo_enum not in (TipoSolicitudDevolucion.CAMBIO, TipoSolicitudDevolucion.DEVOLUCION):
-            raise ValidationException("Tipo inválido; use CAMBIO o DEVOLUCION")
+        if tipo_enum not in (
+            TipoSolicitudDevolucion.CAMBIO,
+            TipoSolicitudDevolucion.DEVOLUCION,
+            TipoSolicitudDevolucion.REPOSICION,
+        ):
+            raise ValidationException("Tipo inválido; use DEVOLUCION, REPOSICION o CAMBIO")
         return motivo_enum
 
     @classmethod
@@ -309,6 +454,12 @@ class CambioDevolucionService:
         limite = await cls.validar_plazo_orden(orden)
         solicitud = SolicitudDevolucion(
             numero_solicitud=cls._generar_numero_solicitud(),
+            # [EXAMEN-2] Fase C: numeración propia de la reposición (CU18).
+            numero_reposicion=(
+                cls._generar_numero_reposicion()
+                if tipo == TipoSolicitudDevolucion.REPOSICION
+                else None
+            ),
             cliente_id=orden.cliente_id,
             orden_id=orden.id,
             sucursal_id=sucursal_id or orden.sucursal_id,
@@ -457,6 +608,11 @@ class CambioDevolucionService:
     # ------------------------------------------------------------------
 
     @classmethod
+    def _generar_numero_reposicion(cls) -> str:
+        """[EXAMEN-2] Fase C: REP-AAAAMMDD-XXXXXX (único por tenant)."""
+        return f"REP-{datetime.now(timezone.utc):%Y%m%d}-{secrets.token_hex(3).upper()}"
+
+    @classmethod
     async def procesar_cambio(
         cls,
         db: AsyncSession,
@@ -465,6 +621,26 @@ class CambioDevolucionService:
         datos: dict,
         es_offline: bool = False,
     ) -> dict:
+        """Despacha devolución y reposición sin duplicar la lógica común."""
+        tipo = TipoSolicitudDevolucion(str(datos.get("tipo", "CAMBIO")).upper())
+        if tipo == TipoSolicitudDevolucion.REPOSICION:
+            return await cls._procesar_reposicion(
+                db, tenant_id, usuario_id, datos, es_offline
+            )
+        return await cls._procesar_devolucion(
+            db, tenant_id, usuario_id, datos, es_offline
+        )
+
+    @classmethod
+    async def _procesar_devolucion(
+        cls,
+        db: AsyncSession,
+        tenant_id: int,
+        usuario_id: int | None,
+        datos: dict,
+        es_offline: bool = False,
+    ) -> dict:
+        """Devolución pura y `CAMBIO` legacy (mismo comportamiento de antes)."""
         tipo = TipoSolicitudDevolucion(str(datos.get("tipo", "CAMBIO")).upper())
         motivo = cls.validar_motivo(
             datos.get("motivo", MotivoDevolucion.OTRO),
@@ -658,6 +834,429 @@ class CambioDevolucionService:
 
         await cls.notificar_devolucion(db, solicitud, "CAMBIO_REGISTRADO")
         return await cls.serializar(db, solicitud)
+
+    # ------------------------------------------------------------------
+    # Reposición (CU18)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    async def _procesar_reposicion(
+        cls,
+        db: AsyncSession,
+        tenant_id: int,
+        usuario_id: int | None,
+        datos: dict,
+        es_offline: bool = False,
+    ) -> dict:
+        """Reposición: reintegra la prenda devuelta y entrega una nueva.
+
+        Todo el movimiento de inventario y la diferencia económica ocurren en
+        la misma transacción (RNF-21); el orden es reservar → descontar →
+        sumar → registrar el pago, para que un fallo de stock no deje stock
+        sumado por error.
+        """
+        motivo = cls.validar_motivo(
+            datos.get("motivo", MotivoDevolucion.TALLA_INCORRECTA),
+            TipoSolicitudDevolucion.REPOSICION,
+            datos.get("motivo_detalle"),
+        )
+
+        uuid_offline = datos.get("uuid_offline")
+        if uuid_offline:
+            uuid_valor = (
+                uuid_offline if isinstance(uuid_offline, UUID) else UUID(str(uuid_offline))
+            )
+            existente = (await db.execute(
+                select(SolicitudDevolucion).where(
+                    SolicitudDevolucion.tenant_id == tenant_id,
+                    SolicitudDevolucion.uuid_offline == uuid_valor,
+                )
+            )).scalar_one_or_none()
+            if existente is not None:
+                return await cls.serializar(db, existente, idempotente=True)
+
+        orden = (
+            await cls._obtener_orden(db, datos["orden_id"], tenant_id)
+            if datos.get("orden_id")
+            else await cls.buscar_venta(
+                db,
+                tenant_id,
+                numero_orden=datos.get("numero_orden"),
+                numero_comprobante=datos.get("numero_comprobante"),
+                uuid_offline=datos.get("uuid_venta_offline"),
+            )
+        )
+        if orden.estado not in ESTADOS_ORDEN_ELEGIBLES:
+            raise ValidationException(
+                f"No se puede reponer una orden en estado {orden.estado.value}"
+            )
+        cls.validar_plazo(orden)
+
+        items = datos.get("items") or []
+        if not items:
+            raise ValidationException("Debe indicar al menos una línea para la reposición")
+
+        sucursal_id = datos.get("sucursal_id") or orden.sucursal_id
+        if sucursal_id is None:
+            raise ValidationException("La venta no tiene sucursal para ajustar inventario")
+
+        detalles_orden = {detalle.id: detalle for detalle in orden.detalles}
+        preparados: list[dict] = []
+        for item in items:
+            detalle_id = int(item["detalle_orden_id"])
+            detalle = detalles_orden.get(detalle_id)
+            if detalle is None:
+                raise ValidationException(
+                    f"El detalle {detalle_id} no pertenece a la orden {orden.numero_orden}"
+                )
+            cantidad = int(item.get("cantidad", 1))
+            if cantidad <= 0 or cantidad > int(detalle.cantidad):
+                raise ValidationException(f"Cantidad inválida para el detalle {detalle_id}")
+
+            variante_id = item.get("variante_cambio_id")
+            if not variante_id:
+                raise ValidationException(
+                    "Toda reposición debe indicar la variante nueva (variante_cambio_id)"
+                )
+            variante_nueva = (await db.execute(
+                select(VarianteProducto).where(
+                    VarianteProducto.id == int(variante_id),
+                    VarianteProducto.tenant_id == tenant_id,
+                    VarianteProducto.deleted_at.is_(None),
+                )
+            )).scalar_one_or_none()
+            if variante_nueva is None:
+                raise ValidationException("La variante nueva no pertenece al tenant")
+
+            # La reposición cambia talla/color, nunca el producto.
+            variante_original = await db.get(VarianteProducto, detalle.variante_producto_id)
+            if (
+                variante_original is not None
+                and variante_nueva.producto_id != variante_original.producto_id
+            ):
+                raise ValidationException(
+                    "La reposición debe ser del mismo producto (otra talla o color)"
+                )
+
+            disponible = await InventarioVentasService.validar_stock_disponible(
+                db, variante_nueva.id, sucursal_id, cantidad
+            )
+            if not disponible:
+                direccion = str(datos.get("direccion_talla") or "MAYOR").upper()
+                alternativas = await AlternativaTallaService.buscar(
+                    db, tenant_id, variante_nueva.id, sucursal_id, direccion, cantidad
+                )
+                if datos.get("aceptar_sin_alternativa"):
+                    return await cls._registrar_sin_alternativa(
+                        db, tenant_id, orden, motivo, usuario_id, datos,
+                        sucursal_id, alternativas, es_offline,
+                    )
+                raise ValidationException(
+                    "No hay stock suficiente de la variante nueva en la sucursal"
+                    + (
+                        f"; alternativas disponibles: {alternativas['alternativas']}"
+                        if alternativas.get("alternativas") else ""
+                    )
+                )
+
+            precio_nuevo = _decimal(
+                variante_nueva.precio_variante
+                or (await cls._precio_producto(db, variante_nueva.producto_id, tenant_id))
+            )
+            preparados.append({
+                "detalle": detalle,
+                "cantidad": cantidad,
+                "variante_nueva": variante_nueva,
+                "precio_nuevo": precio_nuevo,
+            })
+
+        # 1. Reserva provisional de las prendas nuevas.
+        for preparado in preparados:
+            await cls.reservar_variante_cambio(
+                db, tenant_id, sucursal_id,
+                preparado["variante_nueva"].id, preparado["cantidad"], usuario_id,
+            )
+
+        # 2. Cabecera de la solicitud con numeración de reposición.
+        solicitud = await cls.crear_solicitud_cambio(
+            db, tenant_id, orden, motivo, usuario_id,
+            tipo=TipoSolicitudDevolucion.REPOSICION,
+            motivo_detalle=datos.get("motivo_detalle"),
+            sucursal_id=sucursal_id,
+            es_offline=es_offline,
+            uuid_offline=uuid_offline,
+            observaciones=datos.get("observaciones"),
+        )
+
+        diferencia_total = Decimal("0.00")
+        items_devueltos: list[dict] = []
+        items_nuevos: list[dict] = []
+        detalles_solicitud: list[DetalleSolicitudDevolucion] = []
+        for preparado in preparados:
+            detalle = preparado["detalle"]
+            detalle_solicitud = await cls.crear_detalle_cambio(
+                db, solicitud, detalle, preparado["cantidad"],
+                variante_nueva=preparado["variante_nueva"],
+                precio_nuevo=preparado["precio_nuevo"],
+            )
+            detalle_solicitud.estado_item = "RESERVADO"
+            detalles_solicitud.append(detalle_solicitud)
+            items_devueltos.append({
+                "variante_id": detalle.variante_producto_id,
+                "sucursal_id": sucursal_id,
+                "cantidad": preparado["cantidad"],
+            })
+            items_nuevos.append({
+                "variante_id": preparado["variante_nueva"].id,
+                "sucursal_id": sucursal_id,
+                "cantidad": preparado["cantidad"],
+                "usuario_id": usuario_id,
+            })
+            diferencia_total += _decimal(detalle_solicitud.subtotal_diferencia or 0)
+
+        solicitud.monto_reembolso = Decimal("0.00")
+        solicitud.diferencia_precio = diferencia_total.quantize(CENTAVO)
+        if diferencia_total > CENTAVO:
+            solicitud.tipo_diferencia = TipoDiferencia.COBRO
+        elif diferencia_total < -CENTAVO:
+            solicitud.tipo_diferencia = TipoDiferencia.SALDO_FAVOR
+        else:
+            solicitud.tipo_diferencia = TipoDiferencia.SIN_DIFERENCIA
+        await db.flush()
+
+        # 3. Descuenta la nueva y suma la devuelta en la misma transacción.
+        await cls.actualizar_inventario_cambio(
+            db, tenant_id, sucursal_id, items_devueltos, items_nuevos,
+            usuario_id, solicitud.id,
+        )
+        await cls._registrar_movimientos_reposicion(
+            db, tenant_id, solicitud.id, items_devueltos, items_nuevos, usuario_id
+        )
+
+        for detalle in detalles_solicitud:
+            detalle.estado_item = "ENTREGADO"
+        await db.flush()
+
+        # 4. Diferencia económica: cobro o saldo a favor.
+        if diferencia_total > CENTAVO:
+            await cls.registrar_pago_diferencia(
+                db, solicitud, diferencia_total,
+                datos.get("metodo_pago_diferencia", "EFECTIVO"),
+            )
+        elif diferencia_total < -CENTAVO:
+            await cls.registrar_saldo_favor(db, solicitud, abs(diferencia_total))
+
+        solicitud.estado = EstadoSolicitudDevolucion.COMPLETADA
+        solicitud.fecha_resolucion = _ahora()
+        if es_offline:
+            solicitud.estado_sincronizacion = EstadoSincronizacion.CONFIRMADA
+        solicitud.nota_reposicion_url = cls.nota_reposicion_url(solicitud.id)
+        await db.flush()
+
+        await cls.notificar_devolucion(db, solicitud, "REPOSICION_REGISTRADA")
+        return await cls.serializar(db, solicitud)
+
+    @classmethod
+    async def _registrar_sin_alternativa(
+        cls,
+        db: AsyncSession,
+        tenant_id: int,
+        orden: Orden,
+        motivo: MotivoDevolucion,
+        usuario_id: int | None,
+        datos: dict,
+        sucursal_id: int,
+        alternativas: dict,
+        es_offline: bool = False,
+    ) -> dict:
+        """Registra la solicitud en `SIN_ALTERNATIVA` y avisa al cliente."""
+        solicitud = await cls.crear_solicitud_cambio(
+            db, tenant_id, orden, motivo, usuario_id,
+            tipo=TipoSolicitudDevolucion.REPOSICION,
+            motivo_detalle=(
+                datos.get("motivo_detalle")
+                or "Sin talla alternativa con stock; el cliente será notificado"
+            ),
+            sucursal_id=sucursal_id,
+            es_offline=es_offline,
+            uuid_offline=datos.get("uuid_offline"),
+            observaciones=datos.get("observaciones"),
+        )
+        solicitud.estado = EstadoSolicitudDevolucion.SIN_ALTERNATIVA
+        solicitud.monto_reembolso = Decimal("0.00")
+        await db.flush()
+
+        try:
+            from app.services.notificacion_service import NotificacionService
+
+            await NotificacionService.crear(
+                db,
+                tenant_id=tenant_id,
+                cliente_id=orden.cliente_id,
+                usuario_id=usuario_id,
+                tipo="SIN_ALTERNATIVA",
+                asunto="No encontramos tu talla",
+                mensaje=(
+                    "No hay stock de la talla solicitada. Puedes solicitar una "
+                    "devolución o un traspaso desde otra sucursal."
+                ),
+                referencia=("solicitud_devolucion", solicitud.id),
+            )
+        except Exception as exc:  # pragma: no cover - notificación opcional
+            logger.warning("No se pudo notificar SIN_ALTERNATIVA: %s", exc)
+
+        return await cls.serializar(db, solicitud)
+
+    @classmethod
+    async def _registrar_movimientos_reposicion(
+        cls,
+        db: AsyncSession,
+        tenant_id: int,
+        solicitud_id: int,
+        items_devueltos: Iterable[dict],
+        items_nuevos: Iterable[dict],
+        usuario_id: int | None,
+    ) -> dict:
+        """Movimientos informativos separados de entrada y salida (CU18)."""
+        from app.apps.gestion_catalogo.models import MovimientoInventario, TipoMovimiento
+
+        registrados = 0
+        for items, tipo, etiqueta in (
+            (items_devueltos, TipoMovimiento.REPOSICION_ENTRADA, "entrada"),
+            (items_nuevos, TipoMovimiento.REPOSICION_SALIDA, "salida"),
+        ):
+            for item in items:
+                inventario = (await db.execute(
+                    select(Inventario).where(
+                        Inventario.tenant_id == tenant_id,
+                        Inventario.variante_producto_id == item["variante_id"],
+                        Inventario.sucursal_id == item["sucursal_id"],
+                    )
+                )).scalar_one_or_none()
+                if inventario is None:
+                    continue
+                db.add(MovimientoInventario(
+                    inventario_id=inventario.id,
+                    tipo=tipo,
+                    cantidad=0,
+                    motivo=(
+                        f"Reposición {etiqueta} de prenda "
+                        f"(solicitud {solicitud_id})"
+                    ),
+                    usuario_id=usuario_id,
+                    tenant_id=tenant_id,
+                ))
+                registrados += 1
+        await db.flush()
+        return {"movimientos": registrados}
+
+    @classmethod
+    def nota_reposicion_url(cls, solicitud_id: int) -> str:
+        return f"/api/v1/devoluciones/{solicitud_id}/nota-reposicion"
+
+    @classmethod
+    async def generar_nota_reposicion(
+        cls, db: AsyncSession, tenant_id: int, solicitud_id: int
+    ) -> tuple[bytes, str]:
+        """Nota de Reposición en PDF (dos tablas + bloque de diferencia)."""
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+        solicitud = await cls.obtener_solicitud(db, tenant_id, solicitud_id)
+        if solicitud.tipo != TipoSolicitudDevolucion.REPOSICION:
+            raise ValidationException("La solicitud no es una reposición")
+
+        tenant = None
+        try:
+            from app.apps.gestion_saas.models import Tenant
+
+            tenant = await db.get(Tenant, tenant_id)
+        except Exception:  # pragma: no cover - defensivo
+            tenant = None
+
+        buffer = io.BytesIO()
+        documento = SimpleDocTemplate(buffer, pagesize=letter, topMargin=36, bottomMargin=36)
+        estilos = getSampleStyleSheet()
+        moneda = getattr(tenant, "moneda", "BOB") or "BOB"
+        elementos = [
+            Paragraph(getattr(tenant, "razon_social", None) or "FashionStore", estilos["Title"]),
+            Paragraph(f"NIT: {getattr(tenant, 'nit', None) or '-'}", estilos["Normal"]),
+            Paragraph(
+                f"Nota de reposición N.º {solicitud.numero_reposicion or solicitud.numero_solicitud}",
+                estilos["Heading2"],
+            ),
+            Paragraph(
+                f"Orden: {getattr(solicitud.orden, 'numero_orden', solicitud.orden_id)} · "
+                f"Estado: {solicitud.estado.value}",
+                estilos["Normal"],
+            ),
+            Paragraph(
+                f"Fecha: {_aware(solicitud.fecha_solicitud).strftime('%d/%m/%Y %H:%M')} · "
+                f"Moneda: {moneda}",
+                estilos["Normal"],
+            ),
+            Paragraph(
+                f"Motivo: {solicitud.motivo.value} - {solicitud.motivo_detalle or ''}",
+                estilos["Normal"],
+            ),
+            Spacer(1, 12),
+        ]
+
+        def _tabla(titulo: str, campo_variante: str) -> Table:
+            filas = [[titulo, "Cantidad", "Precio", "Subtotal"]]
+            total = 0.0
+            for detalle in solicitud.detalles or []:
+                variante = getattr(detalle, campo_variante)
+                precio = (
+                    detalle.precio_unitario
+                    if campo_variante == "variante_producto_id"
+                    else detalle.precio_variante_nueva
+                )
+                cantidad = detalle.cantidad or 0
+                subtotal = float(precio or 0) * cantidad
+                total += subtotal
+                filas.append([
+                    f"Variante #{variante or '-'}", str(cantidad),
+                    f"{float(precio or 0):.2f}", f"{subtotal:.2f}",
+                ])
+            filas.append(["Total", "", "", f"{total:.2f}"])
+            tabla = Table(filas, repeatRows=1)
+            tabla.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E11D48")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ]))
+            return tabla
+
+        elementos.append(Paragraph("Prenda devuelta", estilos["Heading4"]))
+        elementos.append(_tabla("Prenda devuelta", "variante_producto_id"))
+        elementos.append(Spacer(1, 10))
+        elementos.append(Paragraph("Prenda nueva", estilos["Heading4"]))
+        elementos.append(_tabla("Prenda nueva", "variante_cambio_id"))
+        elementos.extend([
+            Spacer(1, 12),
+            Paragraph(
+                f"Diferencia: {float(solicitud.diferencia_precio or 0):.2f} "
+                f"({solicitud.tipo_diferencia.value if solicitud.tipo_diferencia else 'SIN_DIFERENCIA'})",
+                estilos["Normal"],
+            ),
+            Paragraph(
+                f"Pagado por diferencia: {float(solicitud.monto_pagado_diferencia or 0):.2f} · "
+                f"Saldo a favor: {float(solicitud.saldo_favor or 0):.2f}",
+                estilos["Normal"],
+            ),
+            Paragraph(
+                f"Atendido por usuario #{solicitud.usuario_procesa_id or '-'} · "
+                "Firma: ______________________",
+                estilos["Normal"],
+            ),
+        ])
+        documento.build(elementos)
+        nombre = f"nota_reposicion_{solicitud.numero_reposicion or solicitud.numero_solicitud}.pdf"
+        return buffer.getvalue(), nombre
 
     @classmethod
     async def _procesar_reembolso(
@@ -1187,6 +1786,8 @@ class CambioDevolucionService:
             "saldo_favor": float(solicitud.saldo_favor or 0),
             "motivo_rechazo": solicitud.motivo_rechazo,
             "nota_devolucion_url": solicitud.nota_devolucion_url,
+            "numero_reposicion": solicitud.numero_reposicion,
+            "nota_reposicion_url": solicitud.nota_reposicion_url,
             "detalles": [
                 {
                     "id": detalle.id,
