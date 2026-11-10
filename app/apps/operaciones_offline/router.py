@@ -206,15 +206,11 @@ async def obtener_configuracion_offline(
 async def _sucursal_para(
     db: AsyncSession, tenant_id: int, sucursal_id: Optional[int]
 ) -> Optional[int]:
+    # Sin sucursal explícita el alcance es todo el tenant. Antes se elegía
+    # silenciosamente la primera sucursal, por lo que el paquete administrativo
+    # no incluía el stock de las demás sucursales activas.
     if sucursal_id is None:
-        from app.apps.gestion_catalogo.models import Sucursal
-
-        return (await db.execute(
-            select(Sucursal.id)
-            .where(Sucursal.tenant_id == tenant_id, Sucursal.deleted_at.is_(None))
-            .order_by(Sucursal.id.asc())
-            .limit(1)
-        )).scalar_one_or_none()
+        return None
     await PaqueteOfflineService.validar_sucursal_del_tenant(db, tenant_id, sucursal_id)
     return sucursal_id
 
@@ -313,8 +309,6 @@ async def obtener_stock_offline(
     db: AsyncSession = Depends(get_db),
 ):
     sucursal = await _sucursal_para(db, tenant.id, sucursal_id)
-    if sucursal is None:
-        return []
     return await PaqueteOfflineService.obtener_stock_sucursal(
         db, tenant.id, sucursal, desde=actualizado_desde
     )

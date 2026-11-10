@@ -23,6 +23,7 @@ from app.apps.gestion_catalogo.models import (
     Categoria,
     Coleccion,
     Color,
+    EstadoSucursal,
     Inventario,
     Producto,
     Sucursal,
@@ -90,6 +91,7 @@ class PaqueteOfflineService:
                 Sucursal.id == sucursal_id,
                 Sucursal.tenant_id == tenant_id,
                 # [EXAMEN-2] Fase 2.5: no distribuir paquetes de sucursales cerradas
+                Sucursal.estado == EstadoSucursal.ACTIVO,
                 Sucursal.deleted_at.is_(None),
             )
         )
@@ -222,17 +224,25 @@ class PaqueteOfflineService:
 
     @staticmethod
     async def obtener_stock_sucursal(
-        db: AsyncSession, tenant_id: int, sucursal_id: int, desde: Optional[datetime] = None
+        db: AsyncSession,
+        tenant_id: int,
+        sucursal_id: Optional[int] = None,
+        desde: Optional[datetime] = None,
     ) -> list[dict]:
         query = (
             select(Inventario)
             .options(selectinload(Inventario.variante_producto))
+            .join(Sucursal, Sucursal.id == Inventario.sucursal_id)
             .where(
                 Inventario.tenant_id == tenant_id,
-                Inventario.sucursal_id == sucursal_id,
+                Sucursal.tenant_id == tenant_id,
+                Sucursal.estado == EstadoSucursal.ACTIVO,
+                Sucursal.deleted_at.is_(None),
             )
             .order_by(Inventario.variante_producto_id.asc())
         )
+        if sucursal_id is not None:
+            query = query.where(Inventario.sucursal_id == sucursal_id)
         if desde is not None:
             query = query.where(Inventario.updated_at > desde)
         result = await db.execute(query)
@@ -382,7 +392,16 @@ class PaqueteOfflineService:
             )).scalar_one_or_none()
             if valor is not None:
                 fechas.append(valor)
-        consulta_inv = select(func.max(Inventario.updated_at)).where(Inventario.tenant_id == tenant_id)
+        consulta_inv = (
+            select(func.max(Inventario.updated_at))
+            .join(Sucursal, Sucursal.id == Inventario.sucursal_id)
+            .where(
+                Inventario.tenant_id == tenant_id,
+                Sucursal.tenant_id == tenant_id,
+                Sucursal.estado == EstadoSucursal.ACTIVO,
+                Sucursal.deleted_at.is_(None),
+            )
+        )
         if sucursal_id is not None:
             consulta_inv = consulta_inv.where(Inventario.sucursal_id == sucursal_id)
         valor = (await db.execute(consulta_inv)).scalar_one_or_none()
@@ -434,9 +453,8 @@ class PaqueteOfflineService:
             "desde_version": desde_version,
             "catalogo": await cls.obtener_catalogo(db, tenant_id, desde=desde),
             "variantes": await cls.obtener_variantes_y_precios(db, tenant_id, desde=desde),
-            "stock": (
-                await cls.obtener_stock_sucursal(db, tenant_id, sucursal_id, desde=desde)
-                if sucursal_id is not None else []
+            "stock": await cls.obtener_stock_sucursal(
+                db, tenant_id, sucursal_id, desde=desde
             ),
         }
 
@@ -465,9 +483,8 @@ class PaqueteOfflineService:
             "configuracion_offline": config,
             "catalogo": await cls.obtener_catalogo(db, tenant_id, filtros),
             "variantes": await cls.obtener_variantes_y_precios(db, tenant_id),
-            "stock": (
-                await cls.obtener_stock_sucursal(db, tenant_id, sucursal_id)
-                if sucursal_id is not None else []
+            "stock": await cls.obtener_stock_sucursal(
+                db, tenant_id, sucursal_id
             ),
             "datos_maestros": await cls.obtener_datos_maestros(db, tenant_id),
             "promociones": await cls.obtener_promociones_vigentes(db, tenant_id),

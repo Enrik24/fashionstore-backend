@@ -10,6 +10,7 @@ from uuid import uuid4
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from app.apps.gestion_catalogo.models import EstadoSucursal, Inventario, Sucursal
 from app.apps.gestion_ventas.models import EstadoOrden, Orden, TipoOrden
 from app.apps.gestion_usuarios.models import Bitacora
 from app.apps.operaciones_offline.models import (
@@ -49,9 +50,35 @@ async def test_paquete_contiene_solo_datos_del_tenant(
     plan_profesional,
     catalogo_tenant,
     cliente_tenant,
+    db_session,
 ):
     tenant_a = await tenant_nuevo(plan_id=plan_profesional.id, nombre="Paquete A")
     catalogo_a = await catalogo_tenant(tenant_a, precio="120.00", stock=7)
+
+    # Segunda sucursal activa del mismo tenant para comprobar el alcance
+    # multi-sucursal cuando el cliente omite `sucursal_id`.
+    sucursal_original = await db_session.get(Sucursal, catalogo_a["sucursal_id"])
+    sucursal_segunda = Sucursal(
+        nombre="Sucursal CU05 2",
+        direccion="Av. Segunda 123",
+        telefono="70000001",
+        estado=EstadoSucursal.ACTIVO,
+        ciudad_id=sucursal_original.ciudad_id,
+        tenant_id=int(tenant_a["id"]),
+    )
+    db_session.add(sucursal_segunda)
+    await db_session.flush()
+    db_session.add(
+        Inventario(
+            variante_producto_id=catalogo_a["variante_id"],
+            sucursal_id=sucursal_segunda.id,
+            cantidad=3,
+            cantidad_reservada=0,
+            stock_minimo=0,
+            tenant_id=int(tenant_a["id"]),
+        )
+    )
+    await db_session.commit()
 
     tenant_b = await tenant_nuevo(plan_id=plan_profesional.id, nombre="Paquete B")
     catalogo_b = await catalogo_tenant(tenant_b, precio="999.00", stock=99)
@@ -77,9 +104,43 @@ async def test_paquete_contiene_solo_datos_del_tenant(
     assert catalogo_b["variante_id"] not in variantes
     assert float(variantes[catalogo_a["variante_id"]]["precio"]) == 120.0
 
-    stock = {s["variante_producto_id"]: s for s in paquete["stock"]}
-    assert stock[catalogo_a["variante_id"]]["cantidad"] == 7
-    assert catalogo_b["variante_id"] not in stock
+    stock_explicito = {
+        (s["variante_producto_id"], s["sucursal_id"]): s
+        for s in paquete["stock"]
+    }
+    assert stock_explicito[
+        (catalogo_a["variante_id"], catalogo_a["sucursal_id"])
+    ]["cantidad"] == 7
+    assert (
+        catalogo_a["variante_id"],
+        sucursal_segunda.id,
+    ) not in stock_explicito
+    assert catalogo_b["variante_id"] not in {
+        variante_id for variante_id, _ in stock_explicito
+    }
+
+    # Sin sucursal explícita el paquete contiene el stock de todas las
+    # sucursales activas del tenant, no solo de una sucursal elegida por orden.
+    respuesta_todas = await client.get(
+        "/api/v1/offline/paquete",
+        headers=tenant_a["headers"],
+    )
+    assert respuesta_todas.status_code == 200, respuesta_todas.text
+    paquete_todas = respuesta_todas.json()
+    assert paquete_todas["sucursal_id"] is None
+    stock_todas = {
+        (s["variante_producto_id"], s["sucursal_id"]): s
+        for s in paquete_todas["stock"]
+    }
+    assert stock_todas[
+        (catalogo_a["variante_id"], catalogo_a["sucursal_id"])
+    ]["cantidad"] == 7
+    assert stock_todas[
+        (catalogo_a["variante_id"], sucursal_segunda.id)
+    ]["cantidad"] == 3
+    assert catalogo_b["variante_id"] not in {
+        variante_id for variante_id, _ in stock_todas
+    }
 
     assert paquete["configuracion_offline"]["incluir_clientes"] is True
     assert "impuestos" in paquete

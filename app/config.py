@@ -2,10 +2,16 @@
 Configuración global de la aplicación FastAPI.
 Carga las variables de entorno y proporciona configuración centralizada.
 """
-from pydantic_settings import BaseSettings
 from typing import List
-import os
+from pathlib import Path
 from functools import lru_cache
+
+from pydantic import field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Ruta absoluta al .env del backend: así la configuración no depende del
+# directorio desde el que se arranque (uvicorn, gunicorn, alembic, pytest).
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 class Settings(BaseSettings):
     """Configuración de la aplicación cargada desde variables de entorno."""
@@ -18,8 +24,17 @@ class Settings(BaseSettings):
     DB_PORT: int = 5432
     DATABASE_URL: str = ""
     
-    # SSL para proveedores cloud como Supabase (False por defecto, se activa automáticamente para cloud)
+    # SSL para proveedores cloud como Supabase/Render (False por defecto, se
+    # activa automáticamente para hosts cloud). Vacío en el .env equivale a False.
     DB_SSL: bool = False
+
+    @field_validator("DB_SSL", mode="before")
+    @classmethod
+    def _parse_db_ssl(cls, value):
+        """Acepta vacío/None como False en lugar de fallar al validar el bool."""
+        if value is None or (isinstance(value, str) and value.strip() == ""):
+            return False
+        return value
     
     # JWT
     SECRET_KEY: str
@@ -125,61 +140,59 @@ class Settings(BaseSettings):
     RENDER_PUBLIC_URL: str = ""
     KEEPALIVE_INTERVALO_SEG: int = 600
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    model_config = SettingsConfigDict(
+        env_file=ENV_FILE,
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",
+    )
     
-    def __init__(self, **kwargs):
-        super().__init__(kwargs)
+    @model_validator(mode="after")
+    def _resolver_database_url(self):
         
-        # Obtener DATABASE_URL de variable de entorno directamente
-        # (pydantic-settings ya la carga, pero la verificamos explícitamente)
-        env_database_url = os.environ.get("DATABASE_URL", "")
+        # ------------------------------------------------------------------
+        # Selección de la base de datos: una sola fuente, sin mezclar.
+        #   1. Si DATABASE_URL tiene valor (dashboard de Render o .env), esa
+        #      manda y las variables DB_HOST/DB_PORT/DB_NAME/DB_USER/
+        #      DB_PASSWORD se ignoran por completo.
+        #   2. Si DATABASE_URL está vacía o no existe, se arma la URL con las
+        #      variables DB_* del .env local.
+        # ------------------------------------------------------------------
+        database_url = (self.DATABASE_URL or "").strip()
         
-        # Obtener variables individuales de entorno
-        env_db_host = os.environ.get("DB_HOST", "")
-        env_db_port = os.environ.get("DB_PORT", "")
-        env_db_name = os.environ.get("DB_NAME", "")
-        env_db_user = os.environ.get("DB_USER", "")
-        env_db_password = os.environ.get("DB_PASSWORD", "")
-        
-        # Estrategia de construcción de DATABASE_URL:
-        # 1. Si hay variables individuales (Render las inyecta), usarlas
-        # 2. Si hay DATABASE_URL en env, convertirla al formato correcto
-        # 3. Usar el valor por defecto del campo
-        
-        if env_db_host and env_db_port and env_db_name and env_db_user:
-            # Render inyecta variables individuales - construir URL desde ellas
-            self.DATABASE_URL = (
-                f"postgresql+asyncpg://{env_db_user}:{env_db_password}"
-                f"@{env_db_host}:{env_db_port}/{env_db_name}"
-            )
-        elif env_database_url:
-            # Convertir formato de Render (postgres:// o postgresql://) a asyncpg
-            if env_database_url.startswith("postgres://"):
-                self.DATABASE_URL = env_database_url.replace("postgres://", "postgresql+asyncpg://", 1)
-            elif env_database_url.startswith("postgresql://"):
-                self.DATABASE_URL = env_database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
-            elif env_database_url.startswith("postgresql+asyncpg://"):
-                self.DATABASE_URL = env_database_url
-            else:
-                # Si ya tiene el formato correcto o es otro formato, usar tal cual
-                self.DATABASE_URL = env_database_url
-        elif not self.DATABASE_URL:
-            # Desarrollo local - construir desde variables de la clase
-            self.DATABASE_URL = (
+        if database_url:
+            # Render entrega "postgres://" o "postgresql://"; asyncpg necesita
+            # el driver explícito. No se alteran usuario, contraseña ni params.
+            if database_url.startswith("postgres://"):
+                database_url = "postgresql+asyncpg://" + database_url[len("postgres://"):]
+            elif database_url.startswith("postgresql://"):
+                database_url = "postgresql+asyncpg://" + database_url[len("postgresql://"):]
+        else:
+            # Desarrollo local - construir desde las variables del .env
+            database_url = (
                 f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}"
                 f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
             )
         
-        # Activar SSL automáticamente si el host es de Supabase u otros proveedores cloud
-        if self.DATABASE_URL and ("supabase" in self.DATABASE_URL or "rds.amazonaws" in self.DATABASE_URL or "azure" in self.DATABASE_URL):
+        self.DATABASE_URL = database_url
+        
+        # Activar SSL automáticamente si el host es de Supabase u otros proveedores cloud.
+        # En Render: el host externo (dpg-xxxx-a.<region>-postgres.render.com) exige
+        # SSL; el host interno (dpg-xxxx-a) no lo necesita, así que este check no aplica.
+        if self.DATABASE_URL and (
+            "supabase" in self.DATABASE_URL
+            or "rds.amazonaws" in self.DATABASE_URL
+            or "azure" in self.DATABASE_URL
+            or ".render.com" in self.DATABASE_URL
+        ):
             self.DB_SSL = True
+
+        return self
     
     @property
     def cors_origins_list(self) -> List[str]:
         """Retorna lista de orígenes CORS desde la cadena de configuración."""
-        return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
 
 @lru_cache()
