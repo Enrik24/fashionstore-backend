@@ -1,8 +1,8 @@
-﻿"""ex2_009 - Dispositivos de sincronizaciÃ³n y configuraciÃ³n offline
+"""ex2_009 - Dispositivos de sincronización y configuración offline
 
 [EXAMEN-2] Fase 1 (plan, 3.3.13/3.3.14 y 9.1.4). Crea las tablas de CU17/CU04,
-el PIN offline y la FK del carrito al dispositivo. La configuraciÃ³n offline se
-crea en `ex2_004` para poder sembrarla; aquÃ­ se garantiza su existencia.
+el PIN offline y la FK del carrito al dispositivo. La configuración offline se
+crea en `ex2_004` para poder sembrarla; aquí se garantiza su existencia.
 
 Revision ID: ex2_009_dispositivos_y_config_offline
 Revises: ex2_008_nuevos_valores_enum
@@ -123,4 +123,4 @@ def downgrade() -> None:
     conn = op.get_bind()
     if "dispositivos_sincronizacion" in sa.inspect(conn).get_table_names():
         op.drop_table("dispositivos_sincronizacion")
-
+

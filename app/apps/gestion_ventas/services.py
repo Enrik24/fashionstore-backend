@@ -548,28 +548,105 @@ class CarritoService:
     @classmethod
     async def recalcular_carrito(cls, db: AsyncSession, carrito: Carrito) -> Dict[str, Decimal]:
         subtotal = sum((item.subtotal for item in carrito.items), Decimal("0.00"))
-        descuento = Decimal("0.00")
-        
+
+        # [EXAMEN-2] Descuento automático de campañas vigentes (ej. Black
+        # Fashion November 15% en Poleras/Pantalones/Chaquetas): se aplica al
+        # pagar tal como se muestra en el catálogo.
+        promo = await cls.calcular_descuento_promocion(db, carrito.items)
+        desc_promo = promo["descuento"]
+
+        descuento_cupon = Decimal("0.00")
         if carrito.cupon_id:
             cupon = carrito.cupon
             if not cupon:
                 q_cup = select(Cupon).where(Cupon.id == carrito.cupon_id)
                 res_cup = await db.execute(q_cup)
                 cupon = res_cup.scalar_one_or_none()
-                
+
             if cupon:
                 valido, _, _, desc_calc = await CuponService.validar_cupon(db, cupon.codigo, subtotal, items=carrito.items)
-                if valido:
-                    descuento = desc_calc
+                if valido and desc_promo > 0:
+                    # [EXAMEN-2] Regla "no acumulable": la campaña vigente manda
+                    # y el cupón se libera de forma transparente.
+                    carrito.cupon_id = None
+                elif valido:
+                    descuento_cupon = desc_calc
                 else:
                     carrito.cupon_id = None
                     carrito.descuento_aplicado = Decimal("0.00")
-                    descuento = Decimal("0.00")
-                
+
+        descuento = desc_promo + descuento_cupon
+
         carrito.descuento_aplicado = descuento
         total = max(Decimal("0.00"), subtotal - descuento)
         await db.flush()
-        return {"subtotal": subtotal, "descuento": descuento, "total": total}
+        return {
+            "subtotal": subtotal,
+            "descuento": descuento,
+            "total": total,
+            "descuento_cupon": descuento_cupon,
+            "descuento_promocion": desc_promo,
+            "promocion_nombre": promo["nombre"],
+            "promocion_valor": promo["valor"],
+        }
+
+    @classmethod
+    async def calcular_descuento_promocion(cls, db: AsyncSession, items: List[ItemCarrito]) -> Dict[str, Any]:
+        """[EXAMEN-2] Descuento de campañas vigentes (tipo PORCENTAJE) del carrito.
+
+        Replica en el checkout lo mostrado en catálogo: cada producto recibe el
+        mayor % de las promociones ACTIVA/vigentes que le correspondan (por
+        producto o por categoría). No acumulable: la campaña es automática.
+        Devuelve {"descuento": Decimal, "nombre": str|None, "valor": Decimal|None}.
+        """
+        resultado: Dict[str, Any] = {"descuento": Decimal("0.00"), "nombre": None, "valor": None}
+        if not items:
+            return resultado
+
+        # Import local para evitar ciclo de imports entre apps.
+        try:
+            from app.apps.gestion_marketing.services import PromocionService
+            promos = await PromocionService.obtener_promociones_activas(db)
+        except Exception as exc:  # fallar abierto: el checkout no debe romperse por marketing
+            logger.warning(f"No se pudieron cargar promociones activas para el carrito: {exc}")
+            return resultado
+
+        promos_pct = [p for p in promos if p.tipo == "PORCENTAJE" and (p.valor or 0) > 0]
+        if not promos_pct:
+            return resultado
+
+        # producto_id y categoria_id de cada variante del carrito
+        v_ids = [it.variante_producto_id for it in items]
+        r_vars = await db.execute(
+            select(VarianteProducto)
+            .options(joinedload(VarianteProducto.producto))
+            .where(VarianteProducto.id.in_(v_ids))
+        )
+        alcance: Dict[int, Tuple[Optional[int], Optional[int]]] = {}
+        for v in r_vars.scalars().all():
+            alcance[v.id] = (v.producto_id, v.producto.categoria_id if v.producto else None)
+
+        desc = Decimal("0.00")
+        mejor_pct = Decimal("0.00")
+        for it in items:
+            pid, cat_id = alcance.get(it.variante_producto_id, (None, None))
+            aplicables = [
+                p for p in promos_pct
+                if (pid is not None and pid in p.producto_ids)
+                or (cat_id is not None and cat_id in p.categoria_ids)
+            ]
+            if not aplicables:
+                continue
+            pct = max(p.valor or Decimal("0.00") for p in aplicables)
+            top = max(aplicables, key=lambda x: x.valor or Decimal("0.00"))
+            desc += (it.subtotal or Decimal("0.00")) * Decimal(pct) / Decimal("100")
+            if (top.valor or Decimal("0.00")) > mejor_pct:
+                mejor_pct = top.valor
+                resultado["nombre"] = top.nombre
+                resultado["valor"] = top.valor
+
+        resultado["descuento"] = desc.quantize(Decimal("0.01"))
+        return resultado
 
     @classmethod
     async def agregar_item(
@@ -657,7 +734,15 @@ class CarritoService:
         
         if len(carrito.items) == 0:
             raise BadRequestException("El carrito está vacío, no se puede aplicar un cupón")
-            
+
+        # [EXAMEN-2] Regla "no acumulable": si una campaña ya descuenta al
+        # carrito, el cupón no puede combinarse con ella.
+        promo = await cls.calcular_descuento_promocion(db, carrito.items)
+        if promo["descuento"] > 0:
+            raise BadRequestException(
+                f"La campaña '{promo['nombre']}' ya aplica a tu carrito; los descuentos de campañas no son acumulables con cupones."
+            )
+
         valido, msg, cupon, descuento = await CuponService.validar_cupon(db, codigo, subtotal)
         if not valido:
             raise BadRequestException(msg)
@@ -705,12 +790,19 @@ class OrdenService:
             
         subtotal = sum((item.subtotal for item in carrito.items), Decimal("0.00"))
         descuento = Decimal("0.00")
-        
-        if carrito.cupon:
+
+        # [EXAMEN-2] Campaña vigente aplicada en el checkout (no acumulable con cupón).
+        promo = await CarritoService.calcular_descuento_promocion(db, carrito.items)
+        desc_promo = promo["descuento"]
+        cupon_usado: Optional[int] = None
+
+        if carrito.cupon and desc_promo == 0:
             valido, _, cupon, desc_calc = await CuponService.validar_cupon(db, carrito.cupon.codigo, subtotal)
             if valido:
                 descuento = desc_calc
                 await CuponService.incrementar_uso(db, cupon.id)
+                cupon_usado = carrito.cupon_id
+        descuento += desc_promo
                 
         # Impuestos (e.g. 12% o 0 según aplique, default 0 para claridad)
         impuestos = Decimal("0.00")
@@ -734,7 +826,7 @@ class OrdenService:
             total=total,
             impuestos=impuestos,
             descuentos=descuento,
-            cupon_id=carrito.cupon_id if descuento > 0 else None,
+            cupon_id=cupon_usado,
             direccion_envio=direccion_envio
         )
         db.add(orden)
@@ -931,7 +1023,8 @@ class OrdenService:
             tipo=tipo,
             monto_total=orden.total,
             archivo_pdf=pdf_url,
-            orden_id=orden.id
+            orden_id=orden.id,
+            tenant_id=orden.tenant_id  # [FIX] NOT NULL: hereda el tenant de la orden
         )
         db.add(comprobante)
         await db.flush()

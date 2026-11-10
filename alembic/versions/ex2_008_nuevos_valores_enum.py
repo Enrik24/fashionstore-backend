@@ -1,7 +1,7 @@
-﻿"""ex2_008 - Nuevos valores de enums del Examen 2
+"""ex2_008 - Nuevos valores de enums del Examen 2
 
 [EXAMEN-2] Fase 1 (plan, 3.8.5 y 9.1.4). Agrega los valores usados por la
-operaciÃ³n offline, el pago diferido y las devoluciones.
+operación offline, el pago diferido y las devoluciones.
 
 Nota: PostgreSQL no permite eliminar valores de un enum sin recrear el tipo.
 El `downgrade` es un no-op deliberado; las migraciones anteriores eliminan las
@@ -49,6 +49,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Irreversible por diseÃ±o: PostgreSQL no soporta DROP VALUE.
+    # Irreversible por diseño: PostgreSQL no soporta DROP VALUE.
     pass
-
+

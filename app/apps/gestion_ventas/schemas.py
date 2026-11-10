@@ -146,6 +146,10 @@ class CarritoResponse(BaseModel):
     estado: EstadoCarrito
     cupon_id: Optional[int] = None
     descuento_aplicado: Decimal = Decimal("0.00")
+    # [EXAMEN-2] Campaña promocional aplicada automáticamente en el checkout
+    descuento_promocion: Decimal = Decimal("0.00")
+    promocion_nombre: Optional[str] = None
+    promocion_valor: Optional[Decimal] = None
     items: List[ItemCarritoResponse] = []
     subtotal: Decimal = Decimal("0.00")
     total: Decimal = Decimal("0.00")

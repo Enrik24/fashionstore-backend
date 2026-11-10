@@ -15,6 +15,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
+from pathlib import Path
 
 from app.database import Base
 from app.apps.gestion_ventas.models import EstadoTransaccion
@@ -286,6 +287,13 @@ class Backup(Base):
     tenant = relationship("Tenant")
     creador = relationship("Usuario", foreign_keys=[creado_por])
     restauraciones = relationship("Restauracion", back_populates="backup")
+
+    @property
+    def nombre_archivo(self) -> str | None:
+        """Nombre del archivo generado, sin exponer la ruta interna del servidor."""
+        if not self.ruta:
+            return None
+        return Path(self.ruta).name
 
     def __repr__(self):
         return f"<Backup tenant={self.tenant_id} {self.tipo}: {self.estado}>"

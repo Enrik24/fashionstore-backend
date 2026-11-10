@@ -1,5 +1,6 @@
 """
 Servicios de negocio para Gestión de Catálogo, Productos e Inventario.
+# reload touch backend fix E3 (tipos-tela varchar)
 """
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime
@@ -734,7 +735,8 @@ class TipoTelaService:
         if tenant_id is not None:
             query = query.where(TipoTela.tenant_id == tenant_id)
         if not incluir_inactivos:
-            query = query.where(TipoTela.estado == EstadoProducto.ACTIVO)
+            # ✅ FIX E3: tipos_tela.estado en BD es VARCHAR, no enum PG; comparar como string para evitar 500 (varchar = estadoproducto).
+            query = query.where(TipoTela.estado == EstadoProducto.ACTIVO.value)
         return list((await db.execute(query.order_by(TipoTela.nombre.asc()))).scalars().all())
 
     @staticmethod

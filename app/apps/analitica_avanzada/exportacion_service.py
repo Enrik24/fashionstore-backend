@@ -24,7 +24,7 @@ from app.apps.analitica_avanzada.reporte_service import ReporteGenerativoService
 # Registro en proceso: archivo_id -> metadatos + contenido
 _ARCHIVOS: dict[str, dict[str, Any]] = {}
 
-FORMATOS = {"PDF", "EXCEL"}
+FORMATOS = {"PDF", "EXCEL", "HTML"}
 
 
 def limpiar_archivos() -> None:
@@ -43,7 +43,8 @@ class ExportacionService:
     def generar_nombre_archivo(cls, tipo: str, tenant_nombre: str, fecha: datetime | None = None) -> str:
         base = "".join(ch if ch.isalnum() else "_" for ch in (tenant_nombre or "tenant"))
         base = "_".join(filter(None, base.split("_")))[:40] or "tenant"
-        return f"{tipo.lower()}_{base}_{(fecha or datetime.now()).strftime('%Y%m%d_%H%M')}.{ 'xlsx' if tipo.upper() == 'EXCEL' else 'pdf'}"
+        ext = {"EXCEL": "xlsx", "HTML": "html"}.get(tipo.upper(), "pdf")
+        return f"{tipo.lower()}_{base}_{(fecha or datetime.now()).strftime('%Y%m%d_%H%M')}.{ext}"
 
     @classmethod
     def aplicar_branding(cls, documento: dict, tenant) -> dict:
@@ -165,6 +166,34 @@ class ExportacionService:
             elementos.append(Paragraph("Sin datos para los filtros seleccionados.", estilos["Normal"]))
         doc.build(elementos)
         return buf.getvalue()
+
+    @classmethod
+    def generar_html(cls, datos: dict, opciones: dict | None = None) -> bytes:
+        import html as _html
+
+        opciones = opciones or {}
+        branding = opciones.get("branding") or {}
+        metadatos = opciones.get("metadatos") or {}
+
+        def esc(valor) -> str:
+            return _html.escape(str(valor or ""))
+
+        cabecera = "".join(f"<th>{esc(c)}</th>" for c in (datos.get("columnas") or []))
+        filas = "".join(
+            "<tr>" + "".join(f"<td>{esc(f.get(c, ''))}</td>" for c in (datos.get("columnas") or [])) + "</tr>"
+            for f in (datos.get("filas") or [])[:200]
+        )
+        contenido = f"""<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>{esc(datos.get('titulo', 'Reporte'))}</title>
+<style>body{{font-family:Arial,sans-serif;margin:2rem}}table{{border-collapse:collapse;width:100%}}th{{background:#e11d48;color:#fff;padding:.4rem;border:1px solid #cbd5e1;font-size:12px}}td{{padding:.35rem;border:1px solid #cbd5e1;font-size:12px}}</style></head>
+<body><h1>{esc(branding.get('razon_social') or 'FashionStore')}</h1>
+<p>NIT: {esc(branding.get('nit') or '-')}</p>
+<h2>Reporte: {esc(datos.get('titulo', ''))}</h2>
+<p>Usuario: {esc(metadatos.get('usuario') or '-')} · Fecha: {esc(metadatos.get('fecha') or '-')}</p>
+<p>Filtros: {esc(metadatos.get('filtros') or {})}</p>
+{"<table><thead><tr>" + cabecera + "</tr></thead><tbody>" + filas + "</tbody></table>" if filas else "<p>Sin datos para los filtros seleccionados.</p>"}
+</body></html>"""
+        return contenido.encode("utf-8")
 
     @classmethod
     def generar_excel(cls, datos: dict, opciones: dict | None = None) -> bytes:
@@ -309,7 +338,7 @@ class ExportacionService:
     ) -> dict:
         formato = (formato or "PDF").upper()
         if formato not in FORMATOS:
-            raise ValidationException("Formato no soportado; use PDF o EXCEL")
+            raise ValidationException("Formato no soportado; use PDF, EXCEL o HTML")
 
         solicitud = await ReporteGenerativoService.obtener_solicitud(db, solicitud_id, tenant_id)
         if solicitud.estado != EstadoSolicitudReporteIA.EJECUTADA:
@@ -326,6 +355,9 @@ class ExportacionService:
             if formato == "PDF":
                 contenido = cls.generar_pdf(datos, opciones)
                 media_type = "application/pdf"
+            elif formato == "HTML":
+                contenido = cls.generar_html(datos, opciones)
+                media_type = "text/html; charset=utf-8"
             else:
                 contenido = cls.generar_excel(datos, opciones)
                 media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"

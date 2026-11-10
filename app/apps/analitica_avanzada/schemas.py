@@ -15,15 +15,18 @@ class ReporteSolicitudRequest(BaseModel):
     texto: Optional[str] = Field(None, max_length=2000)
     audio_base64: Optional[str] = None
     formato: str = Field("PDF", description="Formato sugerido para exportar (PDF o EXCEL)")
+    # Compatibilidad: clientes viejos mandan { prompt } en vez de { texto }.
+    prompt: Optional[str] = None
 
 
 class ReporteInterpretarRequest(BaseModel):
     texto: Optional[str] = Field(None, max_length=2000)
     audio_base64: Optional[str] = None
+    prompt: Optional[str] = None
 
 
 class ReporteExportarRequest(BaseModel):
-    formato: str = Field("PDF", pattern="^(PDF|EXCEL|pdf|excel)$")
+    formato: str = Field("PDF", pattern="^(PDF|EXCEL|HTML|pdf|excel|html)$")
     opciones: Optional[dict[str, Any]] = None
 
 

@@ -66,23 +66,58 @@ class MLService:
     # ------------------------------------------------------------------
 
     @classmethod
+    async def _medir_origen(
+        cls, db: AsyncSession, tenant_id: int, es_sintetico: bool
+    ) -> dict:
+        """Mide un origen (real o sintético) sin mezclar ambos."""
+        resp = await db.execute(
+            select(
+                func.min(Orden.fecha),
+                func.max(Orden.fecha),
+                func.count(Orden.id),
+                func.count(func.distinct(func.date(Orden.fecha))),
+            ).where(
+                Orden.tenant_id == tenant_id,
+                Orden.es_sintetico.is_(es_sintetico),
+            )
+        )
+        primera, ultima, total, dias_distintos = resp.one()
+        if primera is None:
+            return {
+                "primera": None, "ultima": None, "total": 0,
+                "dias_distintos": 0, "meses": 0.0, "suficientes": False,
+            }
+        p = primera.replace(tzinfo=None) if isinstance(primera, datetime) and primera.tzinfo else primera
+        u = ultima.replace(tzinfo=None) if isinstance(ultima, datetime) and ultima.tzinfo else ultima
+        dias = max(0, (u.date() - p.date()).days) if p and u else 0
+        meses = dias / 30
+        total = int(total or 0)
+        dias_distintos = int(dias_distintos or 0)
+        return {
+            "primera": primera, "ultima": ultima, "total": total,
+            "dias_distintos": dias_distintos,
+            "meses": meses,
+            "suficientes": (
+                meses >= settings.ML_MIN_MESES_HISTORIAL
+                and total >= 30
+                and dias_distintos >= 14
+            ),
+        }
+
+    @classmethod
     async def _origen_datos(cls, db: AsyncSession, tenant_id: int) -> bool:
-        """Devuelve `True` si debe usar sintéticos (no hay datos reales)."""
-        reales = await db.execute(
-            select(func.count(Orden.id)).where(
-                Orden.tenant_id == tenant_id,
-                Orden.es_sintetico.is_(False),
-            )
-        )
-        if int(reales.scalar() or 0) > 0:
+        """Devuelve `True` si debe usar sintéticos (las reales no alcanzan).
+
+        Se mide el origen real por sí solo. La versión anterior delegaba en
+        ``validar_datos_suficientes`` —que ya aplica fallback a sintéticos— y
+        por tanto concluía «suficientes» aunque las reales no lo fueran,
+        dejando al entrenamiento con 1-3 ventas reales (<14 días).
+        """
+        reales = await cls._medir_origen(db, tenant_id, False)
+        if reales["suficientes"]:
             return False
-        sinteticos = await db.execute(
-            select(func.count(Orden.id)).where(
-                Orden.tenant_id == tenant_id,
-                Orden.es_sintetico.is_(True),
-            )
-        )
-        return int(sinteticos.scalar() or 0) > 0
+        sinteticos = await cls._medir_origen(db, tenant_id, True)
+        return int(sinteticos["total"] or 0) > 0
 
     @classmethod
     async def preparar_dataset_ventas(
@@ -165,51 +200,63 @@ class MLService:
 
     @classmethod
     async def validar_datos_suficientes(cls, db: AsyncSession, tenant_id: int) -> dict:
-        """Exige `ML_MIN_MESES_HISTORIAL` meses y un mínimo de registros."""
-        resultado = await db.execute(
-            select(func.min(Orden.fecha), func.max(Orden.fecha), func.count(Orden.id))
-            .where(
-                Orden.tenant_id == tenant_id,
-                Orden.es_sintetico.is_(False),
-            )
-        )
-        primera, ultima, total = resultado.one()
-        if primera is None or int(total or 0) == 0:
-            # Sin historial real se admite el dataset sintético ya sembrado.
-            resultado = await db.execute(
-                select(func.min(Orden.fecha), func.max(Orden.fecha), func.count(Orden.id))
-                .where(
-                    Orden.tenant_id == tenant_id,
-                    Orden.es_sintetico.is_(True),
-                )
-            )
-            primera, ultima, total = resultado.one()
+        """Exige `ML_MIN_MESES_HISTORIAL` meses, 30 ventas y 14 días con venta.
 
-        if primera is None:
+        Si hay ventas reales insuficientes (ej: 13), se reintenta con las
+        sintéticas sembradas (RF-023); si estas alcanzan el mínimo, el
+        entrenamiento usa sintéticos en vez de bloquearse. Devuelve además
+        ``origen``/``usar_sinteticos`` para que el caller entrene con el
+        mismo origen medido (nunca se mezclan).
+        """
+        locales = await cls._medir_origen(db, tenant_id, False)
+        if locales["suficientes"]:
+            return {
+                "suficientes": True,
+                "meses": round(float(locales["meses"]), 2),
+                "ordenes": int(locales["total"]),
+                "dias_distintos": int(locales["dias_distintos"]),
+                "minimo_meses": settings.ML_MIN_MESES_HISTORIAL,
+                "origen": "reales",
+                "usar_sinteticos": False,
+                "motivo": None,
+            }
+
+        sinteticos = await cls._medir_origen(db, tenant_id, True)
+        if sinteticos["suficientes"]:
+            return {
+                "suficientes": True,
+                "meses": round(float(sinteticos["meses"]), 2),
+                "ordenes": int(sinteticos["total"]),
+                "dias_distintos": int(sinteticos["dias_distintos"]),
+                "minimo_meses": settings.ML_MIN_MESES_HISTORIAL,
+                "origen": "sinteticos",
+                "usar_sinteticos": True,
+                "motivo": None,
+            }
+
+        # Ni reales ni sintéticos alcanzan: reporta el origen con más ventas
+        # (útil para el mensaje) sin marcarlo como suficiente.
+        elegido = locales if locales["total"] >= sinteticos["total"] else sinteticos
+        if elegido["primera"] is None:
             return {
                 "suficientes": False,
                 "meses": 0,
                 "ordenes": 0,
+                "dias_distintos": 0,
                 "minimo_meses": settings.ML_MIN_MESES_HISTORIAL,
+                "origen": None,
+                "usar_sinteticos": False,
                 "motivo": "El tenant no tiene ventas registradas",
             }
-
-        if isinstance(primera, datetime) and primera.tzinfo is not None:
-            primera = primera.replace(tzinfo=None)
-        if isinstance(ultima, datetime) and ultima.tzinfo is not None:
-            ultima = ultima.replace(tzinfo=None)
-
-        dias = max(0, (ultima.date() - primera.date()).days)
-        meses = dias / 30
-        suficiente = (
-            meses >= settings.ML_MIN_MESES_HISTORIAL and int(total or 0) >= 30
-        )
         return {
-            "suficientes": suficiente,
-            "meses": round(meses, 2),
-            "ordenes": int(total or 0),
+            "suficientes": False,
+            "meses": round(float(elegido["meses"]), 2),
+            "ordenes": int(elegido["total"]),
+            "dias_distintos": int(elegido["dias_distintos"]),
             "minimo_meses": settings.ML_MIN_MESES_HISTORIAL,
-            "motivo": None if suficiente else "Historial insuficiente para entrenar",
+            "origen": "reales" if elegido is locales else "sinteticos",
+            "usar_sinteticos": int(sinteticos["total"]) > 0,
+            "motivo": "Historial insuficiente para entrenar",
         }
 
     @classmethod
@@ -245,7 +292,7 @@ class MLService:
         reales = np.asarray(reales, dtype=float)
         predicciones = np.asarray(predicciones, dtype=float)
         if reales.size == 0:
-            return {"rmse": 0.0, "mae": 0.0, "r2": 0.0}
+            return {"rmse": 0.0, "mae": 0.0, "r2": 0.0, "accuracy": 0.0, "mape": 0.0}
         errores = reales - predicciones
         rmse = float(np.sqrt(np.mean(np.square(errores))))
         mae = float(np.mean(np.abs(errores)))
@@ -253,10 +300,20 @@ class MLService:
             r2 = float(1 - (np.sum(np.square(errores)) / np.sum(np.square(reales - reales.mean()))))
         else:
             r2 = 0.0
+        # Accuracy para regresión: 1 - MAPE (sin contar reales cero).
+        # Es el porcentaje de acierto relativo; complementa a RMSE/R² (CU12).
+        mask = np.abs(reales) > 1e-9
+        if mask.any():
+            mape = float(np.mean(np.abs(errores[mask] / reales[mask])))
+        else:
+            mape = 0.0
+        accuracy = max(0.0, min(1.0, 1.0 - mape))
         return {
             "rmse": round(rmse, 4),
             "mae": round(mae, 4),
             "r2": round(r2, 4),
+            "accuracy": round(accuracy, 4),
+            "mape": round(mape, 4),
             "filas_prueba": int(reales.size),
         }
 
@@ -803,14 +860,17 @@ class MLService:
 
         r2 = float(metricas.get("r2", 0.0))
         rmse = float(metricas.get("rmse", 0.0))
+        accuracy = float(metricas.get("accuracy", 0.0))
         if r2 < 0.3:
             return (
-                f"El modelo {modelo.algoritmo} explica poco de la variación (R²={r2:.2f}); "
-                f"el error medio es {rmse:.2f}. Úsese como referencia."
+                f"El modelo {modelo.algoritmo} explica poco de la variación (R²={r2:.2f}, "
+                f"accuracy={accuracy * 100:.1f}%); el error medio es {rmse:.2f}. "
+                f"Precisión baja: se sugiere recolectar más datos o cambiar variables. "
+                f"Úsese como referencia."
             )
         return (
-            f"El modelo {modelo.algoritmo} explica la variación con R²={r2:.2f} "
-            f"y un error medio (RMSE) de {rmse:.2f}."
+            f"El modelo {modelo.algoritmo} explica la variación con R²={r2:.2f}, "
+            f"accuracy={accuracy * 100:.1f}% y un error medio (RMSE) de {rmse:.2f}."
         )
 
     @staticmethod

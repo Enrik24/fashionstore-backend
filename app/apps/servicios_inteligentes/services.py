@@ -580,8 +580,11 @@ class ReporteService:
         }
 
     @staticmethod
-    async def generar_reporte_clientes(db: AsyncSession) -> Dict[str, Any]:
-        """Genera estadísticas sobre fidelidad y actividad de clientes."""
+    async def generar_reporte_clientes(db: AsyncSession, sucursal_id: Optional[int] = None) -> Dict[str, Any]:
+        """Genera estadísticas sobre fidelidad y actividad de clientes.
+
+        [EXAMEN-2] Si se indica `sucursal_id`, las compras se contabilizan solo
+        de esa sucursal (órdenes online y ventas presenciales)."""
         res_c = await db.execute(
             select(Cliente).options(
                 selectinload(Cliente.usuario),
@@ -595,11 +598,19 @@ class ReporteService:
         clientes_con_compras = 0
 
         for c in clientes:
-            ordenes_validas = [o for o in c.ordenes if o.estado != EstadoOrden.CANCELADO]
+            ordenes_validas = [
+                o for o in c.ordenes
+                if o.estado != EstadoOrden.CANCELADO
+                and (sucursal_id is None or o.sucursal_id == sucursal_id)
+            ]
             total_gastado = sum(float(o.total or 0) for o in ordenes_validas)
             pedidos_pos = 0
             for v in (c.ventas_presenciales or []):
-                if v.orden is not None and v.orden.estado != EstadoOrden.CANCELADO:
+                if (
+                    v.orden is not None
+                    and v.orden.estado != EstadoOrden.CANCELADO
+                    and (sucursal_id is None or v.orden.sucursal_id == sucursal_id)
+                ):
                     total_gastado += float(v.orden.total or 0)
                     pedidos_pos += 1
             total_pedidos = len(ordenes_validas) + pedidos_pos
@@ -758,6 +769,26 @@ class ReporteService:
 class KPIService:
     """Cálculo y gestión de métricas e indicadores de rendimiento gerenciales."""
 
+    # [EXAMEN-2] Catálogo de métricas vinculables a un KPI. Si un IndicadorKPI
+    # define `metrica`, su `valor_actual` se recalcula en tiempo real desde los
+    # datos del negocio en cada consulta al dashboard (el valor guardado en la
+    # tabla queda como respaldo/valor inicial).
+    METRICAS_KPI: Dict[str, str] = {
+        "ventas_mes": "Ventas del mes (Bs.)",
+        "ticket_promedio": "Ticket promedio (Bs.)",
+        "tasa_conversion_reservas": "Tasa de conversión de reservas (%)",
+        "stock_bajo_minimo": "Productos bajo stock mínimo (unidades: ítems)",
+        "clientes_activos": "Clientes activos (registrados)",
+    }
+
+    @staticmethod
+    def _validar_metrica(metrica: Optional[str]) -> None:
+        """Valida que la métrica vinculada exista en el catálogo (o sea manual)."""
+        if metrica and metrica not in KPIService.METRICAS_KPI:
+            raise BadRequestException(
+                f"Métrica '{metrica}' no admitida. Opciones: {', '.join(KPIService.METRICAS_KPI.keys())} o null (manual)."
+            )
+
     @staticmethod
     async def obtener_dashboard_resumen(db: AsyncSession) -> DashboardKPISummary:
         """Calcula el resumen general de KPIs para el panel administrativo."""
@@ -805,9 +836,27 @@ class KPIService:
 
         ticket_prom = round(total_ventas / max(1, total_pedidos), 2)
 
+        # Valores en vivo para KPIs vinculados a una métrica del negocio
+        valores_metrica = {
+            "ventas_mes": total_ventas,
+            "ticket_promedio": ticket_prom,
+            "tasa_conversion_reservas": tasa_conversion,
+            "stock_bajo_minimo": bajo_stock,
+            "clientes_activos": clientes_tot,
+        }
+
         # Cargar KPIs guardados
         res_kpis = await db.execute(select(IndicadorKPI).order_by(IndicadorKPI.id.asc()))
         kpis_db = res_kpis.scalars().all()
+
+        # [EXAMEN-2] KPIs con `metrica` vinculada: el valor_actual se obtiene
+        # en tiempo real de los cálculos recién realizados.
+        kpis_detallados: List[IndicadorKPIResponse] = []
+        for k in kpis_db:
+            resp = IndicadorKPIResponse.model_validate(k)
+            if k.metrica and k.metrica in valores_metrica:
+                resp.valor_actual = round(float(valores_metrica[k.metrica]), 2)
+            kpis_detallados.append(resp)
 
         return DashboardKPISummary(
             total_ventas_mes=total_ventas,
@@ -816,16 +865,19 @@ class KPIService:
             productos_bajo_stock=bajo_stock,
             clientes_activos=clientes_tot,
             ticket_promedio=ticket_prom,
-            kpis_detallados=[IndicadorKPIResponse.model_validate(k) for k in kpis_db]
+            kpis_detallados=kpis_detallados
         )
 
     @staticmethod
-    async def listar_kpis(db: AsyncSession) -> List[IndicadorKPI]:
-        res = await db.execute(select(IndicadorKPI).order_by(IndicadorKPI.id.asc()))
-        return res.scalars().all()
+    async def listar_kpis(db: AsyncSession) -> List[IndicadorKPIResponse]:
+        """Lista los KPIs configurados, con `valor_actual` recalculado en vivo
+        para los que están vinculados a una métrica del negocio."""
+        resumen = await KPIService.obtener_dashboard_resumen(db)
+        return resumen.kpis_detallados
 
     @staticmethod
     async def crear_kpi(db: AsyncSession, data: IndicadorKPICreate) -> IndicadorKPI:
+        KPIService._validar_metrica(data.metrica)
         datos_kpi = data.model_dump(exclude_unset=True)
         kpi = IndicadorKPI(**datos_kpi)
         db.add(kpi)
@@ -835,6 +887,7 @@ class KPIService:
 
     @staticmethod
     async def actualizar_kpi(db: AsyncSession, kpi_id: int, data: IndicadorKPIBase) -> IndicadorKPI:
+        KPIService._validar_metrica(data.metrica)
         res = await db.execute(select(IndicadorKPI).where(IndicadorKPI.id == kpi_id))
         kpi = res.scalar_one_or_none()
         if not kpi:

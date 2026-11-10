@@ -1,6 +1,6 @@
-﻿"""ex2_005 - tenant_id NOT NULL en tablas de negocio
+"""ex2_005 - tenant_id NOT NULL en tablas de negocio
 
-[EXAMEN-2] Fase 1 (plan, 9.1.4). DespuÃ©s del backfill, convierte `tenant_id`
+[EXAMEN-2] Fase 1 (plan, 9.1.4). Después del backfill, convierte `tenant_id`
 en obligatorio en las tablas de negocio. Las tablas de plataforma
 (`usuarios`, `roles`, `bitacora`, `reportes`, `indicadores_kpi`,
 `pasarelas_pago`) conservan la columna nullable.
@@ -78,4 +78,4 @@ def downgrade() -> None:
         op.execute(
             sa.text(f"ALTER TABLE {table} ALTER COLUMN tenant_id DROP NOT NULL")
         )
-
+

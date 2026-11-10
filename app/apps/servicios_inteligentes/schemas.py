@@ -50,6 +50,10 @@ class IndicadorKPIBase(BaseModel):
     unidad_medida: Optional[str] = None
     tendencia: Optional[str] = None
     periodo: Optional[str] = None
+    # [EXAMEN-2] Métrica vinculada en tiempo real (ver KPIService.METRICAS_KPI).
+    # Si se define, `valor_actual` se calcula automáticamente desde el dashboard
+    # y cualquier valor manual queda como referencia inicial.
+    metrica: Optional[str] = None
 
 
 class IndicadorKPICreate(IndicadorKPIBase):

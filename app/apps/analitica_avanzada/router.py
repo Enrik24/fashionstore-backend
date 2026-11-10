@@ -84,6 +84,8 @@ async def solicitar_reporte(
 ):
     tenant_id = _tenant_id(contexto)
     usuario = _usuario(contexto)
+    if not datos.texto and getattr(datos, "prompt", None):
+        datos.texto = datos.prompt  # compatibilidad con clientes que mandan { prompt }
     audio = _decodificar_audio(datos.audio_base64)
     return await ReporteGenerativoService.solicitar(
         db, tenant_id, getattr(usuario, "id", None), datos.texto, audio
@@ -99,6 +101,8 @@ async def interpretar_reporte(
     tenant_id = _tenant_id(contexto)
     usuario = _usuario(contexto)
     await ReporteGenerativoService.validar_plan_ia(db, tenant_id)
+    if not datos.texto and getattr(datos, "prompt", None):
+        datos.texto = datos.prompt  # compatibilidad con clientes que mandan { prompt }
     audio = _decodificar_audio(datos.audio_base64)
     return await ReporteGenerativoService.interpretar_solicitud(
         tenant_id, getattr(usuario, "id", None), datos.texto, audio
@@ -239,6 +243,27 @@ async def obtener_dashboard(
         sucursal_id=sucursal_id,
         periodo=periodo,
     )
+
+
+@router.get("/analitica/dashboard/ultimo-conocido")
+async def ultimo_conocido_dashboard(
+    sucursal_id: int | None = Query(None),
+    periodo: str | None = Query(None),
+    contexto=Depends(autenticacion_flexible),
+):
+    """Último dashboard conocido (flujo offline, CU12).
+
+    Sin datos en caché retorna 404 para que el cliente muestre el
+    mensaje de «sin datos conocidos» en vez de un contenido vacío.
+    """
+    from fastapi import HTTPException
+
+    datos = DashboardService.obtener_ultimo_conocido(
+        _tenant_id(contexto), sucursal_id=sucursal_id, periodo=periodo
+    )
+    if datos is None:
+        raise HTTPException(status_code=404, detail="Sin datos conocidos para este contexto")
+    return datos
 
 
 @router.get("/analitica/kpis")

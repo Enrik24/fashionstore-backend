@@ -91,7 +91,12 @@ PLANTILLAS: list[dict] = [
         "descripcion": "Productos con más unidades vendidas en el período.",
         "categoria": "PRODUCTOS",
         "palabras_clave": ["top", "producto", "productos", "más vendido", "mas vendido", "ranking"],
-        "parametros": [_p("fecha_inicio", "fecha"), _p("fecha_fin", "fecha"), _p("limite", "entero", por_defecto=10)],
+        "parametros": [
+            _p("fecha_inicio", "fecha"),
+            _p("fecha_fin", "fecha"),
+            _p("limite", "entero", por_defecto=10),
+            _p("sucursal_id", "entero"),  # opcional: "top 5 productos de Equipetrol"
+        ],
         "columnas": ["producto", "unidades", "total"],
         "visualizacion": "BARRAS",
         "sql": """
@@ -106,6 +111,7 @@ PLANTILLAS: list[dict] = [
               AND o.es_sintetico = false
               AND o.fecha >= :fecha_inicio
               AND o.fecha < :fecha_fin
+              AND (CAST(:sucursal_id AS integer) IS NULL OR o.sucursal_id = :sucursal_id)
             GROUP BY p.nombre
             ORDER BY unidades DESC
             LIMIT :limite
@@ -155,7 +161,7 @@ PLANTILLAS: list[dict] = [
             JOIN sucursales s ON s.id = i.sucursal_id
             WHERE i.tenant_id = :tenant_id
               AND (i.cantidad - i.cantidad_reservada) <= i.stock_minimo
-              AND (:sucursal_id IS NULL OR i.sucursal_id = :sucursal_id)
+              AND (CAST(:sucursal_id AS integer) IS NULL OR i.sucursal_id = :sucursal_id)
             ORDER BY disponible ASC
         """,
     },
@@ -179,7 +185,7 @@ PLANTILLAS: list[dict] = [
             LEFT JOIN clientes cl ON cl.id = r.cliente_id
             WHERE r.tenant_id = :tenant_id
               AND r.estado IN ('PENDIENTE', 'PREPARADA', 'EN_PRUEBA')
-              AND (:sucursal_id IS NULL OR r.sucursal_id = :sucursal_id)
+              AND (CAST(:sucursal_id AS integer) IS NULL OR r.sucursal_id = :sucursal_id)
             ORDER BY r.fecha_reserva ASC
         """,
     },

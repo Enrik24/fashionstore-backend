@@ -98,6 +98,23 @@ class DashboardService:
         return round(((actual - anterior) / anterior) * 100, 2)
 
     @classmethod
+    def inicio_periodo(cls, periodo: str | None = None) -> date:
+        """Inicio del período consultado (CU12, paso 3).
+
+        DIA = hoy, SEMANA = últimos 7 días, MES = día 1 del mes,
+        ANIO = 1 de enero. Sin período o valor desconocido, MES.
+        """
+        hoy = date.today()
+        p = (periodo or "MES").upper()
+        if p == "DIA":
+            return hoy
+        if p == "SEMANA":
+            return hoy - timedelta(days=6)
+        if p == "ANIO":
+            return hoy.replace(month=1, day=1)
+        return hoy.replace(day=1)
+
+    @classmethod
     async def _ventas_rango(
         cls, db: AsyncSession, tenant_id: int, desde: date, hasta: date, sucursal_id: int | None
     ) -> dict:
@@ -169,21 +186,24 @@ class DashboardService:
 
     @classmethod
     async def calcular_tasa_devoluciones(
-        cls, db: AsyncSession, tenant_id: int, periodo: str | None = None
+        cls, db: AsyncSession, tenant_id: int, periodo: str | None = None, sucursal_id: int | None = None
     ) -> dict:
         hoy = date.today()
-        inicio = hoy.replace(day=1) if (periodo or "MES").upper() == "MES" else hoy - timedelta(days=30)
+        inicio = cls.inicio_periodo(periodo)
+        condiciones = [
+            SolicitudDevolucion.tenant_id == tenant_id,
+            func.date(SolicitudDevolucion.fecha_solicitud) >= inicio,
+            SolicitudDevolucion.tipo.in_([
+                TipoSolicitudDevolucion.DEVOLUCION,
+                TipoSolicitudDevolucion.CAMBIO,
+            ]),
+        ]
+        if sucursal_id is not None:
+            condiciones.append(SolicitudDevolucion.sucursal_id == sucursal_id)
         devoluciones = await db.execute(
-            select(func.count(SolicitudDevolucion.id)).where(
-                SolicitudDevolucion.tenant_id == tenant_id,
-                func.date(SolicitudDevolucion.fecha_solicitud) >= inicio,
-                SolicitudDevolucion.tipo.in_([
-                    TipoSolicitudDevolucion.DEVOLUCION,
-                    TipoSolicitudDevolucion.CAMBIO,
-                ]),
-            )
+            select(func.count(SolicitudDevolucion.id)).where(*condiciones)
         )
-        ventas = await cls._ventas_rango(db, tenant_id, inicio, hoy, None)
+        ventas = await cls._ventas_rango(db, tenant_id, inicio, hoy, sucursal_id)
         total_dev = int(devoluciones.scalar() or 0)
         base = ventas["ordenes"] or 0
         return {
@@ -194,19 +214,22 @@ class DashboardService:
 
     @classmethod
     async def calcular_tasa_reposiciones(
-        cls, db: AsyncSession, tenant_id: int, periodo: str | None = None
+        cls, db: AsyncSession, tenant_id: int, periodo: str | None = None, sucursal_id: int | None = None
     ) -> dict:
         """[EXAMEN-2] Punto 4: reposiciones del período sobre las ventas."""
         hoy = date.today()
-        inicio = hoy.replace(day=1) if (periodo or "MES").upper() == "MES" else hoy - timedelta(days=30)
+        inicio = cls.inicio_periodo(periodo)
+        condiciones = [
+            SolicitudDevolucion.tenant_id == tenant_id,
+            SolicitudDevolucion.tipo == TipoSolicitudDevolucion.REPOSICION,
+            func.date(SolicitudDevolucion.fecha_solicitud) >= inicio,
+        ]
+        if sucursal_id is not None:
+            condiciones.append(SolicitudDevolucion.sucursal_id == sucursal_id)
         reposiciones = (await db.execute(
-            select(func.count(SolicitudDevolucion.id)).where(
-                SolicitudDevolucion.tenant_id == tenant_id,
-                SolicitudDevolucion.tipo == TipoSolicitudDevolucion.REPOSICION,
-                func.date(SolicitudDevolucion.fecha_solicitud) >= inicio,
-            )
+            select(func.count(SolicitudDevolucion.id)).where(*condiciones)
         )).scalar() or 0
-        ventas = await cls._ventas_rango(db, tenant_id, inicio, hoy, None)
+        ventas = await cls._ventas_rango(db, tenant_id, inicio, hoy, sucursal_id)
         base = ventas["ordenes"] or 0
         return {
             "reposiciones": int(reposiciones),
@@ -216,19 +239,29 @@ class DashboardService:
 
     @classmethod
     async def calcular_monto_compensaciones(
-        cls, db: AsyncSession, tenant_id: int, periodo: str | None = None
+        cls, db: AsyncSession, tenant_id: int, periodo: str | None = None, sucursal_id: int | None = None
     ) -> dict:
         """[EXAMEN-2] Punto 4: dinero compensado por ventas offline rechazadas."""
         hoy = date.today()
-        inicio = hoy.replace(day=1) if (periodo or "MES").upper() == "MES" else hoy - timedelta(days=30)
-        filas = (await db.execute(
+        inicio = cls.inicio_periodo(periodo)
+        condiciones = [
+            Compensacion.tenant_id == tenant_id,
+            func.date(Compensacion.fecha_creacion) >= inicio,
+        ]
+        consulta = (
             select(Compensacion.estado, func.count(Compensacion.id), func.sum(Compensacion.monto))
-            .where(
-                Compensacion.tenant_id == tenant_id,
-                func.date(Compensacion.fecha_creacion) >= inicio,
-            )
+            .where(*condiciones)
             .group_by(Compensacion.estado)
-        )).all()
+        )
+        if sucursal_id is not None:
+            # La compensación no guarda sucursal: se filtra por la orden asociada.
+            consulta = (
+                select(Compensacion.estado, func.count(Compensacion.id), func.sum(Compensacion.monto))
+                .outerjoin(Orden, Orden.id == Compensacion.orden_id)
+                .where(*condiciones, Orden.sucursal_id == sucursal_id)
+                .group_by(Compensacion.estado)
+            )
+        filas = (await db.execute(consulta)).all()
         por_estado = {
             (estado.value if hasattr(estado, "value") else str(estado)): {
                 "cantidad": int(total or 0),
@@ -250,9 +283,19 @@ class DashboardService:
 
     @classmethod
     async def calcular_prendas_repuestas(
-        cls, db: AsyncSession, tenant_id: int, limite: int = 5
+        cls, db: AsyncSession, tenant_id: int, limite: int = 5,
+        sucursal_id: int | None = None, periodo: str | None = None,
     ) -> list[dict]:
         """[EXAMEN-2] Punto 4: top de prendas repuestas (solo REPOSICION)."""
+        inicio = cls.inicio_periodo(periodo) if periodo else None
+        condiciones = [
+            DetalleSolicitudDevolucion.tenant_id == tenant_id,
+            SolicitudDevolucion.tipo == TipoSolicitudDevolucion.REPOSICION,
+        ]
+        if inicio is not None:
+            condiciones.append(func.date(SolicitudDevolucion.fecha_solicitud) >= inicio)
+        if sucursal_id is not None:
+            condiciones.append(SolicitudDevolucion.sucursal_id == sucursal_id)
         result = await db.execute(
             select(
                 Producto.nombre,
@@ -265,10 +308,7 @@ class DashboardService:
             .join(Producto, Producto.id == VarianteProducto.producto_id)
             .outerjoin(Talla, Talla.id == VarianteProducto.talla_id)
             .outerjoin(Color, Color.id == VarianteProducto.color_id)
-            .where(
-                DetalleSolicitudDevolucion.tenant_id == tenant_id,
-                SolicitudDevolucion.tipo == TipoSolicitudDevolucion.REPOSICION,
-            )
+            .where(*condiciones)
             .group_by(Producto.nombre, Talla.valor, Color.nombre)
             .order_by(func.sum(DetalleSolicitudDevolucion.cantidad).desc())
             .limit(min(int(limite), 20))
@@ -280,8 +320,15 @@ class DashboardService:
 
     @classmethod
     async def calcular_top_cambiadas(
-        cls, db: AsyncSession, tenant_id: int, limite: int = 5
+        cls, db: AsyncSession, tenant_id: int, limite: int = 5,
+        sucursal_id: int | None = None, periodo: str | None = None,
     ) -> list[dict]:
+        inicio = cls.inicio_periodo(periodo) if periodo else None
+        condiciones = [DetalleSolicitudDevolucion.tenant_id == tenant_id]
+        if inicio is not None:
+            condiciones.append(func.date(SolicitudDevolucion.fecha_solicitud) >= inicio)
+        if sucursal_id is not None:
+            condiciones.append(SolicitudDevolucion.sucursal_id == sucursal_id)
         result = await db.execute(
             select(
                 Producto.nombre,
@@ -294,7 +341,7 @@ class DashboardService:
             .join(Producto, Producto.id == VarianteProducto.producto_id)
             .outerjoin(Talla, Talla.id == VarianteProducto.talla_id)
             .outerjoin(Color, Color.id == VarianteProducto.color_id)
-            .where(DetalleSolicitudDevolucion.tenant_id == tenant_id)
+            .where(*condiciones)
             .group_by(Producto.nombre, Talla.valor, Color.nombre)
             .order_by(func.sum(DetalleSolicitudDevolucion.cantidad).desc())
             .limit(min(int(limite), 20))
@@ -306,16 +353,19 @@ class DashboardService:
 
     @classmethod
     async def calcular_ticket_promedio(
-        cls, db: AsyncSession, tenant_id: int, periodo: str | None = None
+        cls, db: AsyncSession, tenant_id: int, periodo: str | None = None, sucursal_id: int | None = None
     ) -> dict:
         hoy = date.today()
-        inicio = hoy.replace(day=1) if (periodo or "MES").upper() == "MES" else hoy - timedelta(days=30)
+        inicio = cls.inicio_periodo(periodo)
+        condiciones = [
+            Orden.tenant_id == tenant_id,
+            Orden.es_sintetico.is_(False),
+            func.date(Orden.fecha) >= inicio,
+        ]
+        if sucursal_id is not None:
+            condiciones.append(Orden.sucursal_id == sucursal_id)
         result = await db.execute(
-            select(func.coalesce(func.avg(Orden.total), 0)).where(
-                Orden.tenant_id == tenant_id,
-                Orden.es_sintetico.is_(False),
-                func.date(Orden.fecha) >= inicio,
-            )
+            select(func.coalesce(func.avg(Orden.total), 0)).where(*condiciones)
         )
         return {"ticket_promedio": round(_f(result.scalar()), 2)}
 
@@ -332,12 +382,12 @@ class DashboardService:
             "ventas_mes": await cls.calcular_ventas_mes(db, tenant_id, sucursal_id),
             "stock_critico": await cls.calcular_stock_critico(db, tenant_id, sucursal_id),
             "reservas_pendientes": await cls.calcular_reservas_pendientes(db, tenant_id, sucursal_id),
-            "tasa_devoluciones": await cls.calcular_tasa_devoluciones(db, tenant_id, periodo),
-            "tasa_reposiciones": await cls.calcular_tasa_reposiciones(db, tenant_id, periodo),
-            "prendas_repuestas": await cls.calcular_prendas_repuestas(db, tenant_id),
-            "monto_compensaciones": await cls.calcular_monto_compensaciones(db, tenant_id, periodo),
-            "top_cambiadas": await cls.calcular_top_cambiadas(db, tenant_id),
-            "ticket_promedio": await cls.calcular_ticket_promedio(db, tenant_id, periodo),
+            "tasa_devoluciones": await cls.calcular_tasa_devoluciones(db, tenant_id, periodo, sucursal_id),
+            "tasa_reposiciones": await cls.calcular_tasa_reposiciones(db, tenant_id, periodo, sucursal_id),
+            "prendas_repuestas": await cls.calcular_prendas_repuestas(db, tenant_id, 5, sucursal_id, periodo),
+            "monto_compensaciones": await cls.calcular_monto_compensaciones(db, tenant_id, periodo, sucursal_id),
+            "top_cambiadas": await cls.calcular_top_cambiadas(db, tenant_id, 5, sucursal_id, periodo),
+            "ticket_promedio": await cls.calcular_ticket_promedio(db, tenant_id, periodo, sucursal_id),
         }
 
     # ------------------------------------------------------------------
@@ -357,6 +407,14 @@ class DashboardService:
         return entrada["datos"]
 
     @classmethod
+    def obtener_cache_fecha(
+        cls, tenant_id: int, sucursal_id: int | None, periodo: str | None
+    ) -> datetime | None:
+        clave = (tenant_id, sucursal_id, periodo or "MES")
+        entrada = _CACHE.get(clave)
+        return entrada["guardado_en"] if entrada else None
+
+    @classmethod
     def guardar_cache(cls, clave: tuple, datos: dict) -> None:
         _CACHE[clave] = {"datos": datos, "guardado_en": datetime.utcnow()}
 
@@ -371,8 +429,29 @@ class DashboardService:
 
     @classmethod
     def obtener_ultimo_conocido(
-        cls, tenant_id: int, sucursal_id: int | None = None
+        cls, tenant_id: int, sucursal_id: int | None = None, periodo: str | None = None
     ) -> dict | None:
+        """Datos cacheados con su fecha de corte (flujo offline, CU12).
+
+        Expira solo por TTL de memoria: re-ejecutar esta llamada tras el
+        vencimiento retorna el último snapshot con ``desactualizado: True``
+        para el banner «Datos actualizados al [hora]».
+        """
+        for clave, entrada in _CACHE.items():
+            if clave[0] != tenant_id:
+                continue
+            if sucursal_id is not None and clave[1] != sucursal_id:
+                continue
+            if periodo is not None and clave[2] != (periodo or "MES").upper():
+                continue
+            # Sin periodo pedido, prioriza MES (contexto por defecto de la UI).
+            if periodo is None and clave[2] != "MES":
+                continue
+            datos = dict(entrada["datos"])
+            datos["fecha_corte"] = entrada["guardado_en"].isoformat()
+            datos["desactualizado"] = True
+            return datos
+        # Sin coincidencia de periodo: fallback a cualquier snapshot del tenant.
         for clave, entrada in _CACHE.items():
             if clave[0] == tenant_id and (sucursal_id is None or clave[1] == sucursal_id):
                 datos = dict(entrada["datos"])
@@ -424,13 +503,15 @@ class DashboardService:
             datos = {k: v for k, v in todos.items() if k in permitidos}
             cls.guardar_cache(clave, datos)
 
+        fecha_cache = cls.obtener_cache_fecha(*clave)
         return {
             "rol": rol,
             "sucursal_id": sucursal_id,
             "periodo": (periodo or "MES").upper(),
             "widgets": datos,
-            "fecha_corte": datetime.utcnow().isoformat(),
+            "fecha_corte": (fecha_cache or datetime.utcnow()).isoformat(),
             "cache": cacheado,
+            "actualizacion_automatica_segundos": settings.DASHBOARD_CACHE_TTL_SEG,
             "datos_suficientes": await cls.verificar_datos_suficientes(db, tenant_id),
         }
 
@@ -453,15 +534,15 @@ class DashboardService:
         if kpi in ("reservas_pendientes", "reservas"):
             return {"kpi": kpi, **await cls.calcular_reservas_pendientes(db, tenant_id, sucursal_id)}
         if kpi in ("tasa_devoluciones", "devoluciones"):
-            return {"kpi": kpi, **await cls.calcular_tasa_devoluciones(db, tenant_id, periodo)}
+            return {"kpi": kpi, **await cls.calcular_tasa_devoluciones(db, tenant_id, periodo, sucursal_id)}
         if kpi in ("tasa_reposiciones", "reposiciones"):
-            return {"kpi": kpi, **await cls.calcular_tasa_reposiciones(db, tenant_id, periodo)}
+            return {"kpi": kpi, **await cls.calcular_tasa_reposiciones(db, tenant_id, periodo, sucursal_id)}
         if kpi in ("prendas_repuestas", "repuestas"):
-            return {"kpi": kpi, "items": await cls.calcular_prendas_repuestas(db, tenant_id)}
+            return {"kpi": kpi, "items": await cls.calcular_prendas_repuestas(db, tenant_id, 5, sucursal_id, periodo)}
         if kpi in ("monto_compensaciones", "compensaciones"):
-            return {"kpi": kpi, **await cls.calcular_monto_compensaciones(db, tenant_id, periodo)}
+            return {"kpi": kpi, **await cls.calcular_monto_compensaciones(db, tenant_id, periodo, sucursal_id)}
         if kpi in ("top_cambiadas", "cambiadas"):
-            return {"kpi": kpi, "items": await cls.calcular_top_cambiadas(db, tenant_id)}
+            return {"kpi": kpi, "items": await cls.calcular_top_cambiadas(db, tenant_id, 5, sucursal_id, periodo)}
         if kpi in ("ticket_promedio", "ticket"):
-            return {"kpi": kpi, **await cls.calcular_ticket_promedio(db, tenant_id, periodo)}
+            return {"kpi": kpi, **await cls.calcular_ticket_promedio(db, tenant_id, periodo, sucursal_id)}
         return {"kpi": kpi, "detalle": [], "mensaje": "KPI no reconocido"}

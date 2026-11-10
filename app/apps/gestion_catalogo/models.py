@@ -308,7 +308,7 @@ class TipoTela(Base):
     nombre = Column(String(80), nullable=False)
     descripcion = Column(Text, nullable=True)
     cuidados_lavado = Column(String(200), nullable=True)
-    estado = Column(Enum(EstadoProducto), default=EstadoProducto.ACTIVO, nullable=False)
+    estado = Column(Enum(EstadoProducto, native_enum=False), default=EstadoProducto.ACTIVO, nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     deleted_at = Column(DateTime(timezone=True), nullable=True)
 

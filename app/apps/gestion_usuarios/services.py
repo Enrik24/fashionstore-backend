@@ -1300,6 +1300,25 @@ class DatosInicialesService:
                     plan.permite_restauracion = restauracion
             planes[nombre] = plan
 
+        # Limpieza del duplicado por encoding roto (ex2_004 "BÃ¡sico").
+        # La migración original guardó el nombre con doble encoding; al
+        # buscar "Básico" se creó otro plan. Se fusiona y elimina el roto.
+        roto = (await db.execute(
+            select(Plan).where(Plan.nombre == "BÃ¡sico")
+        )).scalar_one_or_none()
+        if roto is not None and "Básico" in planes and roto.id != planes["Básico"].id:
+            correcto = planes["Básico"]
+            suscs_rotas = (await db.execute(
+                select(Suscripcion).where(Suscripcion.plan_id == roto.id)
+            )).scalars().all()
+            for s in suscs_rotas:
+                s.plan_id = correcto.id
+            await db.delete(roto)
+            await db.flush()
+            for n, orden_esperado in (("Básico", 1), ("Profesional", 2), ("Empresarial", 3)):
+                if n in planes:
+                    planes[n].orden = orden_esperado
+
         # ------------------------------------------------------------
         # 5. Suscripción activa + pago demo + configuración offline
         # ------------------------------------------------------------

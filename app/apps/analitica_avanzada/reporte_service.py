@@ -62,6 +62,11 @@ class ReporteGenerativoService:
         texto = (interpretacion.get("texto_original") or "").lower()
         if any(frase in texto for frase in PERIODOS_AMBIGUOS):
             return "¿A qué período exacto te refieres? Indica fecha inicial y final."
+        # "esta sucursal" / "esta tienda" sin indicar cuál: preguntar en vez
+        # de ejecutar el reporte con un filtro inventado.
+        if re.search(r"\b(esta|la actual|la misma)\s+(sucursal|tienda)\b", texto):
+            return ("¿De qué sucursal? Indícala, por ejemplo: "
+                    "'de sucursal 3' o 'de Equipetrol'.")
         if not interpretacion.get("plantilla"):
             return "No pude identificar el reporte. ¿Quieres ventas, stock, reservas o devoluciones?"
         parametros = interpretacion.get("parametros") or {}
@@ -152,6 +157,42 @@ class ReporteGenerativoService:
             raise ValidationException("La solicitud debe incluir texto o audio")
 
         interpretacion = await cls._interpretar_con_groq(texto) or cls._interpretar_heuristico(texto)
+        texto_lower = texto.lower()
+        # [FIX] El LLM puede inventar filtros que el usuario no mencionó
+        # (ej. sucursal_id=1 en "stock crítico"): si el texto no menciona
+        # sucursal, se descarta el filtro.
+        if interpretacion.get("parametros") and "sucursal" not in texto_lower:
+            interpretacion["parametros"].pop("sucursal_id", None)
+        # [FIX] Alias libres del LLM -> parámetros canónicos de las plantillas
+        # (top/n→limite, sucursal/tienda→sucursal_id). Valores no numéricos
+        # para sucursal_id (placeholders tipo "<id>") se descartan.
+        params = interpretacion.get("parametros") or {}
+        for _alias_orig, _alias_dest in (("top", "limite"), ("n", "limite"),
+                                         ("sucursal", "sucursal_id"),
+                                         ("tienda", "sucursal_id")):
+            if _alias_orig in params:
+                if _alias_dest not in params:
+                    params[_alias_dest] = params.pop(_alias_orig)
+                else:
+                    params.pop(_alias_orig)
+        if "sucursal_id" in params:
+            valor_suc = params["sucursal_id"]
+            if isinstance(valor_suc, str) and valor_suc.strip().isdigit():
+                params["sucursal_id"] = int(valor_suc)
+            elif not isinstance(valor_suc, int):
+                params.pop("sucursal_id", None)
+        # "el producto más vendido" (singular) -> límite 1, no el top 10 por defecto.
+        if ("top" not in texto_lower and "los " not in texto_lower
+                and re.search(r"\b(el producto|la prenda|el servicio)\b", texto_lower)):
+            params["limite"] = 1
+        # [FIX] La heurística rellenaba el período por defecto, pero la ruta
+        # Groq no: sin fechas, todo dictado terminaba en AMBIGUA preguntando
+        # por el período aunque la validación ya tiene valores por defecto.
+        plantilla_ = PlantillaReporteService.mapear_plantilla(interpretacion)
+        if plantilla_ and any(p["tipo"] == "fecha" for p in plantilla_["parametros"]):
+            if not params.get("fecha_inicio") and not params.get("fecha_fin"):
+                params.update(cls._periodo_por_defecto())
+        interpretacion["parametros"] = params
         if not interpretacion.get("plantilla"):
             plantilla = PlantillaReporteService.mapear_plantilla(texto)
             if plantilla:
@@ -299,6 +340,33 @@ class ReporteGenerativoService:
     ) -> dict:
         await cls.validar_plan_ia(db, tenant_id)
         interpretacion = await cls.interpretar_solicitud(tenant_id, usuario_id, texto, audio)
+
+        # [FIX] Resolver nombres de sucursal mencionados en el texto
+        # ("el producto más vendido de Equipetrol") a sucursal_id, porque el
+        # LLM devuelve el nombre o placeholders en lugar del id.
+        import unicodedata
+        plantilla_nombre = PlantillaReporteService.mapear_plantilla(interpretacion)
+
+        def _sin_acentos(t: str) -> str:
+            return "".join(
+                c for c in unicodedata.normalize("NFKD", t or "") if not unicodedata.combining(c)
+            ).lower().strip()
+
+        if plantilla_nombre and any(
+                p.get("nombre") == "sucursal_id" for p in plantilla_nombre["parametros"]):
+            texto_norm = _sin_acentos(interpretacion.get("texto_original") or "")
+            # Solo resuelve nombres si aún no hay sucursal_id numérica.
+            if not interpretacion.get("parametros", {}).get("sucursal_id"):
+                from app.apps.gestion_catalogo.models import Sucursal
+                from sqlalchemy import select as _select
+                sucursales_tenant = (await db.execute(
+                    _select(Sucursal).where(Sucursal.tenant_id == tenant_id)
+                )).scalars().all()
+                for suc in sucursales_tenant:
+                    clave = _sin_acentos(suc.nombre or "").replace("sucursal", "").strip()
+                    if clave and clave in texto_norm:
+                        interpretacion.setdefault("parametros", {})["sucursal_id"] = suc.id
+                        break
 
         if interpretacion.get("requiere_aclaracion"):
             estado = (

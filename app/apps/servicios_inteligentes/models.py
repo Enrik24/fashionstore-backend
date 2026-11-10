@@ -80,6 +80,10 @@ class IndicadorKPI(Base):
     unidad_medida = Column(String(20), nullable=True, server_default="%")
     tendencia = Column(String(20), nullable=True)  # subir, bajar, estable
     periodo = Column(String(50), nullable=True)  # mensual, semanal, anual
+    # [EXAMEN-2] Métrica vinculada en tiempo real (NULL = el valor se ingresa manualmente).
+    # Valores permitidos: ventas_mes, tasa_conversion_reservas, ticket_promedio,
+    # stock_bajo_minimo, clientes_activos (ver KPIService.METRICAS_KPI).
+    metrica = Column(String(50), nullable=True)
     ultimo_actualizado = Column(DateTime(timezone=True), server_default=func.now())
     
     def __repr__(self):

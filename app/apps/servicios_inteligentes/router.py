@@ -22,7 +22,9 @@ from sqlalchemy import select
 from app.database import get_db
 from app.security import get_current_user, get_optional_current_user, require_role, get_client_ip
 from app.exceptions import NotFoundException, BadRequestException
-from app.apps.gestion_usuarios.models import Usuario, Cliente, Administrador
+from app.apps.gestion_usuarios.models import (
+    Usuario, Cliente, Administrador, EncargadoSucursal, Cajero, Rol, UsuarioRol
+)
 from app.apps.gestion_usuarios.services import BitacoraService
 
 from app.apps.servicios_inteligentes.models import (
@@ -48,6 +50,48 @@ router = APIRouter(prefix="/api/v1", tags=["Servicios Inteligentes y Reportes"])
 
 
 # ==============================================================================
+# [EXAMEN-2] ALCANCE DE REPORTES POR ROL (KPIs filtrados por sucursal)
+# ==============================================================================
+
+async def _sucursal_alcance(
+    db: AsyncSession, current_user: Usuario, sucursal_id: Optional[int]
+) -> Optional[int]:
+    """Resuelve el alcance de sucursal de un reporte/KPI según el rol.
+
+    - Administrador: ve todas las sucursales (respeta el `sucursal_id` pedido,
+      o ninguna = global).
+    - Encargado: queda SIEMPRE fijo en su sucursal asignada (EncargadoSucursal);
+      si intenta consultar otra se devuelve 403. Cajero se acepta como respaldo.
+    """
+    res_roles = await db.execute(
+        select(Rol.nombre)
+        .join(UsuarioRol, Rol.id == UsuarioRol.rol_id)
+        .where(UsuarioRol.usuario_id == current_user.id)
+    )
+    roles = {str(n).lower() for n in res_roles.scalars().all()}
+    if "administrador" in roles or "superadmin" in roles:
+        return sucursal_id
+
+    res_enc = await db.execute(
+        select(EncargadoSucursal.sucursal_id).where(EncargadoSucursal.usuario_id == current_user.id)
+    )
+    sucursal_asignada = res_enc.scalar_one_or_none()
+    if sucursal_asignada is None:
+        res_caj = await db.execute(
+            select(Cajero.sucursal_id).where(Cajero.usuario_id == current_user.id)
+        )
+        sucursal_asignada = res_caj.scalar_one_or_none()
+    if sucursal_asignada is None:
+        raise HTTPException(status_code=403, detail="El usuario no tiene una sucursal asignada")
+    if sucursal_id is not None and int(sucursal_id) != int(sucursal_asignada):
+        raise HTTPException(
+            status_code=403,
+            detail="Solo puede consultar reportes de su sucursal asignada"
+        )
+    return int(sucursal_asignada)
+
+
+# ==============================================================================
 # REPORTES (CU15)
 # ==============================================================================
 
@@ -58,10 +102,14 @@ async def get_reporte_ventas(
     sucursal_id: Optional[int] = Query(None),
     formato: FormatoReporte = Query(FormatoReporte.JSON),
     incluir_serie: bool = Query(False),
-    current_user: Usuario = Depends(require_role("Administrador")),
+    current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
     db: AsyncSession = Depends(get_db)
 ):
-    """Genera reporte analítico de ventas y recaudación por canal."""
+    """Genera reporte analítico de ventas y recaudación por canal.
+
+    [EXAMEN-2] Administrador: filtra por la sucursal que pida (o global).
+    Encargado: fijo a su sucursal asignada."""
+    sucursal_id = await _sucursal_alcance(db, current_user, sucursal_id)
     datos = await ReporteService.generar_reporte_ventas(db, fecha_inicio, fecha_fin, sucursal_id, incluir_serie)
     if formato == FormatoReporte.CSV:
         csv_data = await ReporteService.exportar_csv(datos)
@@ -79,10 +127,13 @@ async def get_reporte_inventario(
     sucursal_id: Optional[int] = Query(None),
     limite: int = Query(500, ge=1, le=2000),
     formato: FormatoReporte = Query(FormatoReporte.JSON),
-    current_user: Usuario = Depends(require_role("Administrador")),
+    current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
     db: AsyncSession = Depends(get_db)
 ):
-    """Genera reporte de inventario, stock por sucursal y alertas."""
+    """Genera reporte de inventario, stock por sucursal y alertas.
+
+    [EXAMEN-2] Encargado: fijo a su sucursal asignada."""
+    sucursal_id = await _sucursal_alcance(db, current_user, sucursal_id)
     datos = await ReporteService.generar_reporte_inventario(db, categoria_id, bajo_stock, sucursal_id, limite)
     if formato == FormatoReporte.CSV:
         csv_data = await ReporteService.exportar_csv(datos)
@@ -99,10 +150,13 @@ async def get_reporte_reservas(
     fecha_fin: Optional[datetime] = Query(None),
     sucursal_id: Optional[int] = Query(None),
     formato: FormatoReporte = Query(FormatoReporte.JSON),
-    current_user: Usuario = Depends(require_role("Administrador")),
+    current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
     db: AsyncSession = Depends(get_db)
 ):
-    """Genera reporte de efectividad y tasa de conversión de reservas."""
+    """Genera reporte de efectividad y tasa de conversión de reservas.
+
+    [EXAMEN-2] Encargado: fijo a su sucursal asignada."""
+    sucursal_id = await _sucursal_alcance(db, current_user, sucursal_id)
     datos = await ReporteService.generar_reporte_reservas(db, fecha_inicio, fecha_fin, sucursal_id)
     if formato == FormatoReporte.CSV:
         csv_data = await ReporteService.exportar_csv(datos)
@@ -115,12 +169,17 @@ async def get_reporte_reservas(
 
 @router.get("/reportes/clientes", name="reporte_clientes")
 async def get_reporte_clientes(
+    sucursal_id: Optional[int] = Query(None),
     formato: FormatoReporte = Query(FormatoReporte.JSON),
-    current_user: Usuario = Depends(require_role("Administrador")),
+    current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
     db: AsyncSession = Depends(get_db)
 ):
-    """Genera reporte de fidelidad y top clientes con mayor gasto."""
-    datos = await ReporteService.generar_reporte_clientes(db)
+    """Genera reporte de fidelidad y top clientes con mayor gasto.
+
+    [EXAMEN-2] Si se pasa sucursal_id contabiliza solo compras de esa
+    sucursal. Encargado: fijo a su sucursal asignada."""
+    sucursal_id = await _sucursal_alcance(db, current_user, sucursal_id)
+    datos = await ReporteService.generar_reporte_clientes(db, sucursal_id)
     if formato == FormatoReporte.CSV:
         csv_data = await ReporteService.exportar_csv(datos)
         return PlainTextResponse(content=csv_data, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=reporte_clientes.csv"})
@@ -136,10 +195,13 @@ async def get_reporte_financiero(
     fecha_fin: Optional[datetime] = Query(None),
     sucursal_id: Optional[int] = Query(None),
     formato: FormatoReporte = Query(FormatoReporte.JSON),
-    current_user: Usuario = Depends(require_role("Administrador")),
+    current_user: Usuario = Depends(require_role("Administrador", "Encargado")),
     db: AsyncSession = Depends(get_db)
 ):
-    """Genera reporte financiero con ingresos por pasarela y beneficios estimados."""
+    """Genera reporte financiero con ingresos por pasarela y beneficios estimados.
+
+    [EXAMEN-2] Encargado: fijo a su sucursal asignada."""
+    sucursal_id = await _sucursal_alcance(db, current_user, sucursal_id)
     datos = await ReporteService.generar_reporte_financiero(db, fecha_inicio, fecha_fin, sucursal_id)
     if formato == FormatoReporte.CSV:
         csv_data = await ReporteService.exportar_csv(datos)

@@ -2,14 +2,15 @@
 Script de Seeder para FashionStore Backend.
 Puebla la base de datos con los datos reales del negocio, de forma idempotente:
 - Permisos y Roles (Administrador, Encargado, Cajero, Cliente)
-- Ciudades y Sucursales con coordenadas
+- Ciudades y Sucursales con coordenadas (5 sucursales: Central, Equipetrol,
+  Ventura Mall, Calacoto y Cochabamba Plaza)
 - Proveedores, Temporadas (Primavera-Verano / Otoño-Invierno) y Colecciones
 - Categorías, Tallas, Colores
 - Productos con costo, género, imágenes Cloudinary y asociaciones a colecciones
 - Variantes (Talla x Color) e inventario por sucursal
   (el precio de cada variante se calcula automáticamente según la talla)
 - Promociones con alcances y Cupones
-- Usuarios por tipo (Admin, Encargado, Cajero, Clientes) + tablas heredadas
+- Usuarios por tipo (Admin, un Encargado y un Cajero por sucursal, 12 Clientes) + tablas heredadas
 
 IDEMPOTENTE: puede ejecutarse múltiples veces sin duplicar registros.
 Los usuarios existentes NO se modifican (solo se crean los faltantes).
@@ -19,7 +20,7 @@ Uso:
 """
 import asyncio
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Dict, List
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -173,10 +174,14 @@ async def seed_ciudades_y_sucursales(db: AsyncSession) -> Dict[str, Sucursal]:
             await db.flush()
         ciudades_map[nombre_c] = c_obj
 
-    # [EXAMEN-2] Fase 2.5 (D-5): la demo queda con 2 sucursales operativas.
+    # [EXAMEN-2] La demo opera con 5 sucursales (modo multi-sucursal con un
+    # Encargado por sucursal). Las 5 coinciden con los stocks del catálogo.
     sucursales_data = [
         ('Sucursal Central', 'Av. Monseñor Rivero #300, Santa Cruz', '33123456', '09:00 - 21:00', -17.7833, -63.1821, 'Santa Cruz de la Sierra', 'ACTIVO'),
         ('Sucursal Equipetrol', 'Av. San Martín y Calle 5 Este, Santa Cruz', '33987654', '10:00 - 22:00', -17.7654, -63.195, 'Santa Cruz de la Sierra', 'ACTIVO'),
+        ('Sucursal Ventura Mall', 'Ventura Mall, 2do Anillo, Equipetrol, Santa Cruz', '33456789', '10:00 - 22:00', -17.762, -63.2003, 'Santa Cruz de la Sierra', 'ACTIVO'),
+        ('Sucursal Calacoto', 'Av. Ballivián #456, Calacoto, La Paz', '22789012', '09:00 - 20:00', -16.5405, -68.0887, 'La Paz', 'ACTIVO'),
+        ('Sucursal Cochabamba Plaza', 'Av. América #789, Cochabamba', '44123456', '09:00 - 20:00', -17.3895, -66.1568, 'Cochabamba', 'ACTIVO'),
     ]
 
     sucursales_map = {}
@@ -2098,22 +2103,43 @@ async def seed_tipos_tela(db: AsyncSession, tenant_id: int) -> None:
 # =====================================================================
 
 async def seed_promociones(db: AsyncSession):
-    """Crea promociones con sus alcances (productos, categorías, sucursales)."""
+    """Crea promociones con sus alcances (productos, categorías, sucursales).
+
+    [EXAMEN-2] Fechas relativas a hoy (UTC): las campañas quedan siempre
+    vigentes -o correctamente finalizadas- sin importar cuándo se ejecute el
+    seed, evitando promociones "ACTIVA" pero con la ventana de fechas vencida.
+    """
     cats = {c.nombre: c.id for c in (await db.execute(select(Categoria))).scalars().all()}
     sucs = {s.nombre: s.id for s in (await db.execute(select(Sucursal))).scalars().all()}
     prods = {p.sku: p.id for p in (await db.execute(select(Producto))).scalars().all()}
+    hoy = datetime.now(timezone.utc)
     promociones_data = [
         {
+            # [EXAMEN-2] Campaña "finalizada" de referencia (hace ~2 semanas).
             "nombre": 'Dia del Estudiante',
             "descripcion": 'Descuento especial para jovenes estudiantes',
             "tipo": 'PORCENTAJE',
             "valor": Decimal("10.0"),
-            "fecha_inicio": datetime(2026, 9, 21, 0, 54),
-            "fecha_fin": datetime(2026, 9, 27, 0, 54),
+            "fecha_inicio": hoy - timedelta(days=21),
+            "fecha_fin": hoy - timedelta(days=14),
             "condiciones": 'Valido para compras online',
-            "estado": 'ACTIVA',
+            "estado": 'FINALIZADA',
             "categorias": ['Camisas', 'Pantalones', 'Poleras'],
             "sucursales": ['Sucursal Central'],
+            "productos": [],
+        },
+        {
+            # [EXAMEN-2] Campaña Black Friday vigente: banner en home/catálogo.
+            "nombre": 'Black Fashion November',
+            "descripcion": 'Black Friday: 15% de descuento en Poleras, Pantalones y Chaquetas',
+            "tipo": 'PORCENTAJE',
+            "valor": Decimal("15.0"),
+            "fecha_inicio": hoy,
+            "fecha_fin": hoy + timedelta(days=21),
+            "condiciones": "Vigente hasta fin de campaña. Descuento visible en catálogo para las categorías incluidas. No acumulable con otros cupones.",
+            "estado": 'ACTIVA',
+            "categorias": ['Poleras', 'Pantalones', 'Chaquetas'],
+            "sucursales": [],  # vacío = todas las sucursales
             "productos": [],
         },
     ]
@@ -2134,6 +2160,14 @@ async def seed_promociones(db: AsyncSession):
             db.add(promo)
             await db.flush()
             print(f"  [+] Promoción creada: {promo.nombre}")
+        else:
+            # Refrescar fechas/estado: una campaña previa no debe quedar
+            # "ACTIVA" con fechas vencidas tras re-ejecutar el seed.
+            promo.fecha_inicio = item["fecha_inicio"]
+            promo.fecha_fin = item["fecha_fin"]
+            promo.estado = EstadoPromocion[item["estado"]]
+            await db.flush()
+            print(f"  [=] Promoción actualizada: {promo.nombre} ({item['estado']})")
         for cn in item["categorias"]:
             if cn in cats:
                 rx = await db.execute(select(PromocionCategoria).where(
@@ -2201,8 +2235,84 @@ async def seed_cupones(db: AsyncSession):
 
 
 # =====================================================================
+# 6.1 KPIS DE EJEMPLO (solo crea faltantes, no modifica existentes)
+# =====================================================================
+
+async def seed_kpis(db: AsyncSession):
+    """Crea KPIs de ejemplo para el panel 'Objetivos Estratégicos & KPIs'.
+
+    Dos de ellos están vinculados a métricas en tiempo real (columna `metrica`):
+    su valor_actual se recalcula automáticamente en el dashboard.
+    Idempotente: si ya existen KPIs en el tenant, no crea nada.
+    """
+    from app.apps.servicios_inteligentes.models import IndicadorKPI
+
+    res = await db.execute(select(IndicadorKPI).limit(1))
+    if res.scalars().first() is not None:
+        print("  [i] KPIs ya configurados, se omiten.")
+        return
+
+    kpis_data = [
+        {
+            "nombre": "Ventas del Mes",
+            "descripcion": "Ingresos totales por pedidos de los últimos 30 días (calculado en tiempo real)",
+            "valor_objetivo": 1_500_000.0,
+            "unidad_medida": "Bs.",
+            "tendencia": "Positiva",
+            "periodo": "Mensual",
+            "metrica": "ventas_mes",
+        },
+        {
+            "nombre": "Conversión de Reservas",
+            "descripcion": "Porcentaje de reservas retiradas con éxito en tienda (calculado en tiempo real)",
+            "valor_objetivo": 30.0,
+            "unidad_medida": "%",
+            "tendencia": "Positiva",
+            "periodo": "Mensual",
+            "metrica": "tasa_conversion_reservas",
+        },
+        {
+            "nombre": "Rotación de Inventario",
+            "descripcion": "Veces que se renueva el stock promedio por año (meta manual a completar por merchandising)",
+            "valor_actual": 6.0,
+            "valor_objetivo": 12.0,
+            "unidad_medida": "veces/año",
+            "tendencia": "Positiva",
+            "periodo": "Anual",
+            "metrica": None,
+        },
+    ]
+    for item in kpis_data:
+        kpi = IndicadorKPI(
+            nombre=item["nombre"],
+            descripcion=item["descripcion"],
+            valor_actual=item.get("valor_actual", 0.0),
+            valor_objetivo=item["valor_objetivo"],
+            unidad_medida=item["unidad_medida"],
+            tendencia=item["tendencia"],
+            periodo=item["periodo"],
+            metrica=item["metrica"],
+        )
+        db.add(kpi)
+        await db.flush()
+        print(f"  [+] KPI creado: {kpi.nombre}")
+    print(f"  [+] KPIs verificados: {len(kpis_data)}")
+
+
+# =====================================================================
 # 7. USUARIOS POR ROL (solo crea faltantes, no modifica existentes)
 # =====================================================================
+
+# Un Encargado por cada sucursal del tenant (correo, nombre y teléfono por
+# sucursal). Todos comparten la contraseña "Encargado123!" del rol demo.
+# La clave es el nombre de la sucursal creado en seed_ciudades_y_sucursales.
+ENCARGADOS_POR_SUCURSAL = {
+    'Sucursal Central': ('Juan', 'Pérez', 'encargado@fashionstore.com', '70000002'),
+    'Sucursal Equipetrol': ('Lorena', 'Suárez', 'encargado.equipetrol@fashionstore.com', '70000012'),
+    'Sucursal Ventura Mall': ('Pedro', 'Castillo', 'encargado.ventura@fashionstore.com', '70000013'),
+    'Sucursal Calacoto': ('Verónica', 'Arana', 'encargado.calacoto@fashionstore.com', '70000014'),
+    'Sucursal Cochabamba Plaza': ('Diego', 'Terán', 'encargado.cochabamba@fashionstore.com', '70000015'),
+}
 
 async def _asegurar_usuario(
     db: AsyncSession,
@@ -2247,8 +2357,20 @@ async def _asegurar_usuario(
     return usuario, creado
 
 
-async def seed_usuarios(db: AsyncSession, roles: dict, sucursal: Sucursal):
-    """Crea usuarios faltantes (Admin, Encargado, Cajero, Clientes). Nunca modifica existentes."""
+# Un Cajero por cada sucursal del tenant (correo, nombre y teléfono por
+# sucursal). Todos comparten la contraseña "Cajero123!" del rol demo.
+# La clave es el nombre de la sucursal creado en seed_ciudades_y_sucursales.
+CAJEROS_POR_SUCURSAL = {
+    'Sucursal Central': ('María', 'López', 'cajero@fashionstore.com', '70000003'),
+    'Sucursal Equipetrol': ('Andrea', 'Ríos', 'cajero.equipetrol@fashionstore.com', '70000022'),
+    'Sucursal Ventura Mall': ('Samuel', 'Mendieta', 'cajero.ventura@fashionstore.com', '70000023'),
+    'Sucursal Calacoto': ('Paula', 'Danielsen', 'cajero.calacoto@fashionstore.com', '70000024'),
+    'Sucursal Cochabamba Plaza': ('Rodrigo', 'Salazar', 'cajero.cochabamba@fashionstore.com', '70000025'),
+}
+
+
+async def seed_usuarios(db: AsyncSession, roles: dict, sucursales: Dict[str, Sucursal]):
+    """Crea usuarios faltantes (Admin, Encargados, Cajeros, Clientes). Nunca modifica existentes."""
     admin_user, admin_creado = await _asegurar_usuario(
         db, nombre="Administrador", apellido="Sistema", correo="admin@fashionstore.com",
         telefono="70000001", contrasena_plana="Admin123!", rol_nombre="Administrador", roles_dict=roles)
@@ -2257,26 +2379,66 @@ async def seed_usuarios(db: AsyncSession, roles: dict, sucursal: Sucursal):
         db.add(Administrador(usuario_id=admin_user.id))
     print(f"  {'[+] Creado' if admin_creado else '[=] Existente'} Admin: {admin_user.correo} (Contraseña: Admin123!)")
 
-    encargado_user, enc_creado = await _asegurar_usuario(
-        db, nombre="Juan", apellido="Pérez", correo="encargado@fashionstore.com",
-        telefono="70000002", contrasena_plana="Encargado123!", rol_nombre="Encargado", roles_dict=roles)
-    res_enc = await db.execute(select(EncargadoSucursal).where(EncargadoSucursal.usuario_id == encargado_user.id))
-    if not res_enc.scalar_one_or_none():
-        db.add(EncargadoSucursal(usuario_id=encargado_user.id, sucursal_id=sucursal.id))
-    print(f"  {'[+] Creado' if enc_creado else '[=] Existente'} Encargado: {encargado_user.correo} (Contraseña: Encargado123!)")
+    # Un Encargado por sucursal: se crea el usuario faltante y se asegura la
+    # fila en encargados_sucursal (usuario + sucursal). Idempotente: si el
+    # usuario ya existe y ya tiene la asignación, no se duplica nada.
+    for nombre_sucursal, (nom, ape, corr, tel) in ENCARGADOS_POR_SUCURSAL.items():
+        sucursal = sucursales.get(nombre_sucursal)
+        if not sucursal:
+            print(f"  [!] Sucursal '{nombre_sucursal}' no existe en la BD; encargado omitido")
+            continue
+        enc_user, enc_creado = await _asegurar_usuario(
+            db, nombre=nom, apellido=ape, correo=corr, telefono=tel,
+            contrasena_plana="Encargado123!", rol_nombre="Encargado", roles_dict=roles)
+        res_enc = await db.execute(
+            select(EncargadoSucursal).where(
+                EncargadoSucursal.usuario_id == enc_user.id,
+                EncargadoSucursal.sucursal_id == sucursal.id,
+            )
+        )
+        if not res_enc.scalar_one_or_none():
+            db.add(EncargadoSucursal(usuario_id=enc_user.id, sucursal_id=sucursal.id))
+            print(f"  [+] Encargado asignado: {enc_user.correo} -> {sucursal.nombre} (Contraseña: Encargado123!)")
+        else:
+            print(f"  [=] Existente Encargado: {enc_user.correo} ya está en {nombre_sucursal}")
 
-    cajero_user, caj_creado = await _asegurar_usuario(
-        db, nombre="María", apellido="López", correo="cajero@fashionstore.com",
-        telefono="70000003", contrasena_plana="Cajero123!", rol_nombre="Cajero", roles_dict=roles)
-    res_caj = await db.execute(select(Cajero).where(Cajero.usuario_id == cajero_user.id))
-    if not res_caj.scalar_one_or_none():
-        db.add(Cajero(usuario_id=cajero_user.id, sucursal_id=sucursal.id))
-    print(f"  {'[+] Creado' if caj_creado else '[=] Existente'} Cajero: {cajero_user.correo} (Contraseña: Cajero123!)")
+    # Un Cajero por sucursal: misma lógica idempotente que los encargados.
+    # El usuario legacy (cajero@fashionstore.com) permanece en Sucursal Central.
+    for nombre_sucursal, (nom, ape, corr, tel) in CAJEROS_POR_SUCURSAL.items():
+        sucursal = sucursales.get(nombre_sucursal)
+        if not sucursal:
+            print(f"  [!] Sucursal '{nombre_sucursal}' no existe en la BD; cajero omitido")
+            continue
+        caj_user, caj_creado = await _asegurar_usuario(
+            db, nombre=nom, apellido=ape, correo=corr, telefono=tel,
+            contrasena_plana="Cajero123!", rol_nombre="Cajero", roles_dict=roles)
+        res_caj_suc = await db.execute(
+            select(Cajero).where(
+                Cajero.usuario_id == caj_user.id,
+                Cajero.sucursal_id == sucursal.id,
+            )
+        )
+        if not res_caj_suc.scalar_one_or_none():
+            db.add(Cajero(usuario_id=caj_user.id, sucursal_id=sucursal.id))
+            print(f"  [+] Cajero asignado: {caj_user.correo} -> {sucursal.nombre} (Contraseña: Cajero123!)")
+        else:
+            print(f"  [=] Existente Cajero: {caj_user.correo} ya está en {nombre_sucursal}")
 
     clientes_data = [
         ('Ana', 'Morales', 'ana.morales@fashionstore.com', '70000045', "Cliente123!", '8765432-1B', 'Calle Murillo #789, La Paz', None, None),
         ('Lucía', 'Fernández', 'lucia.fernandez@fashionstore.com', '70000056', "Cliente123!", '7654321-1C', 'Av. San Martín #1020, Cochabamba', None, None),
         ('Carlos', 'Gómez', 'carlos.gomez@fashionstore.com', '70000024', "Cliente123!", '9876543-1A', 'Av. Las Americas 456, Santa Cruz, Santa Cruz, Santa Cruz', date(2000, 9, 24), {'tallas_habituales': ['L', 'M'], 'estilos_preferidos': ['Urbano'], 'recibir_ofertas': True, 'notificaciones_whatsapp': True}),
+        # [EXAMEN-2] Clientes adicionales (12 en total): participan como compradores
+        # históricos del dataset de ventas presenciales (seed_ventas.py).
+        ('Rosa', 'Quiroga', 'rosa.quiroga@fashionstore.com', '70000061', "Cliente123!", '1234567-2A', 'Av. Monseñor Rivero #500, Santa Cruz', None, None),
+        ('Miguel', 'Torres', 'miguel.torres@fashionstore.com', '70000062', "Cliente123!", '2345678-2B', 'Av. San Martín #310, Equipetrol, Santa Cruz', None, None),
+        ('Valeria', 'Céspedes', 'valeria.cespedes@fashionstore.com', '70000063', "Cliente123!", '3456789-2C', 'Av. América #610, Cochabamba', None, None),
+        ('Fernando', 'Camacho', 'fernando.camacho@fashionstore.com', '70000064', "Cliente123!", '4567891-2D', 'Calle Oruro #456, La Paz', None, None),
+        ('Daniela', 'Suárez', 'daniela.suarez@fashionstore.com', '70000065', "Cliente123!", '5678901-2E', 'Av. 2do Anillo Ventura Mall #901, Santa Cruz', date(1998, 4, 12), {'tallas_habituales': ['S', 'M'], 'estilos_preferidos': ['Deportivo'], 'recibir_ofertas': True, 'notificaciones_whatsapp': False}),
+        ('Óscar', 'Mamani', 'oscar.mamani@fashionstore.com', '70000066', "Cliente123!", '6789012-2F', 'Av. Ballivián #780, Calacoto, La Paz', None, None),
+        ('Gabriela', 'Villarroel', 'gabriela.villarroel@fashionstore.com', '70000067', "Cliente123!", '7890123-2G', 'Av. Banzer 3er Anillo #112, Santa Cruz', None, None),
+        ('Héctor', 'Aguilar', 'hector.aguilar@fashionstore.com', '70000068', "Cliente123!", '8901234-2H', 'Av. Heroínas #850, Cochabamba', date(1995, 11, 2), {'tallas_habituales': ['L', 'XL'], 'estilos_preferidos': ['Workwear'], 'recibir_ofertas': False, 'notificaciones_whatsapp': True}),
+        ('Paola', 'Limachi', 'paola.limachi@fashionstore.com', '70000069', "Cliente123!", '9012345-2J', 'Av. Ayacucho #220, Cochabamba', None, None),
     ]
     
     for nom, ape, corr, tel, pwd, nit, dir_env, fec_nac, prefs in clientes_data:
@@ -2339,7 +2501,6 @@ async def run_seeders():
             
             print("\n3. Verificando Ciudades y Sucursales...")
             sucursales_map = await seed_ciudades_y_sucursales(session)
-            sucursal_central = sucursales_map["Sucursal Central"]
             
             print("\n4. Verificando Proveedores, Temporadas y Colecciones...")
             proveedores = await seed_proveedores(session)
@@ -2354,9 +2515,12 @@ async def run_seeders():
             print("\n6. Verificando Promociones y Cupones...")
             await seed_promociones(session)
             await seed_cupones(session)
-            
+
+            print("\n6.1 Verificando KPIs de ejemplo...")
+            await seed_kpis(session)
+
             print("\n7. Verificando usuarios por tipo...")
-            await seed_usuarios(session, roles, sucursal_central)
+            await seed_usuarios(session, roles, sucursales_map)
             
             await session.commit()
             print("\n" + "=" * 65)

@@ -1,11 +1,11 @@
-﻿"""ex2_004 - Backfill del tenant demo y datos SaaS iniciales
+"""ex2_004 - Backfill del tenant demo y datos SaaS iniciales
 
 [EXAMEN-2] Fase 1 (plan, 4.6 y 9.1.4). Crea de forma idempotente:
-planes BÃ¡sico/Profesional, tenant demo, super administrador, asignaciÃ³n masiva
-de `tenant_id` (incluidas tablas hijas), suscripciÃ³n activa, pago demo y
-configuraciÃ³n offline.
+planes Básico/Profesional, tenant demo, super administrador, asignación masiva
+de `tenant_id` (incluidas tablas hijas), suscripción activa, pago demo y
+configuración offline.
 
-El `downgrade` elimina solo los datos sembrados por esta migraciÃ³n.
+El `downgrade` elimina solo los datos sembrados por esta migración.
 
 Revision ID: ex2_004_backfill_tenant_demo
 Revises: ex2_003_tenant_id_y_campos_examen2
@@ -33,7 +33,7 @@ ADMIN_HASH = "$2b$12$lLkIVNeXJgvLOkE/IcizzuTFncQYafkx5vzJwVZ6JBuoKwc1vcFHK"
 SUPER_HASH = "$2b$12$eNYo7fhomF/BCNGsHu1Txu4Fjnm6BUVeR8JTWXYS2Fbnp3CZvbK3e"
 
 
-# Tablas raÃ­z: todo lo existente pertenece al tenant demo.
+# Tablas raíz: todo lo existente pertenece al tenant demo.
 ROOT_TABLES = [
     "sucursales", "categorias", "tallas", "colores", "temporadas",
     "colecciones", "proveedores", "productos", "variantes_producto",
@@ -86,9 +86,9 @@ def upgrade() -> None:
                 (nombre, descripcion, precio_mensual, max_sucursales,
                  permite_reportes_ia, permite_pago_diferido, estado, orden,
                  soporte_prioritario)
-            SELECT 'BÃ¡sico', 'Plan inicial para una o dos sucursales',
+            SELECT 'Básico', 'Plan inicial para una o dos sucursales',
                    299.00, 2, false, true, 'ACTIVO'::estado_plan, 0, false
-            WHERE NOT EXISTS (SELECT 1 FROM planes WHERE nombre = 'BÃ¡sico')
+            WHERE NOT EXISTS (SELECT 1 FROM planes WHERE nombre = 'Básico')
             """
         )
     )
@@ -291,7 +291,7 @@ def upgrade() -> None:
         ).bindparams(**params)
     )
 
-    # 9. Backfill de raÃ­ces y tablas hijas
+    # 9. Backfill de raíces y tablas hijas
     for table in ROOT_TABLES:
         op.execute(
             sa.text(
@@ -348,7 +348,7 @@ def upgrade() -> None:
             ).bindparams(**params)
         )
 
-    # BitÃ¡cora: las acciones de plataforma (usuario NULL) conservan NULL
+    # Bitácora: las acciones de plataforma (usuario NULL) conservan NULL
     op.execute(
         sa.text(
             f"""
@@ -360,7 +360,7 @@ def upgrade() -> None:
         )
     )
 
-    # 10. SuscripciÃ³n activa al plan Profesional
+    # 10. Suscripción activa al plan Profesional
     op.execute(
         sa.text(
             f"""
@@ -381,7 +381,7 @@ def upgrade() -> None:
         ).bindparams(**params)
     )
 
-    # 11. Pago de demostraciÃ³n (idempotente por idempotency_key)
+    # 11. Pago de demostración (idempotente por idempotency_key)
     op.execute(
         sa.text(
             f"""
@@ -402,7 +402,7 @@ def upgrade() -> None:
         ).bindparams(**params)
     )
 
-    # 12. ConfiguraciÃ³n offline del tenant demo
+    # 12. Configuración offline del tenant demo
     op.execute(
         sa.text(
             f"""
@@ -482,7 +482,7 @@ def downgrade() -> None:
         sa.text(
             """
             DELETE FROM planes p
-            WHERE p.nombre IN ('BÃ¡sico', 'Profesional')
+            WHERE p.nombre IN ('Básico', 'Profesional')
               AND NOT EXISTS (
                   SELECT 1 FROM suscripciones s WHERE s.plan_id = p.id
               )
@@ -490,4 +490,4 @@ def downgrade() -> None:
         )
     )
     op.execute(sa.text("DROP TABLE IF EXISTS configuracion_offline"))
-
+

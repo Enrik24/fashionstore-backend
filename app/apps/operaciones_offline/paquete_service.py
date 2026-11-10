@@ -56,6 +56,26 @@ def _jsonable(valor: Any) -> Any:
     return valor
 
 
+def _normalizar_imagenes(valor: Any) -> list[str]:
+    """La columna JSON a veces guarda un string serializado '["url"]'."""
+    if not valor:
+        return []
+    if isinstance(valor, list):
+        return [str(x) for x in valor if x]
+    if isinstance(valor, str):
+        s = valor.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed if x]
+            return [s]
+        except (ValueError, TypeError):
+            return [s]
+    return []
+
+
 class PaqueteOfflineService:
 
     # ------------------------------------------------------------------
@@ -144,7 +164,7 @@ class PaqueteOfflineService:
                 "nombre": p.nombre,
                 "descripcion": p.descripcion,
                 "precio": p.precio,
-                "imagenes": p.imagenes or [],
+                "imagenes": _normalizar_imagenes(p.imagenes),
                 "estado": getattr(p.estado, "value", p.estado),
                 "genero": getattr(p.genero, "value", p.genero),
                 "categoria_id": p.categoria_id,

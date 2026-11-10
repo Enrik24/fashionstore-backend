@@ -1,4 +1,4 @@
-﻿"""ex2_007 - Permisos de plataforma y rol Super Administrador
+"""ex2_007 - Permisos de plataforma y rol Super Administrador
 
 [EXAMEN-2] Fase 1 (plan, 9.1.9). Crea los permisos nuevos, el rol de
 plataforma y sus asociaciones. Es idempotente por nombre.
@@ -25,7 +25,7 @@ NUEVOS_PERMISOS = [
     ("gestionar_suscripciones", "Permiso para gestionar suscripciones"),
     ("configurar_tenant", "Permiso para configurar el entorno del tenant"),
     ("sincronizar_offline", "Permiso para sincronizar operaciones offline"),
-    ("resolver_conflictos", "Permiso para resolver conflictos de sincronizaciÃ³n"),
+    ("resolver_conflictos", "Permiso para resolver conflictos de sincronización"),
     ("gestionar_traspasos", "Permiso para gestionar traspasos"),
     ("usar_reportes_ia", "Permiso para usar reportes con IA"),
     ("entrenar_modelos", "Permiso para entrenar modelos de ML"),
@@ -91,7 +91,7 @@ def upgrade() -> None:
 
     todos = "'" + "', '".join(nombre for nombre, _ in NUEVOS_PERMISOS) + "'"
     _asociar("Super Administrador", todos)
-    # El superadministrador tambiÃ©n conserva los permisos base del Examen 1
+    # El superadministrador también conserva los permisos base del Examen 1
     op.execute(
         sa.text(
             """
@@ -133,4 +133,4 @@ def downgrade() -> None:
         )
     )
     op.execute(sa.text(f"DELETE FROM permisos WHERE nombre IN ({nombres})"))
-
+

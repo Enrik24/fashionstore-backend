@@ -10,6 +10,7 @@ import pytest
 from httpx import AsyncClient
 
 from app.apps.analitica_avanzada.dashboard_service import DashboardService, limpiar_cache
+from app.apps.analitica_avanzada.ml_service import MLService
 from tests._fase3_helpers import crear_sucursal, crear_venta, sembrar_sinteticos
 
 
@@ -245,3 +246,120 @@ async def test_modelos_aislados_por_tenant(
     )
     assert listado_b.status_code == 200
     assert listado_b.json()["modelos"] == []
+
+
+# ----------------------------------------------------------------------
+# CU12 — brechas cerradas: período, accuracy, último conocido
+# ----------------------------------------------------------------------
+
+def test_inicio_periodo_dia_semana_mes_anio():
+    from datetime import date, timedelta
+
+    hoy = date.today()
+    assert DashboardService.inicio_periodo("DIA") == hoy
+    assert DashboardService.inicio_periodo("SEMANA") == hoy - timedelta(days=6)
+    assert DashboardService.inicio_periodo("MES") == hoy.replace(day=1)
+    assert DashboardService.inicio_periodo("ANIO") == hoy.replace(month=1, day=1)
+    assert DashboardService.inicio_periodo(None) == hoy.replace(day=1)
+    assert DashboardService.inicio_periodo("DESCONOCIDO") == hoy.replace(day=1)
+
+
+def test_metricas_supervisado_incluye_accuracy_mape():
+    metricas = MLService.calcular_metricas(
+        "VENTAS", [100, 200, 300], [110, 190, 310]
+    )
+    assert {"rmse", "mae", "r2", "accuracy", "mape", "filas_prueba"} <= set(metricas)
+    assert 0.0 <= metricas["accuracy"] <= 1.0
+    assert metricas["mape"] >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_dashboard_periodos_ultimo_conocido_y_drilldown_sucursal(
+    client: AsyncClient, db_session, tenant_nuevo, plan_profesional,
+    catalogo_tenant, cliente_tenant,
+):
+    tenant = await tenant_nuevo(plan_id=plan_profesional.id)
+    catalogo = await catalogo_tenant(tenant, precio="75.00", stock=10)
+    cliente = await cliente_tenant(tenant)
+    await crear_venta(db_session, tenant, catalogo, cliente["id"], cantidad=2)
+
+    for periodo in ("DIA", "SEMANA", "MES", "ANIO"):
+        resp = await client.get(
+            f"/api/v1/analitica/dashboard?periodo={periodo}",
+            headers=tenant["headers"],
+        )
+        assert resp.status_code == 200, (periodo, resp.text)
+        cuerpo = resp.json()
+        assert cuerpo["periodo"] == periodo
+        assert cuerpo["actualizacion_automatica_segundos"] == 300
+        assert cuerpo["fecha_corte"]
+
+    # Flujo offline: último conocido tras haber consultado el dashboard.
+    ultimo = await client.get(
+        "/api/v1/analitica/dashboard/ultimo-conocido?periodo=MES",
+        headers=tenant["headers"],
+    )
+    assert ultimo.status_code == 200, ultimo.text
+    assert ultimo.json()["desactualizado"] is True
+    assert ultimo.json()["fecha_corte"]
+
+    # Drill-down con sucursal respeta el contexto de análisis (CU12 paso 6).
+    detalle = await client.get(
+        f"/api/v1/analitica/kpis/tasa_devoluciones/detalle?sucursal_id={catalogo['sucursal_id']}&periodo=MES",
+        headers=tenant["headers"],
+    )
+    assert detalle.status_code == 200, detalle.text
+    assert detalle.json()["kpi"] == "tasa_devoluciones"
+
+    detalle_repuestas = await client.get(
+        f"/api/v1/analitica/kpis/prendas_repuestas/detalle?sucursal_id={catalogo['sucursal_id']}&periodo=MES",
+        headers=tenant["headers"],
+    )
+    assert detalle_repuestas.status_code == 200, detalle_repuestas.text
+    assert detalle_repuestas.json()["kpi"] == "prendas_repuestas"
+
+
+@pytest.mark.asyncio
+async def test_ml_entrenar_incluye_accuracy(
+    client: AsyncClient, db_session, tenant_nuevo, plan_profesional, catalogo_tenant,
+):
+    tenant = await tenant_nuevo(plan_id=plan_profesional.id)
+    await catalogo_tenant(tenant, precio="100.00", stock=1000)
+    await sembrar_sinteticos(
+        db_session, tenant, cantidad_clientes=15, cantidad_ventas=180,
+        dias=180, semilla=77,
+    )
+    respuesta = await client.post(
+        "/api/v1/analitica/ml/entrenar",
+        json={"objetivo": "VENTAS", "hiperparametros": {"n_estimators": 30}},
+        headers=tenant["headers"],
+    )
+    assert respuesta.status_code == 200, respuesta.text
+    metricas = respuesta.json()["metricas"]
+    assert "accuracy" in metricas
+    assert "mape" in metricas
+    assert 0.0 <= metricas["accuracy"] <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_ml_entrenar_con_pocas_reales_y_sinteticos_suficientes(
+    client: AsyncClient, db_session, tenant_nuevo, plan_profesional,
+    catalogo_tenant, cliente_tenant,
+):
+    """Regresión: 1 venta real + sintéticos → entrena con sintéticos (200)."""
+    tenant = await tenant_nuevo(plan_id=plan_profesional.id)
+    catalogo = await catalogo_tenant(tenant, precio="100.00", stock=1000)
+    cliente = await cliente_tenant(tenant)
+    await crear_venta(db_session, tenant, catalogo, cliente["id"], cantidad=1)
+    await sembrar_sinteticos(
+        db_session, tenant, cantidad_clientes=15, cantidad_ventas=180,
+        dias=180, semilla=77,
+    )
+    respuesta = await client.post(
+        "/api/v1/analitica/ml/entrenar",
+        json={"objetivo": "VENTAS", "hiperparametros": {"n_estimators": 30}},
+        headers=tenant["headers"],
+    )
+    assert respuesta.status_code == 200, respuesta.text
+    assert "accuracy" in respuesta.json()["metricas"]
+    assert respuesta.json()["metricas"]["filas_totales"] >= 14

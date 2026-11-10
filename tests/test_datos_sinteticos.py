@@ -176,13 +176,17 @@ async def test_ml_usa_sinteticos_solo_si_no_hay_reales(
         db_session, tenant, catalogo, cliente["id"], cantidad=1, precio="100.00"
     )
 
-    # Con una venta real, el entrenamiento deja de mirar los sintéticos: nunca
-    # se mezclan ambos orígenes.
-    assert await MLService._origen_datos(db_session, tenant_id) is False
-    dataset_real = await MLService.preparar_dataset_ventas(db_session, tenant_id)
-    assert len(dataset_real) == 1
-    assert int(dataset_real.iloc[0]["ordenes"]) == 1
-    assert float(dataset_real.iloc[0]["total"]) == pytest.approx(100.0)
+    # Con una sola venta real las reales siguen siendo insuficientes
+    # (<3 meses / <30 ventas / <14 días): el origen sigue siendo sintético.
+    # La versión anterior retornaba False aquí y el entrenamiento quedaba
+    # con 1 día de datos reales → "se requieren al menos 14 días".
+    # Nunca se mezclan ambos orígenes.
+    assert await MLService._origen_datos(db_session, tenant_id) is True
+    dataset_sintetico_tras_real = await MLService.preparar_dataset_ventas(
+        db_session, tenant_id
+    )
+    assert len(dataset_sintetico_tras_real) >= 14
+    assert int(dataset_sintetico_tras_real.iloc[0]["ordenes"]) >= 1
 
 
 @pytest.mark.asyncio
@@ -301,3 +305,81 @@ async def test_datasets_aislados_por_tenant(
     )).scalar_one()
     assert restantes_b == sembrado_b["siembra"]["ordenes"]
     assert restantes_b > 0
+
+
+@pytest.mark.asyncio
+async def test_sembrar_dos_datasets_misma_semilla_y_resembrar_idempotente(
+    client: AsyncClient,
+    db_session, tenant_nuevo, plan_profesional, catalogo_tenant,
+):
+    """Regresión 500: dos datasets con la misma semilla (UI usa 2026)."""
+    tenant = await tenant_nuevo(plan_id=plan_profesional.id)
+    tenant_id = int(tenant["id"])
+    await catalogo_tenant(tenant, precio="100.00", stock=1000)
+
+    for _ in range(2):
+        generado = await DatosSinteticosService.generar_dataset(
+            db_session, tenant_id,
+            {"cantidad_clientes": 10, "cantidad_ventas": 60, "dias": 120, "semilla": 2026},
+        )
+        respuesta = await client.post(
+            "/api/v1/analitica/datos-sinteticos/sembrar",
+            headers=tenant["headers"],
+            json={"dataset_id": generado["dataset_id"]},
+        )
+        assert respuesta.status_code == 200, respuesta.text
+        assert respuesta.json()["sembrado"] is True
+
+    # Re-sembrar el mismo dataset no duplica ni responde 500.
+    ultimo = await client.get(
+        "/api/v1/analitica/datos-sinteticos", headers=tenant["headers"]
+    )
+    assert ultimo.status_code == 200
+    dataset_id = ultimo.json()["datasets"][-1]["dataset_id"]
+    antes = (await db_session.execute(
+        select(func.count(Orden.id)).where(
+            Orden.tenant_id == tenant_id, Orden.es_sintetico.is_(True)
+        )
+    )).scalar_one()
+    repetido = await client.post(
+        "/api/v1/analitica/datos-sinteticos/sembrar",
+        headers=tenant["headers"],
+        json={"dataset_id": dataset_id},
+    )
+    assert repetido.status_code == 200, repetido.text
+    despues = (await db_session.execute(
+        select(func.count(Orden.id)).where(
+            Orden.tenant_id == tenant_id, Orden.es_sintetico.is_(True)
+        )
+    )).scalar_one()
+    assert despues == antes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dataset_id", ["undefined", "null", "", "  "])
+async def test_sembrar_tolera_dataset_id_indefinido_fallback(
+    client: AsyncClient,
+    db_session,
+    tenant_nuevo,
+    plan_profesional,
+    catalogo_tenant,
+    dataset_id,
+):
+    """Regresión: frontend viejo mandaba String(undefined) → 404. Se usa el último pendiente."""
+    tenant = await tenant_nuevo(plan_id=plan_profesional.id)
+    await catalogo_tenant(tenant, stock=1000)
+
+    generado = await DatosSinteticosService.generar_dataset(
+        db_session,
+        int(tenant["id"]),
+        {"cantidad_clientes": 10, "cantidad_ventas": 60, "dias": 90, "semilla": 99},
+    )
+    assert generado["dataset_id"]
+
+    respuesta = await client.post(
+        "/api/v1/analitica/datos-sinteticos/sembrar",
+        headers=tenant["headers"],
+        json={"dataset_id": dataset_id},
+    )
+    assert respuesta.status_code == 200, respuesta.text
+    assert respuesta.json()["sembrado"] is True

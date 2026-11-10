@@ -1,9 +1,9 @@
-﻿"""ex2_006 - Unicidad compuesta por tenant
+"""ex2_006 - Unicidad compuesta por tenant
 
-[EXAMEN-2] Fase 1 (plan, 3.6 y 9.1.4). Elimina los Ãºnicos simples del Examen 1
-y crea los compuestos `(tenant_id, ...)`, ademÃ¡s de los UUID de idempotencia.
+[EXAMEN-2] Fase 1 (plan, 3.6 y 9.1.4). Elimina los únicos simples del Examen 1
+y crea los compuestos `(tenant_id, ...)`, además de los UUID de idempotencia.
 
-Se usan guardas porque los nombres de constraints/Ã­ndices pueden variar entre
+Se usan guardas porque los nombres de constraints/índices pueden variar entre
 bases creadas por migraciones y por `create_all`.
 
 Revision ID: ex2_006_unicidad_compuesta
@@ -57,7 +57,7 @@ def _unique(table: str, name: str, columns: str) -> None:
 
 
 def upgrade() -> None:
-    # --- Eliminar Ãºnicos simples ---
+    # --- Eliminar únicos simples ---
     _drop_constraint("clientes", "clientes_nit_ci_key")
     _drop_constraint("clientes", "clientes_usuario_id_key")
     _drop_constraint("categorias", "categorias_nombre_key")
@@ -77,7 +77,7 @@ def upgrade() -> None:
     ):
         _drop_index(index_name)
 
-    # Recrear como Ã­ndices no Ãºnicos (el modelo los declara index=True)
+    # Recrear como índices no únicos (el modelo los declara index=True)
     _index("productos", "ix_productos_sku", "sku", unique=False)
     _index("cupones", "ix_cupones_codigo", "codigo", unique=False)
     _index("ordenes", "ix_ordenes_numero_orden", "numero_orden", unique=False)
@@ -89,7 +89,7 @@ def upgrade() -> None:
         unique=False,
     )
 
-    # --- Ãšnicos compuestos del capÃ­tulo 3.6 ---
+    # --- Únicos compuestos del capítulo 3.6 ---
     _unique("clientes", "uq_clientes_tenant_nit_ci", "tenant_id, nit_ci")
     _unique("clientes", "uq_clientes_usuario_tenant", "usuario_id, tenant_id")
     _unique("categorias", "uq_categorias_tenant_nombre", "tenant_id, nombre")
@@ -175,7 +175,7 @@ def downgrade() -> None:
 
     _drop_index("uq_carritos_activo_dispositivo_cliente")
 
-    # Restaurar Ãºnicos simples del Examen 1
+    # Restaurar únicos simples del Examen 1
     _unique("clientes", "clientes_nit_ci_key", "nit_ci")
     _unique("clientes", "clientes_usuario_id_key", "usuario_id")
     _unique("categorias", "categorias_nombre_key", "nombre")
@@ -210,4 +210,4 @@ def downgrade() -> None:
         "numero_solicitud",
         unique=True,
     )
-
+

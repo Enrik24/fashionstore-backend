@@ -164,6 +164,7 @@ class BackupResponse(BaseModel):
     fecha_fin: Optional[datetime] = None
     tamano_bytes: Optional[int] = None
     hash_sha256: Optional[str] = None
+    nombre_archivo: Optional[str] = None
     retencion_hasta: Optional[datetime] = None
     creado_por: Optional[int] = None
     error_detalle: Optional[str] = None

@@ -1,7 +1,7 @@
-﻿"""ex2_001 - Crear tenants, planes, suscripciones y sus enums
+"""ex2_001 - Crear tenants, planes, suscripciones y sus enums
 
-[EXAMEN-2] Fase 1 (plan, 9.1.4). Crea las tablas raÃ­z del SaaS multitenant.
-La migraciÃ³n es idempotente: si la tabla o el tipo ya existen, no falla.
+[EXAMEN-2] Fase 1 (plan, 9.1.4). Crea las tablas raíz del SaaS multitenant.
+La migración es idempotente: si la tabla o el tipo ya existen, no falla.
 
 Revision ID: ex2_001_crear_tenant_plan_suscripcion
 Revises: k17_fcm_token_unique
@@ -126,7 +126,7 @@ def upgrade() -> None:
         op.create_index(op.f("ix_suscripciones_plan_id"), "suscripciones", ["plan_id"], unique=False)
         op.create_index("ix_suscripciones_tenant_estado", "suscripciones", ["tenant_id", "estado"], unique=False)
 
-    # Una sola suscripciÃ³n ACTIVA por tenant (plan, 3.6)
+    # Una sola suscripción ACTIVA por tenant (plan, 3.6)
     op.execute(
         sa.text(
             """
@@ -152,4 +152,4 @@ def downgrade() -> None:
 
     for name in ("estado_suscripcion", "estado_tenant", "estado_plan"):
         op.execute(sa.text(f"DROP TYPE IF EXISTS {name}"))
-
+

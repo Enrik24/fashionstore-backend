@@ -72,11 +72,15 @@ class PlantillaReporteService:
                 valor = cls._a_fecha(valor, nombre)
             elif tipo == "entero":
                 if valor in (None, ""):
-                    valor = definicion.get("por_defecto") or 1
-                try:
-                    valor = int(valor)
-                except (TypeError, ValueError):
-                    raise ValidationException(f"El parámetro {nombre} debe ser entero")
+                    # [FIX] Opcional sin por_defecto queda en None (NULL), no
+                    # en 1: inventar sucursal_id=1 vaciaba reportes como
+                    # stock_critico, cuyo SQL ya maneja el NULL.
+                    valor = definicion.get("por_defecto")
+                if valor is not None:
+                    try:
+                        valor = int(valor)
+                    except (TypeError, ValueError):
+                        raise ValidationException(f"El parámetro {nombre} debe ser entero")
             elif tipo == "texto":
                 valor = str(valor) if valor not in (None, "") else None
             elif tipo == "decimal":

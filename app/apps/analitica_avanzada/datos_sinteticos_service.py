@@ -123,13 +123,21 @@ class DatosSinteticosService:
         catalogo = await cls._catalogo_disponible(db, tenant_id, sucursal_id)
 
         dataset_id = uuid.uuid4().hex
-        clientes = cls.generar_clientes_sinteticos(cantidad_clientes, semilla=semilla)
+        # [BUGFIX] Los identificadores sintéticos deben ser únicos por
+        # dataset, no por semilla: con la misma semilla (la UI siempre usa
+        # 2026) el segundo `sembrar` violaba UNIQUE(tenant, nit_ci) y
+        # UNIQUE(tenant, numero_orden) → 500 Internal Server Error sin CORS.
+        sufijo_dataset = dataset_id[:8]
+        clientes = cls.generar_clientes_sinteticos(
+            cantidad_clientes, semilla=semilla, sufijo=sufijo_dataset
+        )
         ventas = cls.generar_ventas_sinteticas(
             cantidad_ventas,
             dias=dias,
             catalogo=catalogo,
             cantidad_clientes=len(clientes),
             semilla=semilla,
+            sufijo=sufijo_dataset,
         )
         movimientos = cls.generar_movimientos_sinteticos(ventas)
 
@@ -158,14 +166,17 @@ class DatosSinteticosService:
 
     @classmethod
     def generar_clientes_sinteticos(
-        cls, cantidad: int, semilla: int = 2026
+        cls, cantidad: int, semilla: int = 2026, sufijo: str | None = None
     ) -> list[dict]:
         rng = random.Random(semilla)
         nombres = ["Ana", "Luis", "María", "Carlos", "Sofía", "Diego", "Lucía", "Jorge", "Elena", "Pedro"]
         apellidos = ["Quispe", "Mamani", "Rojas", "Flores", "Vargas", "Cruz", "Choque", "López"]
         clientes = []
+        # Con `sufijo` (dataset_id[:8]) cada generación es única aunque
+        # comparta semilla; sin sufijo se conserva el formato legado.
+        marca = sufijo or str(semilla)
         for indice in range(cantidad):
-            codigo = f"{semilla}{indice:04d}"
+            codigo = f"{marca}{indice:04d}"
             clientes.append({
                 "indice": indice,
                 "nit_ci": f"SYN-{codigo}",
@@ -185,6 +196,7 @@ class DatosSinteticosService:
         catalogo: list[dict] | None = None,
         cantidad_clientes: int = 10,
         semilla: int = 2026,
+        sufijo: str | None = None,
     ) -> list[dict]:
         if not catalogo:
             raise ValidationException("Se requiere catálogo con stock para generar ventas")
@@ -245,7 +257,7 @@ class DatosSinteticosService:
             total = round(sum(linea["subtotal"] for linea in lineas), 2)
             ventas.append({
                 "indice": len(ventas),
-                "numero_orden": f"SYN-{semilla}-{indice:05d}",
+                "numero_orden": f"SYN-{sufijo or semilla}-{indice:05d}",
                 "fecha": fecha_hora.isoformat(),
                 "cliente_indice": rng.randrange(max(1, cantidad_clientes)),
                 "sucursal_id": lineas[0]["sucursal_id"],
@@ -366,8 +378,24 @@ class DatosSinteticosService:
         if not validacion["ok"]:
             raise ValidationException("El dataset no es coherente y no puede sembrarse")
 
+        # [BUGFIX] Siembra idempotente: reutiliza clientes/órdenes ya
+        # sembradas en vez de violar UNIQUE(tenant,nit_ci) /
+        # UNIQUE(tenant,numero_orden) y responder 500.
+        nit_a_cliente: dict[str, Cliente] = {}
+        existentes = (await db.execute(
+            select(Cliente).where(
+                Cliente.tenant_id == tenant_id,
+                Cliente.nit_ci.in_([d["nit_ci"] for d in dataset["clientes"]]),
+            )
+        )).scalars().all()
+        for existente in existentes:
+            nit_a_cliente[existente.nit_ci] = existente
+
         clientes_creados: list[Cliente] = []
         for datos in dataset["clientes"]:
+            if datos["nit_ci"] in nit_a_cliente:
+                clientes_creados.append(nit_a_cliente[datos["nit_ci"]])
+                continue
             cliente = Cliente(
                 nit_ci=datos["nit_ci"],
                 correo=datos["correo"],
@@ -378,11 +406,23 @@ class DatosSinteticosService:
             )
             db.add(cliente)
             clientes_creados.append(cliente)
+            nit_a_cliente[datos["nit_ci"]] = cliente
         await db.flush()
+
+        numeros_existentes = set((await db.execute(
+            select(Orden.numero_orden).where(
+                Orden.tenant_id == tenant_id,
+                Orden.numero_orden.in_([v["numero_orden"] for v in dataset["ventas"]]),
+            )
+        )).scalars().all())
 
         ordenes_creadas = 0
         detalles_creados = 0
+        numeros_nuevos: set[str] = set()
         for venta in dataset["ventas"]:
+            if venta["numero_orden"] in numeros_existentes:
+                continue
+            numeros_nuevos.add(venta["numero_orden"])
             cliente = clientes_creados[int(venta["cliente_indice"])]
             orden = Orden(
                 numero_orden=venta["numero_orden"],
@@ -428,6 +468,10 @@ class DatosSinteticosService:
 
         movimientos_creados = 0
         for movimiento in dataset["movimientos"]:
+            # Idempotencia: no duplica movimientos de órdenes ya sembradas.
+            _numero = str(movimiento.get("motivo", "")).rsplit(" ", 1)[-1]
+            if numeros_existentes and _numero in numeros_existentes:
+                continue
             db.add(MovimientoInventario(
                 inventario_id=movimiento["inventario_id"],
                 tipo=TipoMovimiento(movimiento["tipo"]),
@@ -541,6 +585,12 @@ class DatosSinteticosService:
 
     @classmethod
     def _obtener_dataset(cls, dataset_id: str | None, tenant_id: int) -> dict:
+        # Clientes viejos (frontend) envían `String(undefined)` = "undefined"
+        # por el desfasaje dataset_id/id; se trata como "último pendiente".
+        if isinstance(dataset_id, str):
+            dataset_id = dataset_id.strip() or None
+            if dataset_id and dataset_id.lower() in ("undefined", "null"):
+                dataset_id = None
         if dataset_id:
             dataset = _DATASETS.get(dataset_id)
             if dataset is None or int(dataset["tenant_id"]) != int(tenant_id):
