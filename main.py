@@ -146,6 +146,34 @@ async def _job_revocacion_dispositivos() -> None:
             logger.exception("Error en el job de revocación de dispositivos")
 
 
+async def _job_keepalive() -> None:
+    """[EXAMEN-2] Anti-sleep del free tier de Render (temporal, quitar tras la
+    defensa del examen): cada KEEPALIVE_INTERVALO_SEG golpea la URL pública de
+    la propia API (/health) para que Render no suspenda la instancia por
+    inactividad. Render cuenta tráfico que entra por el proxy público, por eso
+    el ping va a RENDER_PUBLIC_URL y no a localhost (eso no lo despertaría).
+    Solo activa si RENDER_PUBLIC_URL está definida: en local y en tests no corre.
+    """
+    import httpx
+
+    if not settings.RENDER_PUBLIC_URL:
+        logger.info("Keep-alive de Render desactivado (RENDER_PUBLIC_URL vacía)")
+        return
+
+    url = f"{settings.RENDER_PUBLIC_URL.rstrip('/')}/health"
+    logger.info("Keep-alive de Render activo: self-ping a %s cada %s s", url, settings.KEEPALIVE_INTERVALO_SEG)
+    while True:
+        await asyncio.sleep(max(60, settings.KEEPALIVE_INTERVALO_SEG))
+        try:
+            async with httpx.AsyncClient(timeout=15) as cliente:
+                r = await cliente.get(url)
+            logger.info("Keep-alive ping %s: %s", url, r.status_code)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Keep-alive ping falló (reintenta en el próximo ciclo)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -164,6 +192,9 @@ async def lifespan(app: FastAPI):
     app.state.job_revocacion = job_revocacion
     job_respaldos = asyncio.create_task(_job_respaldos())
     app.state.job_respaldos = job_respaldos
+    # [EXAMEN-2] Keep-alive del free tier de Render (no haga nada si la var no existe)
+    job_keepalive = asyncio.create_task(_job_keepalive())
+    app.state.job_keepalive = job_keepalive
     
     # Crear tablas en la base de datos
     async with engine.begin() as conn:
@@ -208,6 +239,11 @@ async def lifespan(app: FastAPI):
         pass
     try:
         await job_respaldos
+    except asyncio.CancelledError:
+        pass
+    job_keepalive.cancel()
+    try:
+        await job_keepalive
     except asyncio.CancelledError:
         pass
     await engine.dispose()

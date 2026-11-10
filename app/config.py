@@ -118,6 +118,13 @@ class Settings(BaseSettings):
     BACKUP_JOB_INTERVALO_SEG: int = 3600
     BACKUP_TIMEOUT_SEG: int = 300
 
+    # [EXAMEN-2] Keep-alive del free tier de Render (temporal, solo para la
+    # defensa del examen): self-ping HTTPS a la URL pública para que el
+    #servicio free no se duerma tras ~15 min sin tráfico. Vacío = OFF, por
+    # lo que en desarrollo local y en la suite de tests no corre nada extra.
+    RENDER_PUBLIC_URL: str = ""
+    KEEPALIVE_INTERVALO_SEG: int = 600
+
     class Config:
         env_file = ".env"
         case_sensitive = True
