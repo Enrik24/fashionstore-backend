@@ -458,6 +458,8 @@ class ProductoFilter(BaseModel):
     coleccion_id: Optional[int] = None
     talla_id: Optional[int] = None
     color_id: Optional[int] = None
+    # RF-033: filtro público por tipo de tela (índice ix_productos_tenant_tipo_tela).
+    tipo_tela_id: Optional[int] = None
     precio_min: Optional[Decimal] = None
     precio_max: Optional[Decimal] = None
     ordenar_por: Optional[str] = Field(None, description="precio_asc, precio_desc, nombre, fecha")

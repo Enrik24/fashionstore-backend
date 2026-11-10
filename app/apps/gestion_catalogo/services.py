@@ -1012,7 +1012,11 @@ class ProductoService:
         # Filtro por temporada
         if filtros.temporada_id:
             query = query.where(Producto.temporada_id == filtros.temporada_id)
-            
+
+        # Filtro por tipo de tela (RF-033): índice (tenant_id, tipo_tela_id)
+        if filtros.tipo_tela_id:
+            query = query.where(Producto.tipo_tela_id == filtros.tipo_tela_id)
+
         # Filtro por rango de precios
         if filtros.precio_min is not None:
             query = query.where(Producto.precio >= filtros.precio_min)
