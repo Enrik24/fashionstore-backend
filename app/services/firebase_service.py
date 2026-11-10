@@ -138,6 +138,14 @@ class FirebaseService:
             return True
         return False
 
+    @staticmethod
+    def _resolver_link_webpush(url: str) -> Optional[str]:
+        """Devuelve un link HTTPS absoluto para webpush, o None si es imposible."""
+        if not url:
+            return None
+        link = url if str(url).startswith("http") else f"{settings.CORS_ORIGINS.split(',')[0].strip()}{url}"
+        return link if link.startswith("https://") else None
+
     @classmethod
     async def enviar_multicast(
         cls,
@@ -160,6 +168,22 @@ class FirebaseService:
         # Asegurarse de que todos los valores de data sean strings
         clean_data = {str(k): str(v) for k, v in payload_data.items()}
 
+        # [EXAMEN-2] FCM exige que webpush.fcm_options.link sea un URL
+        # HTTPS absoluto: se resuelve el relativo contra el frontend y, si
+        # el entorno es http (dev con localhost), se omite el link en vez de
+        # romper el envío completo ("WebpushFCMOptions.link must be HTTPS").
+        webpush_link = cls._resolver_link_webpush(clean_data.get("url", "/profile/reservations"))
+
+        webpush_config = messaging.WebpushConfig(
+            notification=messaging.WebpushNotification(
+                title=titulo,
+                body=cuerpo,
+                icon="/assets/icons/icon-192x192.png",
+                badge="/favicon.ico"
+            ),
+            fcm_options=messaging.WebpushFCMOptions(link=webpush_link) if webpush_link else None
+        )
+
         message = messaging.MulticastMessage(
             notification=messaging.Notification(
                 title=titulo,
@@ -167,17 +191,7 @@ class FirebaseService:
             ),
             data=clean_data,
             tokens=tokens,
-            webpush=messaging.WebpushConfig(
-                notification=messaging.WebpushNotification(
-                    title=titulo,
-                    body=cuerpo,
-                    icon="/assets/icons/icon-192x192.png",
-                    badge="/favicon.ico"
-                ),
-                fcm_options=messaging.WebpushFCMOptions(
-                    link=clean_data.get("url", "/profile/reservations")
-                )
-            )
+            webpush=webpush_config
         )
 
         try:
