@@ -118,6 +118,54 @@ PLANTILLAS: list[dict] = [
         """,
     },
     {
+        # [EXAMEN-2] CU10: "los diez productos más vendidos de los últimos
+        # 3 meses agrupados por sucursal". Ranking por sucursal: cada tienda
+        # aporta sus N productos más vendidos (ROW_NUMBER por sucursal).
+        "clave": "top_productos_sucursal",
+        "nombre": "Top N productos por sucursal",
+        "descripcion": "Productos con más unidades vendidas, agrupados por cada sucursal.",
+        "categoria": "PRODUCTOS",
+        "palabras_clave": [
+            "agrupados por sucursal", "agrupado por sucursal", "agrupadas por sucursal",
+            "agrupados por tienda", "agrupado por tienda", "agrupadas por tienda",
+            "agrupar por sucursal", "por sucursal y producto", "por sucursal",
+            "cada sucursal", "todas las sucursales", "producto", "vendido",
+        ],
+        "parametros": [
+            _p("fecha_inicio", "fecha"),
+            _p("fecha_fin", "fecha"),
+            _p("limite", "entero", por_defecto=10),
+            _p("sucursal_id", "entero"),  # opcional: limita a una sucursal
+        ],
+        "columnas": ["sucursal", "producto", "unidades", "total"],
+        "visualizacion": "TABLA",
+        "sql": """
+            SELECT sucursal, producto, unidades, total
+            FROM (
+                SELECT s.nombre AS sucursal,
+                       p.nombre AS producto,
+                       SUM(d.cantidad) AS unidades,
+                       COALESCE(SUM(d.subtotal), 0) AS total,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY s.id ORDER BY SUM(d.cantidad) DESC, p.nombre ASC
+                       ) AS ranking
+                FROM detalles_orden d
+                JOIN ordenes o ON o.id = d.orden_id
+                JOIN variantes_producto v ON v.id = d.variante_producto_id
+                JOIN productos p ON p.id = v.producto_id
+                JOIN sucursales s ON s.id = o.sucursal_id
+                WHERE o.tenant_id = :tenant_id
+                  AND o.es_sintetico = false
+                  AND o.fecha >= :fecha_inicio
+                  AND o.fecha < :fecha_fin
+                  AND (CAST(:sucursal_id AS integer) IS NULL OR o.sucursal_id = :sucursal_id)
+                GROUP BY s.id, s.nombre, p.nombre
+            ) ranking_sucursal
+            WHERE ranking <= :limite
+            ORDER BY sucursal, ranking
+        """,
+    },
+    {
         "clave": "top_clientes",
         "nombre": "Top N clientes",
         "descripcion": "Clientes con mayor monto comprado en el período.",

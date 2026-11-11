@@ -90,6 +90,47 @@ class ReporteGenerativoService:
         inicio = hoy.replace(day=1)
         return {"fecha_inicio": inicio.isoformat(), "fecha_fin": (hoy + timedelta(days=1)).isoformat()}
 
+    # Números en letras que suelen aparecer en solicitudes de reportes.
+    _NUMEROS_TEXTO = {
+        "uno": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5,
+        "seis": 6, "siete": 7, "ocho": 8, "nueve": 9, "diez": 10,
+        "quince": 15, "veinte": 20, "treinta": 30, "cincuenta": 50, "cien": 100,
+    }
+
+    @classmethod
+    def _periodo_relativo(cls, texto: str) -> dict | None:
+        """Traduce 'últimos N meses/días/semanas' a fechas concretas.
+
+        Devuelve None si el texto no menciona un período relativo, para que
+        el caller aplique su propio default.
+        """
+        import unicodedata
+
+        t = "".join(
+            c for c in unicodedata.normalize("NFKD", (texto or "").lower())
+            if not unicodedata.combining(c)
+        )
+        m = re.search(r"ultimos?\s+(\d+)\s+(dia|dias|semana|semanas|mes|meses)", t)
+        if not m:
+            return None
+        n = max(1, int(m.group(1)))
+        unidad = m.group(2)
+        fin = date.today() + timedelta(days=1)  # fin exclusivo
+        if unidad.startswith("dia"):
+            inicio = fin - timedelta(days=n)
+        elif unidad.startswith("semana"):
+            inicio = fin - timedelta(weeks=n)
+        else:  # meses
+            import calendar
+
+            mes, anio = fin.month - n, fin.year
+            while mes <= 0:
+                mes += 12
+                anio -= 1
+            dia = min(fin.day, calendar.monthrange(anio, mes)[1])
+            inicio = date(anio, mes, dia)
+        return {"fecha_inicio": inicio.isoformat(), "fecha_fin": fin.isoformat()}
+
     @classmethod
     def _interpretar_heuristico(cls, texto: str) -> dict:
         plantilla = PlantillaReporteService.mapear_plantilla(texto)
@@ -105,12 +146,31 @@ class ReporteGenerativoService:
 
         # Período explícito simple: "del 1 al 15 de octubre" no se intenta
         # adivinar; se usa el mes en curso y el usuario puede ajustar.
+        # "últimos 3 meses" sí se traduce a fechas concretas.
         if any(p["tipo"] == "fecha" for p in plantilla["parametros"]):
-            interpretacion["parametros"].update(cls._periodo_por_defecto())
+            interpretacion["parametros"].update(
+                cls._periodo_relativo(texto) or cls._periodo_por_defecto()
+            )
         if "sucursal" in texto.lower():
             numeros = re.findall(r"sucursal\s*#?(\d+)", texto.lower())
             if numeros:
                 interpretacion["parametros"]["sucursal_id"] = int(numeros[0])
+        # "los diez productos" / "top 5" -> limite explícito en la heurística.
+        if any(p["nombre"] == "limite" for p in plantilla["parametros"]):
+            import unicodedata
+
+            t = "".join(
+                c for c in unicodedata.normalize("NFKD", texto.lower())
+                if not unicodedata.combining(c)
+            )
+            m = re.search(r"(?:top|primeros|mejores)\s+#?(\d+)", t) or re.search(
+                r"\b(" + "|".join(cls._NUMEROS_TEXTO) + r")\b\s+(?:productos|clientes|prendas)", t
+            )
+            if m:
+                interpretacion["parametros"]["limite"] = (
+                    int(m.group(1)) if m.group(1).isdigit()
+                    else cls._NUMEROS_TEXTO.get(m.group(1))
+                )
         return interpretacion
 
     @classmethod
@@ -121,11 +181,31 @@ class ReporteGenerativoService:
             from app.services.groq_service import GroqService
 
             cliente = GroqService()
+            hoy = date.today()
+            manana = (hoy + timedelta(days=1)).isoformat()
+            # Catálogo con parámetros válidos: evita que el LLM invente claves
+            # que luego PlantillaReporteService.validar_parametros descarta.
+            catalogo = "\n".join(
+                f"- {p['clave']}: parámetros = "
+                + ", ".join(pp["nombre"] for pp in p["parametros"])
+                for p in PlantillaReporteService.listar_plantillas()
+            )
             prompt = (
-                "Eres un intérprete de reportes. Devuelve SOLO JSON con las claves "
-                "plantilla (una de: " + ", ".join(PlantillaReporteService.claves()) + "), "
-                "parametros (objeto), confianza (0-1) y visualizacion. "
-                f"Texto del usuario: {texto}"
+                "Eres un intérprete de reportes para un ERP de moda. Elige UNA plantilla "
+                "del catálogo y extrae SUS parámetros definidos. Devuelve SOLO JSON con las "
+                "claves plantilla, parametros (objeto con solo los parámetros de esa "
+                "plantilla), confianza (0-1) y visualizacion.\n"
+                "Reglas de extracción:\n"
+                f"- Fecha actual: {hoy.isoformat()}. Convierte períodos relativos a fechas "
+                "concretas YYYY-MM-DD: 'últimos 3 meses' -> fecha_inicio = 3 meses antes de "
+                f"hoy y fecha_fin = {manana} (fin exclusivo); 'este mes' -> día 1 del mes; "
+                "'esta semana' -> lunes de esta semana. Nunca devuelvas texto relativo.\n"
+                "- Números en letras (diez, cinco, veinte) o 'top N' -> limite entero.\n"
+                "- 'agrupados por sucursal' / 'por sucursal' junto a productos vendidos -> "
+                "plantilla top_productos_sucursal; si además se nombra UNA sucursal, usa "
+                "sucursal_id solo si el texto da su número (los nombres se resuelven después).\n"
+                "- No inventes parámetros que la plantilla no define.\n"
+                "Catálogo:\n" + catalogo + f"\n\nTexto del usuario: {texto}"
             )
             respuesta = await cliente.client.chat.completions.create(
                 model="openai/gpt-oss-20b",
