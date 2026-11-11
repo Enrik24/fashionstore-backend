@@ -7,15 +7,13 @@ entrenamiento. Cada modelo guarda su artefacto `.joblib` bajo
 """
 from __future__ import annotations
 
+import importlib
 import math
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import joblib
-import numpy as np
-import pandas as pd
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,6 +42,39 @@ FEATURES = [
 
 OBJETIVOS_SUPERVISADOS = {"VENTAS", "VENTAS_DIARIAS", "PREDICCION_VENTAS"}
 OBJETIVOS_NO_SUPERVISADOS = {"SEGMENTACION", "SEGMENTACION_CLIENTES", "ANOMALIAS", "ANOMALIAS_VENTAS"}
+
+
+class _LazyModule:
+    """Carga un módulo pesado la primera vez que realmente se usa.
+
+    `numpy` + `pandas` suman más de 100 MB al proceso. En el plan free de
+    Render el contenedor tiene 512 MB y cada worker de gunicorn carga su
+    propia copia: importarlos en el arranque hacía que el contenedor quedara
+    sin memoria, lo matara y lo reiniciara (eso es lo que el navegador ve
+    como un `502 Bad Gateway`).
+
+    Con esta carga perezosa el worker arranca liviano y solo paga el costo de
+    `numpy`/`pandas` cuando un endpoint de machine learning lo necesita de
+    verdad. El acceso es transparente: `np.arange(...)`, `pd.DataFrame(...)` y
+    `joblib.dump(...)` siguen funcionando igual.
+    """
+
+    def __init__(self, nombre: str) -> None:
+        self._nombre = nombre
+        self._modulo: Any = None
+
+    def _cargar(self) -> Any:
+        if self._modulo is None:
+            self._modulo = importlib.import_module(self._nombre)
+        return self._modulo
+
+    def __getattr__(self, atributo: str) -> Any:
+        return getattr(self._cargar(), atributo)
+
+
+np = _LazyModule("numpy")
+pd = _LazyModule("pandas")
+joblib = _LazyModule("joblib")
 
 
 def _ruta_modelos() -> Path:

@@ -263,6 +263,9 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
+    # Permite los dominios variables (URLs de preview de Vercel). Es None si
+    # no se configuró CORS_ORIGINS_REGEX.
+    allow_origin_regex=settings.cors_origins_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

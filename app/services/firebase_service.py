@@ -10,8 +10,11 @@ from typing import List, Optional, Dict, Any
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import firebase_admin
-from firebase_admin import credentials, messaging
+# [PERF] El SDK de Firebase (firebase_admin) pesa ~14 MB y este módulo lo
+# importa el router de usuarios y el de ventas, es decir, se carga en TODOS
+# los workers de gunicorn aunque el servicio nunca envíe push. Se importa de
+# forma perezosa dentro de las funciones que lo necesitan para que el worker
+# arranque liviano (el contenedor free de Render tiene 512 MB).
 from app.config import settings
 from app.apps.gestion_usuarios.models import DispositivoFCM, Usuario, EncargadoSucursal, Cajero
 
@@ -22,6 +25,9 @@ _firebase_app_initialized = False
 
 def _get_firebase_app():
     """Inicializa y retorna la app de Firebase Admin SDK como singleton."""
+    import firebase_admin
+    from firebase_admin import credentials
+
     global _firebase_app_initialized
     if _firebase_app_initialized:
         return firebase_admin.get_app()
@@ -156,6 +162,8 @@ class FirebaseService:
         data: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """Envía un mensaje FCM a una lista de tokens de dispositivo."""
+        from firebase_admin import messaging
+
         if not tokens:
             return {"exito": 0, "fallo": 0, "mensajes": "Sin tokens"}
 

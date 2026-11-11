@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from alembic import context
 
 # Import the Base from your app
-from app.database import Base
+from app.database import Base, build_connect_args
 from app.config import settings
 
 # Import all models to register them with Base.metadata
@@ -59,15 +59,10 @@ def do_run_migrations(connection: Connection) -> None:
 
 async def run_async_migrations() -> None:
     """Run migrations in 'online' mode with async engine."""
-    # Configurar SSL para proveedores cloud como Supabase
-    connect_args = {"statement_cache_size": 0}
-    if settings.DB_SSL:
-        import ssl
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        connect_args["ssl"] = ssl_context
-    
+    # Mismos connect_args que la aplicación (statement_cache_size=0 + SSL),
+    # para que las migraciones usen el mismo modo de conexión.
+    connect_args = build_connect_args()
+
     # Usamos create_async_engine en lugar de async_engine_from_config
     # para poder pasar connect_args con statement_cache_size=0 y ssl
     connectable = create_async_engine(

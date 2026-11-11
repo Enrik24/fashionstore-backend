@@ -41,8 +41,20 @@ services:
       - key: SECRET_KEY
         generateString: true
       - key: CORS_ORIGINS
-        # Cambia esto por tu dominio de frontend en producción
-        value: "https://tu-frontend.onrender.com,http://localhost:4200"
+        # Orígenes reales del frontend: producción en Vercel + desarrollo local.
+        # Con `allow_credentials=True` NO se puede usar "*": hay que listarlos.
+        value: "https://fashionstore-frontend-smoky.vercel.app,http://localhost:4200,http://localhost:3000"
+      - key: CORS_ORIGINS_REGEX
+        # Las URLs de preview de Vercel cambian de subdominio en cada push
+        # (fashionstore-frontend-<hash>.vercel.app). Sin esta regex, un
+        # preview nuevo recibe el error "blocked by CORS policy".
+        value: "https://fashionstore-frontend(-[a-z0-9-]+)?\\.vercel\\.app"
+      - key: WEB_CONCURRENCY
+        # El contenedor free de Render tiene 512 MB y 0.1 CPU. Cada worker de
+        # gunicorn carga su propia copia del runtime (~200 MB), asi que con 2
+        # el contenedor se queda sin memoria, Render lo reinicia y el proxy
+        # responde 502 "Bad Gateway".
+        value: "1"
       - key: GROQ_API_KEY
         sync: false
       - key: CLOUDINARY_CLOUD_NAME
@@ -59,9 +71,14 @@ services:
         sync: false
       # [EXAMEN-2] Keep-alive del free tier (temporal, quitar tras la defensa):
       # URL pública de ESTE servicio backend para el self-ping anti-sleep.
-      # Completar con el dominio real, ej: https://fashionstore-backend.onrender.com
+      # Sin esta variable el keep-alive NO corre (main.py lo desactiva si está
+      # vacía) y Render suspende el servicio tras ~15 min sin tráfico: la
+      # siguiente petición recibe un 502 mientras la instancia despierta.
       - key: RENDER_PUBLIC_URL
-        sync: false
+        value: "https://fashionstore-backend-3wsr.onrender.com"
+      - key: KEEPALIVE_INTERVALO_SEG
+        # 10 min < 15 min de inactividad de Render: el servicio no se duerme.
+        value: "600"
 
 databases:
   - name: fashionstore-db

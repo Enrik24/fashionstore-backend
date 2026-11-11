@@ -2,9 +2,10 @@
 Configuración global de la aplicación FastAPI.
 Carga las variables de entorno y proporciona configuración centralizada.
 """
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 from functools import lru_cache
+from urllib.parse import quote_plus
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,6 +29,21 @@ class Settings(BaseSettings):
     # activa automáticamente para hosts cloud). Vacío en el .env equivale a False.
     DB_SSL: bool = False
 
+    # Modo SSL explícito, con los nombres de libpq:
+    #   disable | allow | prefer | require | verify-ca | verify-full
+    # Tiene prioridad sobre DB_SSL. Vacío = no se fuerza nada.
+    #
+    # IMPORTANTE: NO escribir `?sslmode=require` en DATABASE_URL. asyncpg no
+    # reconoce ese parámetro (habla `ssl`), SQLAlchemy se lo pasa tal cual y
+    # la conexión revienta con:
+    #   TypeError: connect() got an unexpected keyword argument 'sslmode'
+    # El modo se aplica por connect_args en app/database.py.
+    DB_SSLMODE: str = ""
+
+    # Ruta al certificado CA del proveedor. Necesario para verify-ca /
+    # verify-full (Railway lo entrega como `root.crt`).
+    DB_SSLROOTCERT: str = ""
+
     @field_validator("DB_SSL", mode="before")
     @classmethod
     def _parse_db_ssl(cls, value):
@@ -35,6 +51,22 @@ class Settings(BaseSettings):
         if value is None or (isinstance(value, str) and value.strip() == ""):
             return False
         return value
+
+    @field_validator("DB_SSLMODE", mode="before")
+    @classmethod
+    def _parse_db_sslmode(cls, value):
+        """Normaliza el modo SSL: minúsculas y vacío si no viene."""
+        if value is None:
+            return ""
+        return str(value).strip().lower()
+
+    @field_validator("DB_SSLROOTCERT", mode="before")
+    @classmethod
+    def _parse_db_sslrootcert(cls, value):
+        """Normaliza la ruta del CA: vacía si no viene."""
+        if value is None:
+            return ""
+        return str(value).strip()
     
     # JWT
     SECRET_KEY: str
@@ -74,6 +106,10 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
     CORS_ORIGINS: str = "http://localhost:4200,http://localhost:3000"
+    # Expresión regular de orígenes permitidos, para los dominios que cambian
+    # en cada despliegue (por ejemplo, las URLs de preview de Vercel:
+    # https://fashionstore-frontend-abc123.vercel.app). Vacía = desactivado.
+    CORS_ORIGINS_REGEX: str = ""
     
     # CU26 y CU28 Config
     # [EXAMEN-2] RN-012: el plazo de devolución/cambio es de 7 días calendario.
@@ -169,8 +205,10 @@ class Settings(BaseSettings):
                 database_url = "postgresql+asyncpg://" + database_url[len("postgresql://"):]
         else:
             # Desarrollo local - construir desde las variables del .env
+            # (quote_plus escapa usuario y contraseña: algunas contraseñas de
+            # proveedor traen @ : / o # y romperían la URL sin codificar).
             database_url = (
-                f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}"
+                f"postgresql+asyncpg://{quote_plus(self.DB_USER)}:{quote_plus(self.DB_PASSWORD)}"
                 f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
             )
         
@@ -179,11 +217,13 @@ class Settings(BaseSettings):
         # Activar SSL automáticamente si el host es de Supabase u otros proveedores cloud.
         # En Render: el host externo (dpg-xxxx-a.<region>-postgres.render.com) exige
         # SSL; el host interno (dpg-xxxx-a) no lo necesita, así que este check no aplica.
+        # En Railway el proxy es <nombre>.proxy.<region>.rlwy.net y también exige SSL.
         if self.DATABASE_URL and (
             "supabase" in self.DATABASE_URL
             or "rds.amazonaws" in self.DATABASE_URL
             or "azure" in self.DATABASE_URL
             or ".render.com" in self.DATABASE_URL
+            or ".rlwy.net" in self.DATABASE_URL
         ):
             self.DB_SSL = True
 
@@ -193,6 +233,36 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> List[str]:
         """Retorna lista de orígenes CORS desde la cadena de configuración."""
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+
+    @property
+    def db_sslmode(self) -> str:
+        """Modo SSL efectivo que se aplica a la conexión asyncpg.
+
+        - `DB_SSLMODE` si está definido (disable|allow|prefer|require|
+          verify-ca|verify-full): manda sobre todo lo demás.
+        - "require" si `DB_SSL` está activo. Es lo que se usa hoy con
+          Supabase/Render: cifra el canal sin verificar el certificado.
+        - "" si no hay nada: no se fuerza nada y asyncpg aplica su default
+          ("prefer", que negocia TLS si el servidor lo ofrece).
+
+        Ojo: `require` en asyncpg equivale al `sslmode=require` de libpq
+        (cifra, pero no valida el certificado del servidor).
+        """
+        if self.DB_SSLMODE:
+            return self.DB_SSLMODE
+        return "require" if self.DB_SSL else ""
+
+    @property
+    def cors_origins_regex(self) -> Optional[str]:
+        """Retorna la expresión regular de orígenes CORS, o None si no hay.
+
+        Se usa junto a `allow_origins` para admitir dominios variables (las
+        URLs de preview de Vercel). La regex debe coincidir con el origen
+        completo: no se admite un comodín amplio porque `allow_credentials=True`
+        no permite `*`.
+        """
+        patron = (self.CORS_ORIGINS_REGEX or "").strip()
+        return patron or None
 
 
 @lru_cache()
