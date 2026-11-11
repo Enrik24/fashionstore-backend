@@ -111,6 +111,10 @@ class StripeService:
         s_url = success_url or (
             f"{settings.STRIPE_SUSCRIPCION_SUCCESS_URL}"
             f"?session_id={{CHECKOUT_SESSION_ID}}&suscripcion_id={suscripcion_id}"
+            # [EXAMEN-2] Se incluye el tenant_id para que la página de retorno
+            # pueda fijar la cabecera X-Tenant-ID (exigida al Super Administrador
+            # por el endpoint `confirmar-retorno`).
+            f"&tenant_id={tenant_id}"
         )
         c_url = cancel_url or (
             f"{settings.STRIPE_SUSCRIPCION_CANCEL_URL}?suscripcion_id={suscripcion_id}"
