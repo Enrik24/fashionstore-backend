@@ -693,8 +693,10 @@ class SuscripcionService:
         await SuscripcionService._validar_limites_plan(db, suscripcion.tenant_id, plan)
         suscripcion.plan_id = plan.id
         await db.commit()
-        await db.refresh(suscripcion)
-        return suscripcion
+        # [EXAMEN-2] Se recarga con `plan` para que la respuesta no dispare
+        # una carga perezosa fuera del contexto async (MissingGreenlet),
+        # igual que en `crear`.
+        return await SuscripcionService.obtener(db, suscripcion.id)
 
     @staticmethod
     async def renovar(db: AsyncSession, suscripcion_id: int, dias: int = 30) -> Suscripcion:
