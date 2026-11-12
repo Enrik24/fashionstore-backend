@@ -20,6 +20,7 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.exceptions import (
+    OperacionRechazada,
     PagoDuplicado,
     PagoNoEncontrado,
     ValidationException,
@@ -174,11 +175,39 @@ async def manejar_orden_pago_diferido(
         direccion_envio=payload.get("direccion_envio"),
         sucursal_id=sucursal_id,
     )
+
+    # [EXAMEN-2] CU16/RN-015: la orden sola no habilita el cobro. Con el
+    # `uuid_pago` del payload se crea también el PagoDiferido + PaymentIntent
+    # (mismo contrato que la operación PAGO_DIFERIDO), de modo que tras la
+    # primera sincronización el móvil ya puede abrir el PaymentSheet sin
+    # depender de un reintento del POST directo (que nunca se reenviaba).
+    pago_info: Optional[dict] = None
+    uuid_pago_raw = payload.get("uuid_pago")
+    if uuid_pago_raw:
+        uuid_pago = _uuid(uuid_pago_raw, "uuid_pago")
+        orden_creada = await db.get(Orden, int(resultado["orden_id"]))
+        if orden_creada is None:
+            raise ValidationException("La orden creada no es recuperable")
+        existente = await _buscar_pago_global(db, uuid_pago)
+        if existente is not None:
+            # RN-015: mismo uuid_pago → mismo cobro, sin segundo PaymentIntent.
+            pago_info = _serializar_pago(existente, orden_creada, duplicado=True)
+        else:
+            pago_info = await _crear_pago_para_orden(
+                db,
+                tenant_id,
+                operacion,
+                uuid_pago,
+                orden_creada,
+                moneda=payload.get("moneda"),
+            )
+
     return {
         **resultado,
         "uuid_carrito": str(uuid_valor),
         "uuid_pago": payload.get("uuid_pago"),
         "requiere_pago": True,
+        **({"pago": pago_info} if pago_info is not None else {}),
     }
 
 
@@ -244,30 +273,24 @@ def _serializar_pago(pago: PagoDiferido, orden: Orden, duplicado: bool = False) 
     }
 
 
-async def manejar_pago_diferido(
-    db: AsyncSession, operacion, contexto: dict | None = None
+async def _crear_pago_para_orden(
+    db: AsyncSession,
+    tenant_id: int,
+    operacion,
+    uuid_valor: UUID,
+    orden: Orden,
+    moneda: Optional[str] = None,
 ) -> dict:
-    payload = operacion.payload_json or {}
-    tenant_id = operacion.tenant_id
-    uuid_valor = _uuid(payload.get("uuid_pago"), "uuid_pago")
+    """[EXAMEN-2] CU16/RN-015: crea el PagoDiferido + PaymentIntent de una orden.
 
-    existente = await _buscar_pago_global(db, uuid_valor)
-    if existente is not None:
-        if existente.tenant_id != tenant_id:
-            raise PagoNoEncontrado("Pago diferido no encontrado")
-        orden = await _resolver_orden(
-            db, tenant_id, {"orden_id": existente.orden_id}
-        )
-        # RN-015: mismo uuid_pago → mismo cobro, sin segundo PaymentIntent.
-        return _serializar_pago(existente, orden, duplicado=True)
-
-    orden = await _resolver_orden(db, tenant_id, payload)
-
+    Compartido por la operación `PAGO_DIFERIDO` y por `ORDEN_PAGO_DIFERIDO`
+    (que así completa orden + pago en una sola pasada de sincronización).
+    La confirmación nunca ocurre aquí: el intent queda en
+    `REQUIERE_ACCION_CLIENTE` y llega por webhook o verificación directa.
+    """
     if orden.estado == EstadoOrden.PAGADO:
         raise PagoDuplicado("La orden ya está pagada")
     if orden.estado in {EstadoOrden.CANCELADO, EstadoOrden.PAGO_VENCIDO}:
-        from app.exceptions import OperacionRechazada
-
         raise OperacionRechazada(
             "La orden no admite un nuevo pago",
             tipo_conflicto=TipoConflicto.ORDEN_EXPIRADA.value,
@@ -281,8 +304,6 @@ async def manejar_pago_diferido(
         if getattr(expira, "tzinfo", None) is not None:
             expira = expira.replace(tzinfo=None)
         if expira < ahora:
-            from app.exceptions import OperacionRechazada
-
             raise OperacionRechazada(
                 "La orden expiró antes del pago",
                 tipo_conflicto=TipoConflicto.ORDEN_EXPIRADA.value,
@@ -295,7 +316,7 @@ async def manejar_pago_diferido(
         orden_id=orden.id,
         uuid_pago=uuid_valor,
         monto=_d(orden.total),
-        moneda=(payload.get("moneda") or orden.moneda or settings.STRIPE_MONEDA).upper()[:3],
+        moneda=(moneda or orden.moneda or settings.STRIPE_MONEDA).upper()[:3],
         estado=EstadoPagoDiferido.EN_PROCESO,
         idempotency_key=str(uuid_valor),
         intentos=1,
@@ -350,6 +371,34 @@ async def manejar_pago_diferido(
 
     await db.flush()
     return _serializar_pago(pago, orden)
+
+
+async def manejar_pago_diferido(
+    db: AsyncSession, operacion, contexto: dict | None = None
+) -> dict:
+    payload = operacion.payload_json or {}
+    tenant_id = operacion.tenant_id
+    uuid_valor = _uuid(payload.get("uuid_pago"), "uuid_pago")
+
+    existente = await _buscar_pago_global(db, uuid_valor)
+    if existente is not None:
+        if existente.tenant_id != tenant_id:
+            raise PagoNoEncontrado("Pago diferido no encontrado")
+        orden = await _resolver_orden(
+            db, tenant_id, {"orden_id": existente.orden_id}
+        )
+        # RN-015: mismo uuid_pago → mismo cobro, sin segundo PaymentIntent.
+        return _serializar_pago(existente, orden, duplicado=True)
+
+    orden = await _resolver_orden(db, tenant_id, payload)
+    return await _crear_pago_para_orden(
+        db,
+        tenant_id,
+        operacion,
+        uuid_valor,
+        orden,
+        moneda=payload.get("moneda"),
+    )
 
 
 def registrar_handlers() -> None:
