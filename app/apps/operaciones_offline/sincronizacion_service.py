@@ -49,6 +49,13 @@ logger = logging.getLogger(__name__)
 TIPOS_VALIDOS = {t.value for t in TipoOperacionOffline}
 ESTADOS_REINTENTABLES = {
     EstadoSincronizacion.PENDIENTE,
+    # [BUG-SYNC] ENVIADA también es reintentable: si la respuesta se perdió
+    # (crash / corte de red tras el commit) la operación quedaba bloqueada
+    # para siempre — el lote devolvía EN_PROCESO indefinidamente y este
+    # endpoint la rechazaba. Los manejadores son idempotentes por
+    # uuid_operacion / uuid_pago (RN-005 / RN-015), así que re-ejecutarla es
+    # seguro.
+    EstadoSincronizacion.ENVIADA,
     EstadoSincronizacion.RECHAZADA,
     EstadoSincronizacion.CONFLICTO,
     EstadoSincronizacion.ERROR_CRITICO,
@@ -262,6 +269,21 @@ class SincronizacionService:
             }:
                 if existente.estado_sincronizacion == EstadoSincronizacion.PENDIENTE:
                     # Quedó pendiente de un intento anterior: se reintenta.
+                    return await cls._ejecutar_operacion(db, existente, item, lote)
+                # [BUG-SYNC] bloqueo ENVIADA huérfano (respuesta perdida tras
+                # el commit): si el último intento es viejo no hay nadie
+                # procesándola; re-ejecutarla evita el bucle EN_PROCESO ↔
+                # reintentar que dejaba la operación pendiente para siempre.
+                ultimo_intento = existente.fecha_ultimo_intento
+                if (
+                    ultimo_intento is not None
+                    and getattr(ultimo_intento, "tzinfo", None) is not None
+                ):
+                    ultimo_intento = ultimo_intento.replace(tzinfo=None)
+                if (
+                    ultimo_intento is not None
+                    and datetime.utcnow() - ultimo_intento > timedelta(minutes=5)
+                ):
                     return await cls._ejecutar_operacion(db, existente, item, lote)
                 return cls.construir_resultado(
                     item.uuid_operacion,
