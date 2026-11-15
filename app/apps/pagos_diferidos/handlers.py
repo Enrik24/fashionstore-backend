@@ -36,6 +36,7 @@ from app.apps.gestion_ventas.models import (
     Orden,
     TransaccionPago,
 )
+from app.apps.gestion_usuarios.models import Cliente
 from app.apps.operaciones_offline.models import (
     EstadoPagoDiferido,
     EstadoSincronizacion,
@@ -66,6 +67,40 @@ def _d(valor) -> Decimal:
     return Decimal(str(valor if valor is not None else 0)).quantize(Decimal("0.01"))
 
 
+async def _resolver_cliente_id(
+    db: AsyncSession,
+    tenant_id: int,
+    cliente_id_payload,
+    usuario_id,
+) -> Optional[int]:
+    """Normaliza el `cliente_id` del payload al id real de `clientes`.
+
+    El dispositivo offline a veces envía el id de **usuario** (no tiene el id
+    del perfil de cliente). Si el valor no existe en `clientes`, se busca el
+    perfil por `usuario_id`; si tampoco existe, se devuelve None para no
+    violar la FK `carritos_cliente_id_fkey`.
+    """
+    if cliente_id_payload is not None:
+        directo = (await db.execute(
+            select(Cliente.id).where(
+                Cliente.id == int(cliente_id_payload),
+                Cliente.tenant_id == tenant_id,
+            )
+        )).scalar_one_or_none()
+        if directo is not None:
+            return int(directo)
+    referencia = usuario_id if usuario_id is not None else cliente_id_payload
+    if referencia is None:
+        return None
+    por_usuario = (await db.execute(
+        select(Cliente.id).where(
+            Cliente.usuario_id == int(referencia),
+            Cliente.tenant_id == tenant_id,
+        )
+    )).scalar_one_or_none()
+    return int(por_usuario) if por_usuario is not None else None
+
+
 async def _cargar_carrito(
     db: AsyncSession, tenant_id: int, uuid_valor: UUID
 ) -> Optional[Carrito]:
@@ -88,6 +123,7 @@ async def _crear_carrito_desde_payload(
     operacion,
     uuid_valor: UUID,
     payload: dict,
+    cliente_id: Optional[int] = None,
 ) -> Carrito:
     """Reconstruye el carrito del dispositivo sin hacer commit.
 
@@ -103,7 +139,7 @@ async def _crear_carrito_desde_payload(
         db,
         operacion.tenant_id,
         uuid_valor,
-        payload.get("cliente_id"),
+        cliente_id,
         operacion.dispositivo_id,
     )
     carrito.es_offline = True
@@ -146,11 +182,14 @@ async def manejar_orden_pago_diferido(
     if not uuid_raw:
         raise ValidationException("La operación requiere uuid_carrito")
     uuid_valor = _uuid(uuid_raw, "uuid_carrito")
+    cliente_id = await _resolver_cliente_id(
+        db, tenant_id, payload.get("cliente_id"), operacion.usuario_id
+    )
 
     carrito = await _cargar_carrito(db, tenant_id, uuid_valor)
     if carrito is None:
         carrito = await _crear_carrito_desde_payload(
-            db, operacion, uuid_valor, payload
+            db, operacion, uuid_valor, payload, cliente_id
         )
     if carrito is None:
         raise ValidationException("No se pudo reconstruir el carrito")
@@ -164,8 +203,8 @@ async def manejar_orden_pago_diferido(
         tenant_id,
         payload.get("sucursal_id") or operacion.sucursal_id,
     )
-    if payload.get("cliente_id") is not None and carrito.cliente_id is None:
-        carrito.cliente_id = int(payload["cliente_id"])
+    if cliente_id is not None and carrito.cliente_id is None:
+        carrito.cliente_id = cliente_id
 
     resultado = await OrdenDiferidaService.crear_orden_desde_carrito(
         db,
