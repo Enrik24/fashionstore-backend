@@ -25,6 +25,7 @@ from app.exceptions import (
     PagoNoEncontrado,
     ValidationException,
 )
+from app.apps.gestion_catalogo.models import VarianteProducto
 from app.apps.gestion_ventas.models import (
     Carrito,
     DetalleOrden,
@@ -109,6 +110,13 @@ async def _cargar_carrito(
         .options(
             selectinload(Carrito.items)
             .selectinload(ItemCarrito.variante_producto)
+            .selectinload(VarianteProducto.producto),
+            selectinload(Carrito.items)
+            .selectinload(ItemCarrito.variante_producto)
+            .selectinload(VarianteProducto.talla),
+            selectinload(Carrito.items)
+            .selectinload(ItemCarrito.variante_producto)
+            .selectinload(VarianteProducto.color),
         )
         .where(
             Carrito.uuid_carrito == uuid_valor,
