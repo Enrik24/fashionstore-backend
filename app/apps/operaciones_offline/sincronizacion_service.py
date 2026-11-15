@@ -18,7 +18,7 @@ from typing import Any, Iterable, Optional
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DataError, IntegrityError, ProgrammingError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -47,6 +47,9 @@ from app.apps.operaciones_offline.schemas import LoteSyncRequest, OperacionLoteI
 logger = logging.getLogger(__name__)
 
 TIPOS_VALIDOS = {t.value for t in TipoOperacionOffline}
+# Tope de reintentos ante errores transitorios de BD; superado, la operación
+# pasa a ERROR_CRITICO para revisión en lugar de reintentarse por siempre.
+MAX_INTENTOS_TRANSITORIOS = 5
 ESTADOS_REINTENTABLES = {
     EstadoSincronizacion.PENDIENTE,
     # [BUG-SYNC] ENVIADA también es reintentable: si la respuesta se perdió
@@ -499,14 +502,61 @@ class SincronizacionService:
                 reintentar=False,
                 codigo_http_sugerido=400,
             )
-        except SQLAlchemyError as exc:  # error transitorio de base de datos
+        except (IntegrityError, ProgrammingError, DataError) as exc:
+            # Error de BD permanente (unique/check/enum/esquema): reintentar no
+            # lo cura. Se marca crítico con el detalle real para revisión.
             await db.rollback()
+            operacion = await db.get(OperacionOffline, operacion_id)
+            cls._marcar_intento(operacion, intentos_previos)
+            detalle = str(exc.orig) if getattr(exc, "orig", None) else str(exc)
+            operacion.estado_sincronizacion = EstadoSincronizacion.ERROR_CRITICO
+            operacion.requiere_revision = True
+            operacion.error_detalle = detalle
+            operacion.resultado_json = {
+                "estado": EstadoSincronizacion.ERROR_CRITICO.value,
+                "motivo": "Error de base de datos al procesar la operación",
+                "detalle": detalle,
+                "reintentar": False,
+            }
+            await db.commit()
             return cls.construir_resultado(
                 uuid_operacion,
-                EstadoSincronizacion.PENDIENTE.value,
-                motivo="Error transitorio; reintente con backoff",
-                datos_resultado={"detalle": str(exc)},
-                reintentar=True,
+                EstadoSincronizacion.ERROR_CRITICO.value,
+                motivo="Error de base de datos al procesar la operación",
+                datos_resultado={"detalle": detalle},
+                reintentar=False,
+                codigo_http_sugerido=500,
+            )
+        except SQLAlchemyError as exc:  # error transitorio de base de datos
+            await db.rollback()
+            operacion = await db.get(OperacionOffline, operacion_id)
+            cls._marcar_intento(operacion, intentos_previos)
+            detalle = str(exc.orig) if getattr(exc, "orig", None) else str(exc)
+            agotado = (operacion.intentos or 0) >= MAX_INTENTOS_TRANSITORIOS
+            estado = (
+                EstadoSincronizacion.ERROR_CRITICO if agotado
+                else EstadoSincronizacion.PENDIENTE
+            )
+            motivo = (
+                "Error transitorio agotó reintentos; requiere revisión"
+                if agotado else "Error transitorio; reintente con backoff"
+            )
+            operacion.estado_sincronizacion = estado
+            operacion.requiere_revision = agotado
+            operacion.error_detalle = detalle
+            operacion.resultado_json = {
+                "estado": estado.value,
+                "motivo": motivo,
+                "detalle": detalle,
+                "reintentar": not agotado,
+            }
+            await db.commit()
+            return cls.construir_resultado(
+                uuid_operacion,
+                estado.value,
+                motivo=motivo,
+                datos_resultado={"detalle": detalle},
+                reintentar=not agotado,
                 codigo_http_sugerido=503,
             )
 
