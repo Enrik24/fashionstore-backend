@@ -108,7 +108,7 @@ class PagoDiferidoService:
             "numero_orden": await cls._numero_orden(db, pago.orden_id),
             "monto": pago.monto,
             "moneda": pago.moneda,
-            "estado": pago.estado.value if hasattr(pago.estado, "value") else str(pago.estado),
+            "estado": "REEMBOLSADO" if pago.reembolso_id else pago.estado.value,
             "stripe_payment_intent_id": pago.stripe_payment_intent_id,
             "stripe_checkout_session_id": pago.stripe_checkout_session_id,
             "checkout_url": pago.stripe_checkout_url,
@@ -188,6 +188,8 @@ class PagoDiferidoService:
             # RN-015: mismo uuid_pago → mismo estado, sin segundo cobro.
             return await cls.serializar(db, existente, duplicado=True)
 
+        from app.apps.pagos_diferidos.orden_diferida_service import OrdenDiferidaService
+        await OrdenDiferidaService.verificar_habilitacion(db, tenant_id)
         orden = await cls.resolver_orden(db, tenant_id, datos)
 
         if orden.estado == EstadoOrden.PAGADO:
@@ -254,9 +256,10 @@ class PagoDiferidoService:
         await db.flush()
 
         metadata = {
-            "tenant_id": tenant_id,
-            "uuid_pago": str(uuid_valor),
             **{k: str(v) for k, v in (datos.metadata or {}).items()},
+            "tenant_id": tenant_id,
+            "orden_id": orden.id,
+            "uuid_pago": str(uuid_valor),
         }
         try:
             intent = StripePagoService.crear_checkout_session(
@@ -353,6 +356,16 @@ class PagoDiferidoService:
         pago = await cls.obtener_pago(db, uuid_pago, tenant_id)
         if pago.estado == EstadoPagoDiferido.CONFIRMADO:
             return await cls.serializar(db, pago, duplicado=True)
+        await db.refresh(pago, with_for_update=True)
+        if pago.reembolso_id:
+            raise ConflictException("Un pago reembolsado no admite reintentos")
+        from app.apps.pagos_diferidos.orden_diferida_service import OrdenDiferidaService
+        await OrdenDiferidaService.verificar_habilitacion(db, tenant_id)
+        orden = await db.get(Orden, pago.orden_id)
+        if orden is None or orden.estado != EstadoOrden.PENDIENTE_PAGO_DIFERIDO:
+            raise ConflictException("La orden ya no admite pagos")
+        if await ConciliacionService.verificar_orden_cobrable(db, orden):
+            raise ConflictException("La orden expiró antes del reintento")
         if pago.estado not in {
             EstadoPagoDiferido.RECHAZADO,
             EstadoPagoDiferido.ERROR_CRITICO,

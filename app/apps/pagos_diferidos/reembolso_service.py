@@ -47,6 +47,8 @@ class ReembolsoService:
         motivo: Optional[str] = None,
         usuario_id: Optional[int] = None,
     ) -> dict:
+        await db.flush()
+        await db.refresh(pago, with_for_update=True)
         if pago.reembolso_id:
             # Regla de oro: jamás se reembolsa dos veces el mismo pago.
             return {
@@ -94,6 +96,21 @@ class ReembolsoService:
                 "usuario_id": usuario_id,
                 "fecha_reembolso": datetime.utcnow().isoformat(),
             }
+        from app.apps.gestion_ventas.models import Orden, CanalNotificacion
+        from app.services.notificacion_service import NotificacionService
+        orden = await db.get(Orden, pago.orden_id)
+        await NotificacionService.crear(
+            db, tenant_id=pago.tenant_id, cliente_id=orden.cliente_id if orden else None,
+            usuario_id=None, tipo="REEMBOLSO_PAGO_DIFERIDO",
+            asunto="Reembolso de pedido", mensaje=f"Se reembolsaron {monto_reembolso} {pago.moneda}. {motivo or ''}",
+            referencia=("pago_diferido", pago.id),
+        )
+        await NotificacionService.crear(
+            db, tenant_id=pago.tenant_id, cliente_id=None, usuario_id=None,
+            tipo="REEMBOLSO_PAGO_DIFERIDO_ADMIN", asunto="Pedido reembolsado: revisión requerida",
+            mensaje=f"Orden {pago.orden_id}: {motivo or 'Reembolso solicitado'}",
+            canales=[CanalNotificacion.PUSH], referencia=("pago_diferido", pago.id),
+        )
         await db.flush()
         return {
             "reembolso_id": pago.reembolso_id,

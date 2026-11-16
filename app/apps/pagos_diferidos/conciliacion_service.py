@@ -125,25 +125,24 @@ class ConciliacionService:
 
     @staticmethod
     async def _consumir_stock_reservado(db: AsyncSession, orden: Orden) -> None:
-        if orden.sucursal_id is None:
-            return
-        for detalle in orden.detalles:
+        from app.exceptions import OperacionRechazada
+
+        if orden.sucursal_id is None or not orden.detalles:
+            raise OperacionRechazada("La orden no tiene una reserva de stock válida")
+        detalles = sorted(orden.detalles, key=lambda item: item.variante_producto_id or 0)
+        for detalle in detalles:
             if not detalle.variante_producto_id:
-                continue
+                raise OperacionRechazada("La variante de la orden ya no existe")
             inventario = await InventarioVentasService.obtener_o_crear_inventario(
-                db,
-                detalle.variante_producto_id,
-                orden.sucursal_id,
-                for_update=True,
+                db, detalle.variante_producto_id, orden.sucursal_id, for_update=True,
             )
-            if (inventario.cantidad_reservada or 0) >= detalle.cantidad:
-                await InventarioVentasService.liberar_stock_reserva(
-                    db,
-                    detalle.variante_producto_id,
-                    orden.sucursal_id,
-                    detalle.cantidad,
-                    comprar=True,
-                )
+            if ((inventario.cantidad_reservada or 0) < detalle.cantidad
+                    or inventario.cantidad < detalle.cantidad):
+                raise OperacionRechazada("La reserva o el stock físico son insuficientes")
+        for detalle in detalles:
+            await InventarioVentasService.liberar_stock_reserva(
+                db, detalle.variante_producto_id, orden.sucursal_id, detalle.cantidad, comprar=True,
+            )
 
     @staticmethod
     async def _liberar_stock_reservado(db: AsyncSession, orden: Orden) -> None:
@@ -208,14 +207,21 @@ class ConciliacionService:
         datos_stripe: Optional[dict] = None,
         evento: Optional[EventoStripe] = None,
     ) -> dict:
-        if pago.estado == EstadoPagoDiferido.CONFIRMADO:
-            return {"estado": pago.estado.value, "duplicado": True}
+        await db.flush()
+        await db.refresh(pago, with_for_update=True)
+        if pago.reembolso_id or pago.estado == EstadoPagoDiferido.CONFIRMADO:
+            if evento is not None:
+                evento.procesado = True
+                evento.fecha_procesamiento = datetime.utcnow()
+                evento.error_detalle = None
+            return {"estado": "REEMBOLSADO" if pago.reembolso_id else pago.estado.value, "duplicado": True}
 
         result = await db.execute(
             select(Orden)
             .options(selectinload(Orden.detalles))
-            .where(Orden.id == pago.orden_id)
-            .execution_options(ignorar_tenant=True)
+            .where(Orden.id == pago.orden_id, Orden.tenant_id == pago.tenant_id)
+            .with_for_update()
+            .execution_options(ignorar_tenant=True, populate_existing=True)
         )
         orden = result.scalar_one_or_none()
         if orden is None:
@@ -241,6 +247,7 @@ class ConciliacionService:
         # RN-017: tenant suspendido → la orden queda pendiente de regularización
         if tenant is not None and tenant.estado != EstadoTenant.OPERATIVO:
             orden.estado = EstadoOrden.PENDIENTE_REGULARIZACION
+            await cls._liberar_stock_reservado(db, orden)
             await cls.registrar_conflicto_pago(
                 db,
                 pago,
@@ -281,13 +288,34 @@ class ConciliacionService:
             await db.flush()
             return {"estado": pago.estado.value, "reembolsado": True, "motivo": "ORDEN_EXPIRADA"}
 
-        # Confirmación normal
+        from app.apps.pagos_diferidos.orden_diferida_service import OrdenDiferidaService
+        from app.exceptions import OperacionRechazada, CarritoNoHabilitado
+        try:
+            await OrdenDiferidaService.verificar_habilitacion(db, pago.tenant_id)
+            objeto = datos_stripe or {}
+            monto = objeto.get("amount_total", objeto.get("amount_received", objeto.get("amount")))
+            if ((monto is not None and Decimal(str(monto)) != pago.monto * 100)
+                    or (objeto.get("currency") and objeto["currency"].upper() != pago.moneda.upper())):
+                raise OperacionRechazada("El importe o moneda capturados no corresponden a la orden")
+            await cls._consumir_stock_reservado(db, orden)
+        except (OperacionRechazada, CarritoNoHabilitado) as exc:
+            orden.estado = EstadoOrden.PENDIENTE_REGULARIZACION
+            await cls._liberar_stock_reservado(db, orden)
+            await cls.registrar_conflicto_pago(db, pago, TipoConflicto.STOCK_INSUFICIENTE.value,
+                                              {"motivo": str(exc), "orden_id": orden.id})
+            await ReembolsoService.reembolsar_por_orden_rechazada(db, pago, str(exc))
+            if evento is not None:
+                evento.procesado = True
+                evento.fecha_procesamiento = ahora
+                evento.error_detalle = None
+            await db.flush()
+            return {"estado": "REEMBOLSADO", "reembolsado": True}
+
         pago.estado = EstadoPagoDiferido.CONFIRMADO
         pago.fecha_ultimo_intento = ahora
         pago.ultimo_error = None
         orden.estado = EstadoOrden.PAGADO
 
-        await cls._consumir_stock_reservado(db, orden)
         transaccion = await cls._transaccion_confirmada(db, pago, datos_stripe)
         transaccion.estado = EstadoTransaccion.CONFIRMADO
         comprobante = await cls._emitir_comprobante(db, orden, pago)
@@ -352,6 +380,14 @@ class ConciliacionService:
             return {"procesado": False, "motivo": "PAGO_NO_ENCONTRADO"}
 
         evento.pago_diferido_id = pago.id
+        evento.tenant_id = pago.tenant_id
+        if payment_intent_id and not pago.stripe_payment_intent_id:
+            pago.stripe_payment_intent_id = payment_intent_id
+        if (pago.reembolso_id or pago.estado == EstadoPagoDiferido.CONFIRMADO) and tipo != "charge.refunded":
+            evento.procesado = True
+            evento.fecha_procesamiento = datetime.utcnow()
+            evento.error_detalle = None
+            return {"estado": "REEMBOLSADO" if pago.reembolso_id else pago.estado.value, "duplicado": True}
 
         if tipo == "payment_intent.succeeded":
             resultado = await cls.confirmar_pago(db, pago, datos_stripe=objeto, evento=evento)

@@ -220,6 +220,8 @@ class StripePagoService:
             "id": session.id,
             "status": session.status,
             "payment_status": session.payment_status,
+            "amount_total": session.amount_total,
+            "currency": session.currency,
             "payment_intent": session.payment_intent,
             "url": session.url,
             "metadata": dict(session.metadata or {}),
@@ -236,8 +238,10 @@ class StripePagoService:
             return {"id": session_id, "status": "expired", "simulado": True}
         try:
             session = stripe.checkout.Session.expire(session_id)
-        except stripe.error.StripeError:
-            return {"id": session_id, "status": "expired"}
+        except (stripe.error.APIConnectionError, stripe.error.RateLimitError) as exc:
+            raise StripeErrorTransitorio(str(exc))
+        except stripe.error.StripeError as exc:
+            raise StripeErrorPago(str(exc))
         return {"id": session.id, "status": session.status, "simulado": False}
 
     @classmethod

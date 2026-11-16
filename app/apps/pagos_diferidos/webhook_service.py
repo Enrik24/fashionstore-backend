@@ -15,7 +15,9 @@ import logging
 import time
 from typing import Optional
 
+from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -96,7 +98,7 @@ class WebhookService:
             .where(EventoStripe.stripe_event_id == stripe_event_id)
             .execution_options(ignorar_tenant=True)
         )).scalar_one_or_none()
-        if existente is not None:
+        if existente is not None and existente.procesado:
             return {
                 "recibido": True,
                 "evento": stripe_event_id,
@@ -114,7 +116,7 @@ class WebhookService:
         )
 
         # El webhook no tiene JWT: el tenant se deduce del pago o de la metadata.
-        evento = EventoStripe(
+        evento = existente or EventoStripe(
             tenant_id=int(tenant_id) if tenant_id else None,
             stripe_event_id=stripe_event_id,
             tipo=tipo,
@@ -131,23 +133,35 @@ class WebhookService:
         db.add(evento)
         # Se confirma el registro antes de aplicar el efecto: si el proceso
         # falla, el evento no se pierde y puede reintentarse.
-        await db.commit()
-        await db.refresh(evento)
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+        evento = (await db.execute(
+            select(EventoStripe).where(EventoStripe.stripe_event_id == stripe_event_id)
+            .with_for_update().execution_options(ignorar_tenant=True, populate_existing=True)
+        )).scalar_one()
+        if evento.procesado:
+            return {"recibido": True, "evento": stripe_event_id, "procesado": True, "duplicado": True}
 
         try:
             from app.apps.pagos_diferidos.conciliacion_service import ConciliacionService
 
             resultado = await ConciliacionService.aplicar_evento(db, evento)
             await db.commit()
+            if not evento.procesado:
+                raise HTTPException(status_code=503, detail="Evento pendiente de conciliación")
             return {
                 "recibido": True,
                 "evento": stripe_event_id,
                 "tipo": tipo,
                 "procesado": bool(evento.procesado),
-                "duplicado": False,
+                "duplicado": existente is not None,
                 "motivo": None if evento.procesado else resultado.get("motivo"),
             }
-        except Exception as exc:  # el webhook siempre debe responder 200
+        except HTTPException:
+            raise
+        except Exception as exc:
             await db.rollback()
             evento = (await db.execute(
                 select(EventoStripe)
@@ -159,11 +173,4 @@ class WebhookService:
                 evento.procesado = False
                 await db.commit()
             logger.exception("Error procesando webhook %s", stripe_event_id)
-            return {
-                "recibido": True,
-                "evento": stripe_event_id,
-                "tipo": tipo,
-                "procesado": False,
-                "duplicado": False,
-                "motivo": str(exc),
-            }
+            raise HTTPException(status_code=503, detail="No se pudo conciliar el evento; se reintentará") from exc

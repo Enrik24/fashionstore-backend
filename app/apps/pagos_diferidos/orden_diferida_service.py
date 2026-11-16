@@ -25,6 +25,8 @@ from app.apps.gestion_ventas.models import (
     TipoOrden,
 )
 from app.apps.gestion_ventas.services import (
+    CarritoService,
+    CuponService,
     InventarioVentasService,
     OrdenService,
 )
@@ -39,7 +41,34 @@ def _d(valor) -> Decimal:
 class OrdenDiferidaService:
 
     @staticmethod
-    async def calcular_totales(carrito: Carrito) -> dict:
+    async def verificar_habilitacion(db: AsyncSession, tenant_id: int) -> None:
+        from sqlalchemy import select
+        from app.tenant import get_suscripcion_activa
+        from app.exceptions import CarritoNoHabilitado, OperacionRechazada, SuscripcionVencida
+        from app.apps.gestion_saas.models import Tenant, EstadoTenant
+        from app.apps.operaciones_offline.models import ConfiguracionOffline, TipoConflicto
+
+        tenant = await db.get(Tenant, tenant_id)
+        try:
+            suscripcion = await get_suscripcion_activa(db, tenant_id)
+            habilitado = bool(suscripcion.plan.permite_pago_diferido)
+        except SuscripcionVencida:
+            habilitado = False
+        if tenant is None or tenant.estado != EstadoTenant.OPERATIVO or not habilitado:
+            raise OperacionRechazada(
+                "El pedido se conserva pendiente de regularización del tenant o su suscripción",
+                tipo_conflicto=TipoConflicto.TENANT_SUSPENDIDO.value,
+                estrategia="MANUAL",
+                datos={"estado": "PENDIENTE_REGULARIZACION", "requiere_pago": False},
+            )
+        config = (await db.execute(select(ConfiguracionOffline).where(
+            ConfiguracionOffline.tenant_id == tenant_id
+        ))).scalar_one_or_none()
+        if config is None or not config.habilitar_carrito_offline:
+            raise CarritoNoHabilitado()
+
+    @staticmethod
+    async def calcular_totales(db: AsyncSession, carrito: Carrito, cupon_codigo: Optional[str] = None) -> dict:
         subtotal_local = Decimal("0.00")
         subtotal_servidor = Decimal("0.00")
         items: list[dict] = []
@@ -47,8 +76,12 @@ class OrdenDiferidaService:
 
         for item in carrito.items:
             variante = item.variante_producto
-            if variante is None:
-                raise ValidationException("El carrito contiene una variante inexistente")
+            if (variante is None or variante.deleted_at is not None
+                    or variante.tenant_id != carrito.tenant_id or variante.producto is None
+                    or variante.producto.deleted_at is not None
+                    or variante.producto.tenant_id != carrito.tenant_id
+                    or variante.producto.estado != "ACTIVO" or item.cantidad <= 0):
+                raise ValidationException("El carrito contiene un producto inactivo o una variante no disponible")
             precio_servidor = _d(
                 variante.precio_variante
                 if variante.precio_variante is not None
@@ -77,13 +110,36 @@ class OrdenDiferidaService:
                 "subtotal": _d(precio_servidor * item.cantidad),
             })
 
+        for item, calculado in zip(carrito.items, items):
+            item.precio_unitario = calculado["precio_servidor"]
+            item.subtotal = calculado["subtotal"]
+        promocion = await CarritoService.calcular_descuento_promocion(db, carrito.items)
+        descuento = _d(promocion["descuento"])
+        cupon = {"aplicable": False, "motivo": "Sin cupón"}
+        if cupon_codigo:
+            valido, mensaje, registro, descuento_cupon = await CuponService.validar_cupon(
+                db, cupon_codigo, subtotal_servidor, items=carrito.items
+            )
+            cupon = {"codigo": cupon_codigo, "aplicable": valido and descuento == 0, "motivo": mensaje}
+            if valido and descuento == 0:
+                carrito.cupon_id = registro.id
+                descuento = _d(descuento_cupon)
+            else:
+                carrito.cupon_id = None
+                if descuento > 0:
+                    cupon["motivo"] = "No acumulable con la promoción vigente"
+        total = _d(max(Decimal("0.00"), subtotal_servidor - descuento))
+        if total != _d(subtotal_local) and not diferencias:
+            diferencias.append({"tipo": "TOTAL_RECALCULADO", "total_local": float(subtotal_local),
+                                "total_servidor": float(total), "descuento": float(descuento)})
         return {
             "items": items,
             "subtotal_local": _d(subtotal_local),
             "subtotal_servidor": _d(subtotal_servidor),
-            "descuento": Decimal("0.00"),
-            "total_servidor": _d(subtotal_servidor),
+            "descuento": descuento,
+            "total_servidor": total,
             "diferencias": diferencias,
+            "cupon": cupon,
         }
 
     @classmethod
@@ -95,14 +151,19 @@ class OrdenDiferidaService:
         acepta_nuevo_total: bool = False,
         direccion_envio: Optional[str] = None,
         sucursal_id: Optional[int] = None,
+        uuid_orden=None,
+        cupon_codigo: Optional[str] = None,
+        total_aceptado=None,
     ) -> dict:
         if carrito.estado != EstadoCarrito.ACTIVO:
             raise ValidationException("El carrito no está activo")
         if not carrito.items:
             raise ValidationException("No se puede convertir un carrito vacío")
 
-        totales = await cls.calcular_totales(carrito)
-        if totales["diferencias"] and not acepta_nuevo_total:
+        await cls.verificar_habilitacion(db, tenant_id)
+        totales = await cls.calcular_totales(db, carrito, cupon_codigo)
+        aceptado = acepta_nuevo_total and (total_aceptado is None or _d(total_aceptado) == totales["total_servidor"])
+        if totales["diferencias"] and not aceptado:
             raise AceptacionRequerida(
                 totales["subtotal_local"],
                 totales["total_servidor"],
@@ -163,10 +224,11 @@ class OrdenDiferidaService:
             estado=EstadoOrden.PENDIENTE_PAGO_DIFERIDO,
             total=totales["total_servidor"],
             impuestos=Decimal("0.00"),
-            descuentos=Decimal("0.00"),
+            descuentos=totales["descuento"],
+            cupon_id=carrito.cupon_id,
             direccion_envio=direccion_envio,
             tenant_id=tenant_id,
-            uuid_orden=uuid4(),
+            uuid_orden=uuid_orden or uuid4(),
             origen=OrigenOperacion.OFFLINE,
             es_offline=True,
             estado_sincronizacion=EstadoSincronizacion.CONFIRMADA,
@@ -198,7 +260,7 @@ class OrdenDiferidaService:
             "numero_orden": orden.numero_orden,
             "uuid_orden": str(orden.uuid_orden),
             "estado": orden.estado.value,
-            "subtotal": totales["total_servidor"],
+            "subtotal": totales["subtotal_servidor"],
             "descuento": totales["descuento"],
             "total": totales["total_servidor"],
             "moneda": orden.moneda,

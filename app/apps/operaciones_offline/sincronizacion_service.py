@@ -362,6 +362,15 @@ class SincronizacionService:
                 operacion.fecha_ultimo_intento = datetime.utcnow()
                 await db.flush()
 
+                from app.apps.gestion_saas.models import Tenant, EstadoTenant
+                tenant = await db.get(Tenant, operacion.tenant_id)
+                if tenant is None or tenant.estado != EstadoTenant.OPERATIVO:
+                    raise OperacionRechazada(
+                        "Operación conservada pendiente de regularización del tenant",
+                        tipo_conflicto=TipoConflicto.TENANT_SUSPENDIDO.value,
+                        estrategia="MANUAL",
+                        datos={"estado": "PENDIENTE_REGULARIZACION", "requiere_pago": False},
+                    )
                 manejador = obtener_manejador(tipo)
                 datos = await manejador(db, operacion, contexto)
                 if datos is None:
@@ -633,6 +642,8 @@ class SincronizacionService:
             # se persiste en el payload para que el reintento no vuelva a pedir
             # aceptación ni dependa de un reenvío del dispositivo.
             payload["acepta_nuevo_total"] = bool(acepta_nuevo_total)
+            if acepta_nuevo_total:
+                payload["total_aceptado"] = (operacion.resultado_json or {}).get("total_nuevo")
             operacion.payload_json = payload
 
         item = OperacionLoteItem(

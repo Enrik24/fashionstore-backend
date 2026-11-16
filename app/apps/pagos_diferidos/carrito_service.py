@@ -417,7 +417,7 @@ class CarritoOfflineService:
     ) -> dict:
         carrito = await cls.obtener_carrito(db, uuid_carrito, tenant_id)
         sucursal = await cls.resolver_sucursal(db, tenant_id, sucursal_id)
-        totales = await OrdenDiferidaService.calcular_totales(carrito)
+        totales = await OrdenDiferidaService.calcular_totales(db, carrito, cupon_codigo)
         conflictos = await ConflictoService.detectar_stock(
             db,
             tenant_id,
@@ -425,13 +425,7 @@ class CarritoOfflineService:
             [{"variante_producto_id": i["variante_producto_id"], "cantidad": i["cantidad"]}
              for i in totales["items"]],
         )
-        cupon = {"aplicable": False, "motivo": "El cupón solo se valida con conexión"}
-        if cupon_codigo:
-            cupon = {
-                "codigo": cupon_codigo,
-                "aplicable": False,
-                "motivo": "RN-014: el cupón no se puede validar sin conexión",
-            }
+        cupon = totales["cupon"]
         return CarritoValidacionResponse(
             carrito_id=carrito.id,
             uuid_carrito=str(carrito.uuid_carrito),

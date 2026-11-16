@@ -2,10 +2,10 @@
 [EXAMEN-2] Schemas Pydantic de la Fase 1 — sesión offline y dispositivos
 (CU17). La descarga y el motor de sincronización pertenecen a la Fase 2.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.apps.gestion_saas.schemas import ConfiguracionOfflineResponse
 
@@ -60,6 +60,11 @@ class SesionOfflineResponse(BaseModel):
     permisos: list[str]
     configuracion: ConfiguracionOfflineResponse
     ultima_descarga: Optional[datetime] = None
+
+    @field_validator("expira_en", "ultima_descarga")
+    @classmethod
+    def fechas_utc(cls, value):
+        return value.replace(tzinfo=timezone.utc) if value and value.tzinfo is None else value
 
 
 class RenovarSesionRequest(BaseModel):

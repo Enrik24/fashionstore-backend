@@ -15,7 +15,7 @@ from datetime import date
 from logging import Filter, LogRecord
 from typing import Any, Iterable, Optional
 
-from fastapi import Depends, Header, status
+from fastapi import Depends, Header, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -502,6 +502,7 @@ async def require_sesion_offline_valida(
 
 
 async def autenticacion_flexible(
+    request: Request,
     credentials=Depends(security_optional),
     x_device_id: Optional[str] = Header(default=None, alias="X-Device-ID"),
     x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-ID"),
@@ -551,7 +552,12 @@ async def autenticacion_flexible(
         raise SesionOfflineVencida("El token pertenece a otro tenant")
 
     tenant = await get_tenant_por_id(db, tenant_id)
-    if tenant.estado in {EstadoTenant.SUSPENDIDO, EstadoTenant.CANCELADO}:
+    recepcion_offline = request.method == "POST" and (
+        request.url.path == "/api/v1/offline/sync"
+        or (request.url.path.startswith("/api/v1/offline/operaciones/")
+            and request.url.path.endswith("/reintentar"))
+    )
+    if tenant.estado in {EstadoTenant.SUSPENDIDO, EstadoTenant.CANCELADO} and not recepcion_offline:
         raise TenantSuspendido()
 
     dispositivo = None

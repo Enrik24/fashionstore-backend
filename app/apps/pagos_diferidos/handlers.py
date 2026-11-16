@@ -193,6 +193,17 @@ async def manejar_orden_pago_diferido(
     payload = operacion.payload_json or {}
     tenant_id = operacion.tenant_id
 
+    await OrdenDiferidaService.verificar_habilitacion(db, tenant_id)
+    if payload.get("uuid_pago"):
+        existente = await _buscar_pago_global(db, _uuid(payload["uuid_pago"], "uuid_pago"))
+        if existente is not None:
+            if existente.tenant_id != tenant_id:
+                raise PagoNoEncontrado()
+            orden = await _resolver_orden(db, tenant_id, {"orden_id": existente.orden_id})
+            return {"orden_id": orden.id, "uuid_orden": str(orden.uuid_orden),
+                    "uuid_pago": str(existente.uuid_pago), "requiere_pago": existente.estado != EstadoPagoDiferido.CONFIRMADO,
+                    "pago": _serializar_pago(existente, orden, duplicado=True)}
+
     uuid_raw = payload.get("uuid_carrito") or payload.get("uuid")
     if not uuid_raw:
         raise ValidationException("La operación requiere uuid_carrito")
@@ -228,6 +239,9 @@ async def manejar_orden_pago_diferido(
         acepta_nuevo_total=bool(payload.get("acepta_nuevo_total")),
         direccion_envio=payload.get("direccion_envio"),
         sucursal_id=sucursal_id,
+        uuid_orden=_uuid(payload["uuid_orden"], "uuid_orden") if payload.get("uuid_orden") else None,
+        cupon_codigo=payload.get("cupon_codigo"),
+        total_aceptado=payload.get("total_aceptado"),
     )
 
     # [EXAMEN-2] CU16/RN-015: la orden sola no habilita el cobro. Con el
@@ -344,6 +358,7 @@ async def _crear_pago_para_orden(
     La confirmación nunca ocurre aquí: el intent queda en
     `REQUIERE_ACCION_CLIENTE` y llega por webhook o verificación directa.
     """
+    await OrdenDiferidaService.verificar_habilitacion(db, tenant_id)
     if orden.estado == EstadoOrden.PAGADO:
         raise PagoDuplicado("La orden ya está pagada")
     if orden.estado in {EstadoOrden.CANCELADO, EstadoOrden.PAGO_VENCIDO}:
@@ -405,6 +420,7 @@ async def _crear_pago_para_orden(
             moneda=pago.moneda,
             metadata={
                 "tenant_id": tenant_id,
+                "orden_id": orden.id,
                 "uuid_pago": str(uuid_valor),
             },
             idempotency_key=str(uuid_valor),
