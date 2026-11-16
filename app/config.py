@@ -90,6 +90,10 @@ class Settings(BaseSettings):
     STRIPE_CANCEL_URL: str = "http://localhost:4200/pago-cancelado"
     STRIPE_SUSCRIPCION_SUCCESS_URL: str = "http://localhost:4200/suscripcion-exitosa"
     STRIPE_SUSCRIPCION_CANCEL_URL: str = "http://localhost:4200/suscripcion-cancelada"
+    # Retorno del Checkout de pagos diferidos: base de la ruta
+    # /checkout/pago-pendiente; el servicio añade /{uuid_pago}.
+    STRIPE_PAGO_DIFERIDO_SUCCESS_URL: str = "http://localhost:4200/checkout/pago-pendiente"
+    STRIPE_PAGO_DIFERIDO_CANCEL_URL: str = "http://localhost:4200/checkout/pago-pendiente"
     
     # PayPal
     PAYPAL_CLIENT_ID: str = ""

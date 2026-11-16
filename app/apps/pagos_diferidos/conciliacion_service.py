@@ -333,6 +333,13 @@ class ConciliacionService:
             pago = await db.get(PagoDiferido, evento.pago_diferido_id)
         if pago is None and payment_intent_id:
             pago = await cls.obtener_pago_por_intent(db, payment_intent_id)
+        if pago is None and str(objeto.get("id") or "").startswith("cs_"):
+            result = await db.execute(
+                select(PagoDiferido)
+                .where(PagoDiferido.stripe_checkout_session_id == objeto["id"])
+                .execution_options(ignorar_tenant=True)
+            )
+            pago = result.scalar_one_or_none()
         if pago is None and objeto.get("metadata", {}).get("uuid_pago"):
             from app.apps.pagos_diferidos.pago_service import PagoDiferidoService
             pago = await PagoDiferidoService.buscar_por_uuid(db, objeto["metadata"]["uuid_pago"])
@@ -348,6 +355,17 @@ class ConciliacionService:
 
         if tipo == "payment_intent.succeeded":
             resultado = await cls.confirmar_pago(db, pago, datos_stripe=objeto, evento=evento)
+        elif tipo == "checkout.session.completed":
+            if objeto.get("payment_status") == "paid":
+                pi_id = objeto.get("payment_intent")
+                if pi_id and not pago.stripe_payment_intent_id:
+                    pago.stripe_payment_intent_id = pi_id
+                resultado = await cls.confirmar_pago(db, pago, datos_stripe=objeto, evento=evento)
+            else:
+                # Sesión completada pero aún sin cobro (p. ej. método asíncrono).
+                evento.procesado = True
+                evento.fecha_procesamiento = datetime.utcnow()
+                resultado = {"estado": pago.estado.value, "pendiente_pago": True}
         elif tipo == "payment_intent.payment_failed":
             error = (objeto.get("last_payment_error") or {}).get("message") or "Cobro rechazado"
             pago.estado = EstadoPagoDiferido.RECHAZADO
@@ -403,7 +421,7 @@ class ConciliacionService:
     async def reconciliar_eventos_pendientes(
         cls, db: AsyncSession, pago: PagoDiferido
     ) -> int:
-        if not pago.stripe_payment_intent_id:
+        if not pago.stripe_payment_intent_id and not pago.stripe_checkout_session_id:
             return 0
         result = await db.execute(
             select(EventoStripe)
@@ -418,7 +436,11 @@ class ConciliacionService:
                 str(objeto.get("payment_intent") or ""),
                 str((objeto.get("metadata") or {}).get("uuid_pago") or ""),
             }
-            if pago.stripe_payment_intent_id in candidatos or str(pago.uuid_pago) in candidatos:
+            if (
+                pago.stripe_payment_intent_id in candidatos
+                or str(pago.uuid_pago) in candidatos
+                or (pago.stripe_checkout_session_id and pago.stripe_checkout_session_id in candidatos)
+            ):
                 await cls.aplicar_evento(db, evento)
                 procesados += 1
         if procesados:

@@ -40,6 +40,7 @@ from app.apps.operaciones_offline.schemas import (
     LoteSyncRequest,
     PinConfigurarRequest,
     PinConfigurarResponse,
+    ReintentoOperacionRequest,
     RenovarSesionRequest,
     ResolverConflictoRequest,
     RevocacionRequest,
@@ -445,6 +446,7 @@ async def obtener_operacion_offline(
 @router.post("/operaciones/{uuid_operacion}/reintentar")
 async def reintentar_operacion_offline(
     uuid_operacion: str,
+    datos: Optional[ReintentoOperacionRequest] = None,
     contexto=Depends(autenticacion_flexible),
     db: AsyncSession = Depends(get_db),
 ):
@@ -452,7 +454,10 @@ async def reintentar_operacion_offline(
         db, uuid_operacion, int(contexto["tenant"].id)
     )
     return await SincronizacionService.reintentar_operacion(
-        db, operacion.uuid_operacion, contexto["usuario"].id
+        db,
+        operacion.uuid_operacion,
+        contexto["usuario"].id,
+        acepta_nuevo_total=datos.acepta_nuevo_total if datos is not None else None,
     )
 
 

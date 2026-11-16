@@ -13,7 +13,8 @@ Diseño obligatorio del plan 9.2.5:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any, Iterable, Optional
 from uuid import UUID, uuid4
 
@@ -45,6 +46,21 @@ from app.apps.operaciones_offline.registro_manejadores import obtener_manejador
 from app.apps.operaciones_offline.schemas import LoteSyncRequest, OperacionLoteItem
 
 logger = logging.getLogger(__name__)
+
+
+def _json_safe(valor: Any) -> Any:
+    """Los manejadores devuelven Decimal/datetime/UUID: la columna JSON no los serializa."""
+    if isinstance(valor, Decimal):
+        return float(valor)
+    if isinstance(valor, (datetime, date)):
+        return valor.isoformat()
+    if isinstance(valor, UUID):
+        return str(valor)
+    if isinstance(valor, dict):
+        return {clave: _json_safe(item) for clave, item in valor.items()}
+    if isinstance(valor, (list, tuple)):
+        return [_json_safe(item) for item in valor]
+    return valor
 
 TIPOS_VALIDOS = {t.value for t in TipoOperacionOffline}
 # Tope de reintentos ante errores transitorios de BD; superado, la operación
@@ -350,6 +366,7 @@ class SincronizacionService:
                 datos = await manejador(db, operacion, contexto)
                 if datos is None:
                     datos = {}
+                datos = _json_safe(datos)
 
                 operacion.estado_sincronizacion = EstadoSincronizacion.CONFIRMADA
                 operacion.resultado_json = datos
@@ -596,7 +613,11 @@ class SincronizacionService:
     # ------------------------------------------------------------------
     @classmethod
     async def reintentar_operacion(
-        cls, db: AsyncSession, uuid_operacion, usuario_id: int
+        cls,
+        db: AsyncSession,
+        uuid_operacion,
+        usuario_id: int,
+        acepta_nuevo_total: Optional[bool] = None,
     ) -> dict:
         operacion = await cls.obtener_operacion_global(db, uuid_operacion)
         if operacion.estado_sincronizacion == EstadoSincronizacion.CONFIRMADA:
@@ -606,6 +627,14 @@ class SincronizacionService:
                 f"La operación está en estado {operacion.estado_sincronizacion.value} y no es reintentable"
             )
 
+        payload = dict(operacion.payload_json or {})
+        if acepta_nuevo_total is not None:
+            # El cliente aceptó explícitamente el total recalculado (RN-007):
+            # se persiste en el payload para que el reintento no vuelva a pedir
+            # aceptación ni dependa de un reenvío del dispositivo.
+            payload["acepta_nuevo_total"] = bool(acepta_nuevo_total)
+            operacion.payload_json = payload
+
         item = OperacionLoteItem(
             uuid_operacion=str(operacion.uuid_operacion),
             dispositivo_id=str(operacion.dispositivo_id),
@@ -613,7 +642,7 @@ class SincronizacionService:
             tipo_operacion=str(operacion.tipo_operacion.value),
             sucursal_id=operacion.sucursal_id,
             fecha_registro_local=operacion.fecha_registro_local,
-            payload=operacion.payload_json or {},
+            payload=payload,
         )
         operacion.estado_sincronizacion = EstadoSincronizacion.PENDIENTE
         operacion.requiere_revision = False

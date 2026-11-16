@@ -216,5 +216,10 @@ class ResolverConflictoRequest(BaseModel):
     observacion: Optional[str] = None
 
 
+class ReintentoOperacionRequest(BaseModel):
+    # RN-007: aceptación explícita del total recalculado por el servidor.
+    acepta_nuevo_total: Optional[bool] = None
+
+
 class DescartarConflictoRequest(BaseModel):
     motivo: Optional[str] = None

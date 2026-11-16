@@ -110,6 +110,8 @@ class PagoDiferidoService:
             "moneda": pago.moneda,
             "estado": pago.estado.value if hasattr(pago.estado, "value") else str(pago.estado),
             "stripe_payment_intent_id": pago.stripe_payment_intent_id,
+            "stripe_checkout_session_id": pago.stripe_checkout_session_id,
+            "checkout_url": pago.stripe_checkout_url,
             "client_secret": pago.client_secret,
             "requiere_accion": pago.estado == EstadoPagoDiferido.REQUIERE_ACCION_CLIENTE,
             "idempotency_key": pago.idempotency_key,
@@ -253,12 +255,11 @@ class PagoDiferidoService:
 
         metadata = {
             "tenant_id": tenant_id,
-            "orden_id": orden.id,
             "uuid_pago": str(uuid_valor),
             **{k: str(v) for k, v in (datos.metadata or {}).items()},
         }
         try:
-            intent = StripePagoService.crear_payment_intent(
+            intent = StripePagoService.crear_checkout_session(
                 uuid_pago=str(uuid_valor),
                 monto=pago.monto,
                 moneda=pago.moneda,
@@ -266,6 +267,8 @@ class PagoDiferidoService:
                 idempotency_key=str(uuid_valor),
             )
             pago.stripe_payment_intent_id = intent["id"]
+            pago.stripe_checkout_session_id = intent.get("checkout_session_id")
+            pago.stripe_checkout_url = intent.get("checkout_url")
             pago.client_secret = intent.get("client_secret")
             pago.estado = EstadoPagoDiferido.REQUIERE_ACCION_CLIENTE
             transaccion.stripe_payment_intent_id = intent["id"]
@@ -290,8 +293,9 @@ class PagoDiferidoService:
         await db.commit()
         await db.refresh(pago)
 
-        # Evento fuera de orden: `payment_intent.succeeded` pudo llegar antes.
-        if pago.stripe_payment_intent_id:
+        # Evento fuera de orden: `payment_intent.succeeded` o
+        # `checkout.session.completed` pudieron llegar antes.
+        if pago.stripe_payment_intent_id or pago.stripe_checkout_session_id:
             await ConciliacionService.reconciliar_eventos_pendientes(db, pago)
             await db.refresh(pago)
 
@@ -313,6 +317,18 @@ class PagoDiferidoService:
         if pago.estado == EstadoPagoDiferido.CONFIRMADO:
             return await cls.serializar(db, pago, duplicado=True)
         if not pago.stripe_payment_intent_id:
+            # Checkout Session: el PaymentIntent puede llegar después (webhook
+            # o retorno del cliente). Se verifica la sesión contra Stripe.
+            if pago.stripe_checkout_session_id:
+                session = StripePagoService.obtener_checkout_session(pago.stripe_checkout_session_id)
+                if session.get("payment_status") == "paid":
+                    if session.get("payment_intent"):
+                        pago.stripe_payment_intent_id = session["payment_intent"]
+                    await ConciliacionService.confirmar_pago(db, pago, datos_stripe=session)
+                    await db.commit()
+                    await db.refresh(pago)
+                    return await cls.serializar(db, pago)
+                raise PagoNoConfirmado("El checkout aún no registra el pago")
             raise PagoNoConfirmado("El pago no tiene PaymentIntent")
 
         intent = StripePagoService.obtener_payment_intent(pago.stripe_payment_intent_id)
@@ -358,12 +374,23 @@ class PagoDiferidoService:
                 await ConciliacionService.confirmar_pago(db, pago, datos_stripe=intent)
                 await db.commit()
                 return await cls.serializar(db, pago)
+        elif pago.stripe_checkout_session_id:
+            session = StripePagoService.obtener_checkout_session(pago.stripe_checkout_session_id)
+            if session.get("payment_status") == "paid":
+                if session.get("payment_intent"):
+                    pago.stripe_payment_intent_id = session["payment_intent"]
+                await ConciliacionService.confirmar_pago(db, pago, datos_stripe=session)
+                await db.commit()
+                return await cls.serializar(db, pago)
 
         pago.intentos = (pago.intentos or 0) + 1
         pago.estado = EstadoPagoDiferido.EN_PROCESO
         pago.fecha_ultimo_intento = datetime.utcnow()
+        # La sesión anterior ya no es cobrable: se expira antes de crear otra.
+        if pago.stripe_checkout_session_id:
+            StripePagoService.expirar_checkout_session(pago.stripe_checkout_session_id)
         try:
-            intent = StripePagoService.crear_payment_intent(
+            intent = StripePagoService.crear_checkout_session(
                 uuid_pago=str(pago.uuid_pago),
                 monto=pago.monto,
                 moneda=pago.moneda,
@@ -376,6 +403,8 @@ class PagoDiferidoService:
                 idempotency_key=f"{pago.uuid_pago}:r{pago.intentos}",
             )
             pago.stripe_payment_intent_id = intent["id"]
+            pago.stripe_checkout_session_id = intent.get("checkout_session_id")
+            pago.stripe_checkout_url = intent.get("checkout_url")
             pago.client_secret = intent.get("client_secret")
             pago.estado = EstadoPagoDiferido.REQUIERE_ACCION_CLIENTE
             pago.ultimo_error = None
@@ -410,6 +439,8 @@ class PagoDiferidoService:
             orden.estado = EstadoOrden.CANCELADO
             await ConciliacionService._liberar_stock_reservado(db, orden)
 
+        if pago.stripe_checkout_session_id:
+            StripePagoService.expirar_checkout_session(pago.stripe_checkout_session_id)
         if pago.stripe_payment_intent_id:
             StripePagoService.cancelar_payment_intent(pago.stripe_payment_intent_id)
         pago.estado = EstadoPagoDiferido.CANCELADO
@@ -478,6 +509,8 @@ class PagoDiferidoService:
         for pago in result.scalars().all():
             pago.estado = EstadoPagoDiferido.EXPIRADO
             pago.motivo_rechazo = "Pago vencido"
+            if pago.stripe_checkout_session_id:
+                StripePagoService.expirar_checkout_session(pago.stripe_checkout_session_id)
             if pago.stripe_payment_intent_id:
                 StripePagoService.cancelar_payment_intent(pago.stripe_payment_intent_id)
             orden_result = await db.execute(

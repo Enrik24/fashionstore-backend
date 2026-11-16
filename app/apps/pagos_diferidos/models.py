@@ -60,6 +60,7 @@ class PagoDiferido(Base):
     )
     stripe_payment_intent_id = Column(String(120), nullable=True)
     stripe_checkout_session_id = Column(String(120), nullable=True)
+    stripe_checkout_url = Column(Text, nullable=True)
     idempotency_key = Column(String(255), nullable=False)
     intentos = Column(Integer, nullable=False, default=0, server_default="0")
     fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())

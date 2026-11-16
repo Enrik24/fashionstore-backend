@@ -429,7 +429,17 @@ class ConflictoService:
                 SincronizacionService,
             )
             await SincronizacionService.reintentar_operacion(
-                db, operacion.uuid_operacion, usuario_id
+                db,
+                operacion.uuid_operacion,
+                usuario_id,
+                # RN-007: confirmar/ajustar un conflicto de precio equivale a
+                # aceptar el total central; sin esto el reintento volvería a
+                # pedir aceptación con el mismo payload local.
+                acepta_nuevo_total=(
+                    True
+                    if conflicto.tipo_conflicto == TipoConflicto.PRECIO_DESACTUALIZADO.value
+                    else None
+                ),
             )
             await db.refresh(conflicto)
         await db.commit()

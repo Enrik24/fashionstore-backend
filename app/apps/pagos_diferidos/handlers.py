@@ -150,13 +150,20 @@ async def _crear_carrito_desde_payload(
         cliente_id,
         operacion.dispositivo_id,
     )
+    carrito_nuevo = carrito.id is None
     carrito.es_offline = True
     carrito.estado_sincronizacion = EstadoSincronizacion.CONFIRMADA
     await db.flush()
 
-    for item in list(carrito.items or []):
-        await db.delete(item)
-    await db.flush()
+    # Tras el flush las relaciones quedan expiradas: acceder a carrito.items
+    # provocaría un lazy load (MissingGreenlet en async). Se consultan explícitamente.
+    if not carrito_nuevo:
+        existentes = (await db.execute(
+            select(ItemCarrito).where(ItemCarrito.carrito_id == carrito.id)
+        )).scalars().all()
+        for item in existentes:
+            await db.delete(item)
+        await db.flush()
 
     procesados = await CarritoOfflineService._variantes_y_precios(
         db, operacion.tenant_id, items_payload
@@ -312,6 +319,8 @@ def _serializar_pago(pago: PagoDiferido, orden: Orden, duplicado: bool = False) 
         "moneda": pago.moneda,
         "estado": pago.estado.value if hasattr(pago.estado, "value") else str(pago.estado),
         "stripe_payment_intent_id": pago.stripe_payment_intent_id,
+        "stripe_checkout_session_id": pago.stripe_checkout_session_id,
+        "checkout_url": pago.stripe_checkout_url,
         "client_secret": pago.client_secret,
         "idempotency_key": pago.idempotency_key,
         "requiere_accion": pago.estado == EstadoPagoDiferido.REQUIERE_ACCION_CLIENTE,
@@ -390,18 +399,19 @@ async def _crear_pago_para_orden(
     await db.flush()
 
     try:
-        intent = StripePagoService.crear_payment_intent(
+        intent = StripePagoService.crear_checkout_session(
             uuid_pago=str(uuid_valor),
             monto=pago.monto,
             moneda=pago.moneda,
             metadata={
                 "tenant_id": tenant_id,
-                "orden_id": orden.id,
                 "uuid_pago": str(uuid_valor),
             },
             idempotency_key=str(uuid_valor),
         )
         pago.stripe_payment_intent_id = intent["id"]
+        pago.stripe_checkout_session_id = intent.get("checkout_session_id")
+        pago.stripe_checkout_url = intent.get("checkout_url")
         pago.client_secret = intent.get("client_secret")
         pago.estado = EstadoPagoDiferido.REQUIERE_ACCION_CLIENTE
         transaccion.stripe_payment_intent_id = intent["id"]

@@ -323,7 +323,10 @@ class CarritoOfflineService:
         items = await cls._variantes_y_precios(db, tenant_id, datos.items)
         # El carrito refleja el estado del dispositivo: se reemplazan los ítems.
         if not carrito_nuevo:
-            for item in list(carrito.items or []):
+            existentes = (await db.execute(
+                select(ItemCarrito).where(ItemCarrito.carrito_id == carrito.id)
+            )).scalars().all()
+            for item in existentes:
                 await db.delete(item)
             await db.flush()
         for item in items:
