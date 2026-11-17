@@ -315,7 +315,7 @@ async def confirmar_retorno_suscripcion(
 ):
     """Verifica y confirma el pago de suscripción tras el retorno de Stripe."""
     status = await PagoSuscripcionService.procesar_pago_stripe_completado(
-        db, session_id, suscripcion_id
+        db, session_id, suscripcion_id, tenant_id=tenant.id
     )
     if status != "paid":
         raise BadRequestException(
@@ -332,51 +332,25 @@ async def webhook_stripe(
     db: AsyncSession = Depends(get_db),
 ):
     """Confirmación de pago de suscripción vía webhook Stripe (`checkout.session.completed`)."""
-    from sqlalchemy import select
-
-    from app.apps.gestion_saas.models import PagoSuscripcion
-    from app.apps.gestion_ventas.models import EstadoTransaccion
     from app.services.stripe_service import StripeService
 
-    # Flujo oficial: validar firma y procesar con metadata.
-    if stripe_signature:
-        try:
-            payload = await request.body()
-            event = StripeService.construct_webhook_event(payload, stripe_signature)
-        except Exception as exc:
-            raise BadRequestException(f"Error validando webhook de Stripe: {exc}")
-        if event["type"] == "checkout.session.completed":
-            session = event["data"]["object"]
-            meta = session.get("metadata") or {}
-            try:
-                suscripcion_id = int(meta.get("suscripcion_id")) if meta.get("suscripcion_id") else None
-            except (TypeError, ValueError):
-                suscripcion_id = None
-            status = await PagoSuscripcionService.procesar_pago_stripe_completado(
-                db, session["id"], suscripcion_id
-            )
-            return {"recibido": True, "procesado": status == "paid", "pago_estado": status}
+    if not stripe_signature:
+        raise BadRequestException("Falta cabecera stripe-signature")
+    try:
+        payload = await request.body()
+        event = StripeService.construct_webhook_event(payload, stripe_signature)
+    except Exception as exc:
+        raise BadRequestException(f"Error validando webhook de Stripe: {exc}") from exc
+
+    if event["type"] != "checkout.session.completed":
         return {"recibido": True, "procesado": False, "motivo": f"Tipo de evento no procesado: {event['type']}"}
 
-    # Compatibilidad: payload JSON sin firma (idempotente por payment_intent).
-    try:
-        payload_json = await request.json()
-    except Exception:
-        return {"recibido": True, "procesado": False, "motivo": "Payload inválido"}
-    payment_intent = (payload_json.get("data", {}).get("object", {}).get("id")
-                      or payload_json.get("payment_intent_id"))
-    if not payment_intent:
-        return {"recibido": True, "procesado": False, "motivo": "Sin payment_intent_id"}
-    result = await db.execute(
-        select(PagoSuscripcion).where(PagoSuscripcion.stripe_payment_intent_id == payment_intent)
-    )
-    pago = result.scalar_one_or_none()
-    if pago is None:
-        return {"recibido": True, "procesado": False, "motivo": "Pago no registrado"}
-    if pago.estado == EstadoTransaccion.CONFIRMADO:
-        return {"recibido": True, "procesado": False, "motivo": "Pago ya confirmado"}
-    await PagoSuscripcionService.confirmar(db, pago.id)
-    return {"recibido": True, "procesado": True, "pago_id": pago.id}
+    session = event["data"]["object"]
+    meta = session.get("metadata") or {}
+    if meta.get("tipo") != "suscripcion":
+        return {"recibido": True, "procesado": False, "motivo": "El pago no corresponde a una suscripción"}
+    status = await PagoSuscripcionService.procesar_pago_stripe_completado(db, session["id"])
+    return {"recibido": True, "procesado": status == "paid", "pago_estado": status}
 
 
 # ============================================================

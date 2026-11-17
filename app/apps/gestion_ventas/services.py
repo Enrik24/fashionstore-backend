@@ -1624,8 +1624,8 @@ class PagoService:
         db: AsyncSession, orden_id: int, email_usuario: Optional[str] = None, success_url: Optional[str] = None, cancel_url: Optional[str] = None
     ) -> Dict[str, str]:
         orden = await OrdenService.obtener_orden(db, orden_id)
-        if orden.estado == EstadoOrden.PAGADO:
-            raise BadRequestException("La orden ya se encuentra pagada")
+        if orden.estado != EstadoOrden.PENDIENTE_PAGO:
+            raise BadRequestException("Solo se puede iniciar Stripe para una orden pendiente de pago")
             
         # Si no se pasó email, obtener del cliente
         if not email_usuario and orden.cliente and orden.cliente.usuario:
@@ -1635,8 +1635,8 @@ class PagoService:
             orden_id=orden.id,
             numero_orden=orden.numero_orden,
             total=orden.total,
+            moneda=orden.moneda,
             email_usuario=email_usuario,
-            detalles=orden.detalles,
             success_url=success_url,
             cancel_url=cancel_url
         )
@@ -1645,8 +1645,9 @@ class PagoService:
         transaccion = TransaccionPago(
             orden_id=orden.id,
             monto=orden.total,
-            moneda="USD",
+            moneda=orden.moneda.upper(),
             metodo_pago=MetodoPagoDigital.STRIPE,
+            tenant_id=orden.tenant_id,
             estado=EstadoTransaccion.PENDIENTE,
             referencia_externa=session_data["session_id"]
         )
@@ -1666,15 +1667,65 @@ class PagoService:
         session_stripe = StripeService.retrieve_session(session_id)
         status = getattr(session_stripe, "payment_status", None) or "unknown"
         if status == "paid":
-            # Actualizar transacción
-            q_tx = select(TransaccionPago).where(TransaccionPago.referencia_externa == session_id)
-            res_tx = await db.execute(q_tx)
-            tx = res_tx.scalar_one_or_none()
-            if tx:
-                tx.estado = EstadoTransaccion.CONFIRMADO
-                tx.datos_respuesta = {"payment_intent": session_stripe.payment_intent}
+            q_orden = (
+                select(Orden)
+                .where(Orden.id == orden_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            orden = (await db.execute(q_orden)).scalar_one_or_none()
+            if orden is None:
+                raise NotFoundException("Orden no encontrada")
 
-            # Actualizar orden
+            q_tx = (
+                select(TransaccionPago)
+                .where(
+                    TransaccionPago.referencia_externa == session_id,
+                    TransaccionPago.orden_id == orden.id,
+                    TransaccionPago.tenant_id == orden.tenant_id,
+                    TransaccionPago.metodo_pago == MetodoPagoDigital.STRIPE,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            tx = (await db.execute(q_tx)).scalar_one_or_none()
+            if tx is None:
+                raise BadRequestException("La sesión de Stripe no corresponde a una transacción de esta orden")
+
+            metadata = session_stripe.metadata or {}
+            if session_stripe.id != session_id or metadata.get("orden_id") != str(orden.id):
+                raise BadRequestException("La sesión de Stripe no corresponde a esta orden")
+
+            respuesta = {
+                "payment_intent": session_stripe.payment_intent,
+                "payment_status": status,
+                "amount_total": session_stripe.amount_total,
+                "currency": session_stripe.currency,
+            }
+            if (
+                session_stripe.amount_total != int(orden.total * 100)
+                or tx.monto != orden.total
+                or session_stripe.currency.upper() != orden.moneda.upper()
+                or tx.moneda.upper() != orden.moneda.upper()
+            ):
+                mensaje = "El importe o la moneda de Stripe no coincide con la orden; se requiere revisión del pago"
+                tx.datos_respuesta = {**respuesta, "error": mensaje}
+                await db.commit()
+                raise BadRequestException(mensaje)
+
+            if tx.estado == EstadoTransaccion.CONFIRMADO:
+                await db.commit()
+                return status
+
+            if orden.estado != EstadoOrden.PENDIENTE_PAGO:
+                mensaje = "La orden ya no está pendiente de pago; se requiere revisión del pago"
+                tx.datos_respuesta = {**respuesta, "error": mensaje}
+                await db.commit()
+                raise BadRequestException(mensaje)
+
+            tx.estado = EstadoTransaccion.CONFIRMADO
+            tx.stripe_payment_intent_id = session_stripe.payment_intent
+            tx.datos_respuesta = respuesta
             await OrdenService.actualizar_estado(db, orden_id, EstadoOrden.PAGADO)
             await db.commit()
 

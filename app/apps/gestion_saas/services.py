@@ -804,12 +804,15 @@ class PagoSuscripcionService:
             tenant = await TenantService.obtener_tenant(db, suscripcion.tenant_id)
             email_usuario = tenant.correo_contacto
 
+        # Los precios de plataforma están en BOB, independientemente de la moneda del tenant.
+        moneda = "BOB"
         session_data = StripeService.create_checkout_session_suscripcion(
             suscripcion_id=suscripcion.id,
             tenant_id=suscripcion.tenant_id,
             plan_id=plan.id,
             plan_nombre=plan.nombre,
             precio_mensual=plan.precio_mensual,
+            moneda=moneda,
             email_usuario=email_usuario,
             success_url=success_url,
             cancel_url=cancel_url,
@@ -819,7 +822,7 @@ class PagoSuscripcionService:
             tenant_id=suscripcion.tenant_id,
             suscripcion_id=suscripcion.id,
             monto=plan.precio_mensual,
-            moneda="USD",
+            moneda=moneda,
             estado=EstadoTransaccion.PENDIENTE,
             stripe_checkout_session_id=session_data["session_id"],
             referencia=session_data["session_id"],
@@ -831,7 +834,8 @@ class PagoSuscripcionService:
 
     @staticmethod
     async def procesar_pago_stripe_completado(
-        db: AsyncSession, session_id: str, suscripcion_id: Optional[int] = None
+        db: AsyncSession, session_id: str, suscripcion_id: Optional[int] = None,
+        tenant_id: Optional[int] = None,
     ) -> str:
         from app.apps.gestion_ventas.models import EstadoTransaccion
         from app.services.stripe_service import StripeService
@@ -841,41 +845,75 @@ class PagoSuscripcionService:
         if status != "paid":
             return status
 
-        result = await db.execute(
-            select(PagoSuscripcion).where(
-                PagoSuscripcion.stripe_checkout_session_id == session_id
-            )
+        query = select(PagoSuscripcion).where(
+            PagoSuscripcion.stripe_checkout_session_id == session_id
         )
+        if tenant_id is not None:
+            query = query.where(PagoSuscripcion.tenant_id == tenant_id)
+        result = await db.execute(query.with_for_update().execution_options(populate_existing=True))
         pago = result.scalar_one_or_none()
-        if pago is None and suscripcion_id is not None:
-            result = await db.execute(
-                select(PagoSuscripcion)
-                .where(
-                    PagoSuscripcion.suscripcion_id == suscripcion_id,
-                    PagoSuscripcion.estado == EstadoTransaccion.PENDIENTE,
-                )
-                .order_by(PagoSuscripcion.fecha.desc())
-                .limit(1)
-            )
-            pago = result.scalar_one_or_none()
-
         if pago is None:
-            return status
+            raise NotFoundException("No se encontró el pago asociado a esta sesión de Stripe")
+        if suscripcion_id is not None and pago.suscripcion_id != suscripcion_id:
+            raise ValidationException("La sesión de Stripe no corresponde a esta suscripción")
 
-        payment_intent = getattr(session_stripe, "payment_intent", None)
-        if payment_intent:
-            pago.stripe_payment_intent_id = payment_intent
+        metadata = session_stripe.metadata or {}
         respuesta = dict(pago.datos_respuesta or {})
+        plan_id = respuesta.get("plan_id")
+        if (
+            session_stripe.id != session_id
+            or metadata.get("tipo") != "suscripcion"
+            or metadata.get("suscripcion_id") != str(pago.suscripcion_id)
+            or metadata.get("tenant_id") != str(pago.tenant_id)
+            or metadata.get("plan_id") != str(plan_id)
+        ):
+            raise ValidationException("La sesión de Stripe no corresponde al pago de este plan")
+
         respuesta.update({
             "session_id": session_id,
-            "payment_intent": payment_intent,
+            "payment_intent": session_stripe.payment_intent,
             "payment_status": status,
+            "amount_total": session_stripe.amount_total,
+            "currency": session_stripe.currency,
         })
+        if (
+            session_stripe.amount_total != int(pago.monto * 100)
+            or session_stripe.currency.upper() != pago.moneda.upper()
+            or pago.moneda.upper() != "BOB"
+        ):
+            mensaje = "El importe o la moneda de Stripe no coincide con el pago del plan; se requiere revisión"
+            if pago.estado != EstadoTransaccion.CONFIRMADO:
+                pago.datos_respuesta = {**respuesta, "error": mensaje}
+                await db.commit()
+            raise ValidationException(mensaje)
+
+        if pago.estado == EstadoTransaccion.CONFIRMADO:
+            await db.commit()
+            return status
+
+        result = await db.execute(
+            select(Suscripcion)
+            .where(Suscripcion.id == pago.suscripcion_id, Suscripcion.tenant_id == pago.tenant_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        suscripcion = result.scalar_one_or_none()
+        if suscripcion is None:
+            raise NotFoundException("Suscripción no encontrada")
+        if (
+            suscripcion.plan_id != plan_id
+            or suscripcion.estado == EstadoSuscripcion.CANCELADA
+            or pago.estado != EstadoTransaccion.PENDIENTE
+        ):
+            mensaje = "El plan o la suscripción cambió desde el inicio del pago; se requiere revisión"
+            pago.datos_respuesta = {**respuesta, "error": mensaje}
+            await db.commit()
+            raise ValidationException(mensaje)
+
+        pago.stripe_payment_intent_id = session_stripe.payment_intent
         pago.datos_respuesta = respuesta
         await db.flush()
-
-        if pago.estado != EstadoTransaccion.CONFIRMADO:
-            await PagoSuscripcionService.confirmar(db, pago.id)
+        await PagoSuscripcionService.confirmar(db, pago.id)
         return status
 
     @staticmethod

@@ -6,6 +6,7 @@ import stripe
 from decimal import Decimal
 from typing import Optional, Dict, Any
 from app.config import settings
+from app.exceptions import BadRequestException
 import logging
 
 logger = logging.getLogger(__name__)
@@ -20,8 +21,8 @@ class StripeService:
         orden_id: int,
         numero_orden: str,
         total: Decimal,
+        moneda: str,
         email_usuario: Optional[str] = None,
-        detalles: Optional[list] = None,
         success_url: Optional[str] = None,
         cancel_url: Optional[str] = None
     ) -> Dict[str, str]:
@@ -34,41 +35,19 @@ class StripeService:
         s_url = success_url or f"{settings.STRIPE_SUCCESS_URL}?session_id={{CHECKOUT_SESSION_ID}}&orden_id={orden_id}"
         c_url = cancel_url or f"{settings.STRIPE_CANCEL_URL}?orden_id={orden_id}"
         
-        line_items = []
-        if detalles and len(detalles) > 0:
-            for item in detalles:
-                # Nombre del producto o variante
-                nombre_item = f"Producto #{item.variante_producto_id or 'General'}"
-                if hasattr(item, 'variante_producto') and item.variante_producto:
-                    if hasattr(item.variante_producto, 'producto') and item.variante_producto.producto:
-                        nombre_item = f"{item.variante_producto.producto.nombre}"
-                    elif hasattr(item.variante_producto, 'sku_variante'):
-                        nombre_item = f"SKU: {item.variante_producto.sku_variante}"
-                
-                precio_centavos = int(Decimal(str(item.precio_unitario)) * 100)
-                line_items.append({
-                    "price_data": {
-                        "currency": "usd",
-                        "product_data": {
-                            "name": nombre_item,
-                        },
-                        "unit_amount": max(precio_centavos, 50),  # Stripe mínimo ~50 centavos
-                    },
-                    "quantity": item.cantidad,
-                })
-        else:
-            # Línea genérica con el total de la orden
-            total_centavos = int(Decimal(str(total)) * 100)
-            line_items.append({
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {
-                        "name": f"Orden {numero_orden}",
-                    },
-                    "unit_amount": max(total_centavos, 50),
-                },
-                "quantity": 1,
-            })
+        total_centavos = int(total * 100)
+        if total_centavos <= 0:
+            raise BadRequestException("El total de la orden debe ser mayor a cero para pagar con Stripe")
+
+        # El total de la orden ya incluye promociones, cupones e impuestos.
+        line_items = [{
+            "price_data": {
+                "currency": moneda.lower(),
+                "product_data": {"name": f"Orden {numero_orden}"},
+                "unit_amount": total_centavos,
+            },
+            "quantity": 1,
+        }]
             
         session_params: Dict[str, Any] = {
             "payment_method_types": ["card"],
@@ -86,8 +65,13 @@ class StripeService:
         if email_usuario:
             session_params["customer_email"] = email_usuario
             
-        session = stripe.checkout.Session.create(**session_params)
-        
+        try:
+            session = stripe.checkout.Session.create(**session_params)
+        except stripe.error.InvalidRequestError as exc:
+            raise BadRequestException(
+                f"Stripe rechazó el importe, la moneda o los datos del pago: {exc.user_message}"
+            ) from exc
+
         return {
             "session_id": session.id,
             "checkout_url": session.url
@@ -100,10 +84,10 @@ class StripeService:
         plan_id: int,
         plan_nombre: str,
         precio_mensual: Decimal,
+        moneda: str,
         email_usuario: Optional[str] = None,
         success_url: Optional[str] = None,
         cancel_url: Optional[str] = None,
-        moneda: str = "usd",
     ) -> Dict[str, str]:
         """Crea una sesión de Stripe Checkout para pagar un plan."""
         stripe.api_key = settings.STRIPE_API_KEY
@@ -120,13 +104,15 @@ class StripeService:
             f"{settings.STRIPE_SUSCRIPCION_CANCEL_URL}?suscripcion_id={suscripcion_id}"
         )
 
-        total_centavos = max(int(Decimal(str(precio_mensual)) * 100), 50)
+        total_centavos = int(precio_mensual * 100)
+        if total_centavos <= 0:
+            raise BadRequestException("El precio del plan debe ser mayor a cero para pagar con Stripe")
 
         session_params: Dict[str, Any] = {
             "payment_method_types": ["card"],
             "line_items": [{
                 "price_data": {
-                    "currency": (moneda or "usd").lower(),
+                    "currency": moneda.lower(),
                     "product_data": {"name": f"Plan {plan_nombre}"},
                     "unit_amount": total_centavos,
                 },
@@ -145,7 +131,12 @@ class StripeService:
         if email_usuario:
             session_params["customer_email"] = email_usuario
 
-        session = stripe.checkout.Session.create(**session_params)
+        try:
+            session = stripe.checkout.Session.create(**session_params)
+        except stripe.error.InvalidRequestError as exc:
+            raise BadRequestException(
+                f"Stripe rechazó el importe, la moneda o los datos del pago: {exc.user_message}"
+            ) from exc
         return {
             "session_id": session.id,
             "checkout_url": session.url,
