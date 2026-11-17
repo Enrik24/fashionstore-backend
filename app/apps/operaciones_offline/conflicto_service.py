@@ -321,6 +321,26 @@ class ConflictoService:
         return conflicto
 
     @staticmethod
+    async def cerrar_conflictos_precio_aceptado(
+        db: AsyncSession, operacion: OperacionOffline
+    ) -> None:
+        if (operacion.estado_sincronizacion != EstadoSincronizacion.CONFIRMADA
+                or (operacion.payload_json or {}).get("acepta_nuevo_total") is not True):
+            return
+        registros = (await db.execute(
+            select(LogConflicto).where(
+                LogConflicto.tenant_id == operacion.tenant_id,
+                LogConflicto.operacion_offline_id == operacion.id,
+                LogConflicto.tipo_conflicto == TipoConflicto.PRECIO_DESACTUALIZADO.value,
+                LogConflicto.resuelto.is_(False),
+            ).with_for_update()
+        )).scalars().all()
+        for conflicto in registros:
+            await ConflictoService.resolver_automaticamente(
+                db, conflicto, "Total central aceptado y operación confirmada"
+            )
+
+    @staticmethod
     async def escalar_a_manual(
         db: AsyncSession, operacion: OperacionOffline, conflicto: LogConflicto
     ) -> OperacionOffline:
@@ -393,23 +413,24 @@ class ConflictoService:
         observacion: Optional[str],
         usuario_id: int,
     ) -> LogConflicto:
-        conflicto = await cls.obtener_conflicto(db, conflicto_id, tenant_id)
-        if conflicto.resuelto:
-            raise ConflictException("El conflicto ya fue resuelto")
         decision = (decision or "").upper()
         if decision not in {"CONFIRMAR", "RECHAZAR", "AJUSTAR"}:
             raise ConflictException("Decisión inválida: use CONFIRMAR, RECHAZAR o AJUSTAR")
-
-        conflicto.resuelto = True
-        conflicto.resolucion = decision
-        conflicto.estrategia_resolucion = EstrategiaResolucion.MANUAL.value
-        conflicto.resuelto_por = usuario_id
-        conflicto.fecha_resolucion = datetime.utcnow()
-        conflicto.observaciones = observacion
-        await db.flush()
-
+        conflicto = await cls.obtener_conflicto(db, conflicto_id, tenant_id)
         operacion = conflicto.operacion
-        if decision == "RECHAZAR":
+        if operacion.tenant_id != tenant_id:
+            raise NotFoundException("Operación no encontrada")
+        await db.refresh(operacion, with_for_update=True)
+        await db.refresh(conflicto, with_for_update=True)
+        if conflicto.resuelto:
+            return conflicto
+
+        if operacion.estado_sincronizacion == EstadoSincronizacion.CONFIRMADA:
+            if (decision == "RECHAZAR"
+                    or conflicto.tipo_conflicto != TipoConflicto.PRECIO_DESACTUALIZADO.value
+                    or (operacion.payload_json or {}).get("acepta_nuevo_total") is not True):
+                raise ConflictException("La operación ya está confirmada y no puede modificarse")
+        elif decision == "RECHAZAR":
             operacion.estado_sincronizacion = EstadoSincronizacion.RECHAZADA
             operacion.requiere_revision = False
             operacion.motivo_rechazo = observacion or "Rechazado por revisión manual"
@@ -417,31 +438,28 @@ class ConflictoService:
                 "estado": EstadoSincronizacion.RECHAZADA.value,
                 "motivo": operacion.motivo_rechazo,
             }
-            await db.flush()
         else:
-            # CONFIRMAR/AJUSTAR: se reintenta la operación con los datos
-            # centrales; si vuelve a fallar, el conflicto se reabre.
-            operacion.estado_sincronizacion = EstadoSincronizacion.PENDIENTE
-            operacion.requiere_revision = False
-            operacion.motivo_rechazo = None
-            await db.commit()
-            from app.apps.operaciones_offline.sincronizacion_service import (
-                SincronizacionService,
-            )
-            await SincronizacionService.reintentar_operacion(
+            from app.apps.operaciones_offline.sincronizacion_service import SincronizacionService
+
+            resultado = await SincronizacionService.reintentar_operacion(
                 db,
                 operacion.uuid_operacion,
                 usuario_id,
-                # RN-007: confirmar/ajustar un conflicto de precio equivale a
-                # aceptar el total central; sin esto el reintento volvería a
-                # pedir aceptación con el mismo payload local.
                 acepta_nuevo_total=(
-                    True
-                    if conflicto.tipo_conflicto == TipoConflicto.PRECIO_DESACTUALIZADO.value
+                    True if conflicto.tipo_conflicto == TipoConflicto.PRECIO_DESACTUALIZADO.value
                     else None
                 ),
             )
+            if resultado["estado"] != EstadoSincronizacion.CONFIRMADA.value:
+                raise ConflictException("La operación no pudo confirmarse; el conflicto sigue pendiente")
             await db.refresh(conflicto)
+
+        conflicto.resuelto = True
+        conflicto.resolucion = decision
+        conflicto.estrategia_resolucion = EstrategiaResolucion.MANUAL.value
+        conflicto.resuelto_por = usuario_id
+        conflicto.fecha_resolucion = datetime.utcnow()
+        conflicto.observaciones = observacion
         await db.commit()
         return conflicto
 

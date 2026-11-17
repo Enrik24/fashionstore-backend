@@ -383,6 +383,9 @@ class SincronizacionService:
                 operacion.motivo_rechazo = None
                 operacion.error_detalle = None
                 await db.flush()
+                from app.apps.operaciones_offline.conflicto_service import ConflictoService
+
+                await ConflictoService.cerrar_conflictos_precio_aceptado(db, operacion)
             await db.commit()
             return cls.construir_resultado(
                 uuid_operacion,

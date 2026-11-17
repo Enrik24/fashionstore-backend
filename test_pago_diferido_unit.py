@@ -179,3 +179,60 @@ async def test_confirmacion_repetida_consume_stock_una_sola_vez(monkeypatch):
     assert orden.estado == EstadoOrden.PAGADO
     consumir.assert_awaited_once()
     assert db.execute.await_count == 2
+    ConciliacionService._transaccion_confirmada.assert_awaited_once()
+    ConciliacionService._emitir_comprobante.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_firma_invalida_no_registra_ni_aplica_evento(monkeypatch, secreto_local):
+    db = sesion_falsa()
+    aplicar = AsyncMock()
+    monkeypatch.setattr(ConciliacionService, "aplicar_evento", aplicar)
+    payload = payload_falso()
+    firma = WebhookService.generar_firma(payload, secreto="secreto_incorrecto_local")
+    with pytest.raises(FirmaWebhookInvalida):
+        await WebhookService.procesar(db, payload, firma)
+    db.execute.assert_not_awaited()
+    db.add.assert_not_called()
+    aplicar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_evento_fuera_de_orden_queda_pendiente_y_luego_se_concilia(monkeypatch, secreto_local):
+    evento = evento_falso()
+    db = sesion_falsa(evento, evento)
+    monkeypatch.setattr(ConciliacionService, "obtener_pago_por_intent", AsyncMock(return_value=None))
+    payload = json.dumps({"id": "evt_unit", "type": "payment_intent.succeeded",
+                          "data": {"object": {"id": "pi_unit", "metadata": {}}}}).encode()
+    evento.tipo = "payment_intent.succeeded"
+    evento.payload_json = json.loads(payload)
+    firma = WebhookService.generar_firma(payload, secreto_local)
+    with pytest.raises(HTTPException) as error:
+        await WebhookService.procesar(db, payload, firma)
+    assert error.value.status_code == 503
+    assert evento.procesado is False
+    assert evento.error_detalle is not None
+    confirmar = AsyncMock(return_value={"estado": "CONFIRMADO"})
+    monkeypatch.setattr(ConciliacionService, "confirmar_pago", confirmar)
+    pago = SimpleNamespace(id=77, tenant_id=10, reembolso_id=None,
+                           estado=EstadoPagoDiferido.REQUIERE_ACCION_CLIENTE,
+                           stripe_payment_intent_id="pi_unit")
+    monkeypatch.setattr(ConciliacionService, "obtener_pago_por_intent", AsyncMock(return_value=pago))
+    db.get = AsyncMock(return_value=pago)
+    db.execute.side_effect = [resultado(evento), resultado(evento)]
+
+    async def confirmar_evento(db, pago, datos_stripe, evento):
+        evento.procesado = True
+        evento.error_detalle = None
+        return {"estado": "CONFIRMADO"}
+
+    confirmar.side_effect = confirmar_evento
+    respuesta = await WebhookService.procesar(db, payload, firma)
+    assert respuesta["procesado"] is True
+    assert evento.pago_diferido_id == 77
+    assert evento.tenant_id == 10
+    confirmar.assert_awaited_once()
+    db.execute.side_effect = [resultado(evento)]
+    repetida = await WebhookService.procesar(db, payload, firma)
+    assert repetida["duplicado"] is True
+    assert confirmar.await_count == 1
